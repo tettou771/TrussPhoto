@@ -135,15 +135,12 @@ void tcApp::filesDropped(const vector<string>& files) {
     if (fs::is_directory(path)) {
         library_.scanFolder(path.string());
         grid_->populate(library_);
-
-        // Load thumbnails (synchronous for now)
-        grid_->loadThumbnails(library_);
+        // Thumbnails load automatically via async loader
     } else {
         // Single file - try to find parent folder
         fs::path folder = path.parent_path();
         library_.scanFolder(folder.string());
         grid_->populate(library_);
-        grid_->loadThumbnails(library_);
     }
 }
 
@@ -166,7 +163,7 @@ void tcApp::showFullImage(int index) {
         panOffset_ = {0, 0};
 
         // Disable grid (stops update/draw and events)
-        grid_->isActive = false;
+        grid_->setActive(false);
     } else {
         logWarning() << "Failed to load: " << entry.path.string();
     }
@@ -178,7 +175,7 @@ void tcApp::exitFullImage() {
     selectedIndex_ = -1;
 
     // Re-enable grid
-    grid_->isActive = true;
+    grid_->setActive(true);
 }
 
 void tcApp::drawSingleView() {
