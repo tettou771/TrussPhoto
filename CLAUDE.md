@@ -231,16 +231,15 @@ ILCE-7CM2 | ZEISS Batis 2/40 CF @40mm f/2.0 ISO1000 | Portrait
 Profile: ON 100%
 ```
 
-### 現状のアドオン設計に関するメモ
-- **tcxExiv2**: CMakeLists.txt のみ。exiv2 のリンク設定だけ。ラッパーコードなし。
-  exiv2 の API が十分使いやすいので素通しで直接 `#include <exiv2/exiv2.hpp>` して使う。
-- **tcxLensfun**: ラッパーあり（LensCorrector クラス）。lensfun C API を隠蔽。
-  ただし**実際のレンズ補正出力は未検証**。bilinear サンプリング（bicubic の方がよいかも）。
-  `lf_modifier_initialize` のパラメータ（distance, scale等）が適切かも要確認。
+### ビルド依存関係の整理
+- **アドオン（addons.make）**: tcxCurl, tcxLibRaw, tcxLut — 汎用的なもののみ
+- **local.cmake**: exiv2, lensfun — プロジェクト固有のbrew依存。アドオンにせず `local.cmake` で直接リンク
+- **src/LensCorrector.h**: lensfun C API のラッパー。アプリコードとして配置。
+  **実際のレンズ補正出力は未検証**。bilinear サンプリング（bicubic の方がよいかも）。
 - **tcxLut**: GPU依存（sokol シェーダー）。ヘッドレス/サーバサイドでは使えない。
   将来サーバでLUT適用済みサムネ生成をやるなら CPU ベースの LUT 適用関数が必要。
-- **アドオン増加の懸念**: brew前提のアドオン（exiv2, lensfun）が増えると環境構築が面倒。
-  FetchContent 化が難しいもの（glib2依存など）もある。方針要検討。
+- **WASM非対応**: exiv2, lensfun, LibRaw のファイルI/O依存、ローカルファイルシステム前提の設計により、
+  TrussPhoto はデスクトップ専用。WASM版は別アーキテクチャが必要。
 
 ## テスト用データ
 
@@ -256,17 +255,18 @@ Profile: ON 100%
 
 ### カメラプロファイル関連
 - dcamprof でカメラプロファイル（.cube）を作成する
-- tcxLensfun の実動作検証（補正が正しくかかるか、画質は十分か）
+- レンズ補正の実動作検証（補正が正しくかかるか、画質は十分か）
 - tcxLut に CPU ベースの LUT 適用関数を追加（サーバサイド用）
 
-### アドオン構成の見直し
-- brew前提アドオンが増えている（exiv2, lensfun）。環境構築の手間とのトレードオフ
-- exiv2 は PhotoProvider 内で直接使っているだけなので、アドオンにする必要があるか要検討
-- lensfun も同様。最終的に使うかどうかの判断が先
+### レンズ補正の自前実装（lensfun 脱却）
+- lensfun は glib2 に依存しており、iOS 等へのクロスコンパイルが困難
+- lensfun のレンズDBは単なるXML（pugixml でパース可能）。データだけ拝借してアルゴリズムは自前で組む方針
+- 補正モデル: 歪曲(PTLens多項式), 周辺光量(PA多項式), 色収差(poly3, チャンネル別リマップ)
+- 自前実装なら補正の中間データ（歪曲マップ、ビネットマスク、CA分離）を個別に可視化・デバッグできる
+- XML DBの場所: `/opt/homebrew/Cellar/lensfun/0.3.4/share/lensfun/version_1/`
 
 ### その他
 - MCP初期化シーケンスの調査と自動テスト
 - マルチパートファイルアップロード（ネットワーク越しの同期対応）
 - EXIF dateTimeOriginal をIDに含める
-- Emscripten Fetch API の実装（tcxCurl WASM対応）
 - サーバURL設定のGUI（現在はsettings.json手動編集 or MCP `set_server`）
