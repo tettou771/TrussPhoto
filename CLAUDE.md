@@ -114,8 +114,10 @@ bin/data/
 ## 使用アドオン
 
 - **tcxCurl** - HTTPクライアント（libcurl / Emscripten Fetch）
-- **tcxLibRaw** - RAW画像デコード（LibRaw）
-- **tcxLut** - LUTカラーグレーディング
+- **tcxLibRaw** - RAW画像デコード（LibRaw、FetchContent）
+- **tcxLut** - LUTカラーグレーディング（GPU シェーダー、header-only）
+- **tcxExiv2** - EXIF/MakerNote メタデータ（libexiv2、brew前提）
+- **tcxLensfun** - レンズ補正（lensfun、brew前提）
 - **tcxCrow** - HTTPサーバ（Crow） ※サーバのみ
 
 ## 開発時の注意点・失敗談
@@ -168,6 +170,78 @@ LibRaw の出力にセンサー端のダークピクセル（暗画素）が含�
 バックグラウンドスレッドでサムネイルを読み込む場合は `Pixels`（CPUのみ）を使う。
 → PhotoProvider の getThumbnail() では `Pixels::load()` を使用
 
+### Creative Style はXMPではなくMakerNoteにある
+Sony ARW の Creative Style（Portrait, Standard, Vivid等）は XMP パケットには入っていない。
+LibRaw の `imgdata.idata.xmpdata` にある XMP には Rating と DocumentID しか入っていなかった。
+Creative Style は Sony MakerNote（バイナリ形式の EXIF タグ）に格納されている。
+→ **libexiv2 を使って `Exif.Sony2.CreativeStyle` から取得する**。LibRaw 単体では取れない。
+
+### exiv2 0.28.x の API 変更
+exiv2 0.27 → 0.28 で `toLong()` が `toInt64()` に変更された。
+→ brew で入る 0.28.7 に合わせてコード側を `toInt64()` にする。
+
+### アドオン内に .git があると cmake --preset が壊れる
+tcxLensfun に `git init` したところ、TrussPhoto の `cmake --preset macos` が
+tcxLensfun の .git を見つけてそちらの CMakePresets.json を要求してエラーになった。
+→ **アドオンに独自の .git がある場合、ダミーの CMakePresets.json を置く必要がある**
+（macos, windows, linux, web プリセットを定義）
+
+## カメラプロファイル＋レンズ補正パイプライン
+
+### 処理順序（フルビュー表示時）
+1. **LibRaw**: RAW → sRGB ピクセル（CPU）
+2. **lensfun**: レンズ補正 - 歪曲・周辺光量・色収差（CPU、ピクセル書き換え）
+3. **GPU upload**: テクスチャ作成（Immutable）
+4. **LutShader**: カメラプロファイルLUT適用（GPU、リアルタイム）
+
+- レンズ補正はCPUでピクセル変形するため、GPU upload前に実行
+- LUTはGPUシェーダーでリアルタイム適用（ブレンド調整可能、Pキーでトグル）
+- サムネイルにはLUT/レンズ補正は適用しない
+
+### カメラプロファイルディレクトリ構造
+```
+~/.trussc/profiles/
+  SONY_ILCE-7CM2/           ← カメラモデル名（スペース→アンダースコア）
+    Portrait.cube            ← Creative Style名.cube
+    Standard.cube
+    Vivid.cube
+    _default.cube            ← スタイル不明時のフォールバック
+```
+- CameraProfileManager がスキャンして自動マッチ
+- プロファイル（.cube）はまだ未作成。dcamprof等で後から生成する
+- プロファイルがなくても現在の動作を維持（LibRawデフォルト）
+
+### キーバインド（シングルビュー）
+| キー | 機能 |
+|------|------|
+| ESC | グリッドに戻る |
+| ←→ | 前後の写真 |
+| スクロール | ズーム |
+| ドラッグ | パン |
+| 0 | ズームリセット |
+| P | カメラプロファイル ON/OFF |
+| [ / ] | プロファイルブレンド量 ±10% |
+| L | レンズ補正 ON/OFF（画像再読み込み） |
+
+### メタデータ表示（シングルビュー オーバーレイ）
+```
+7C201750.ARW [RAW]
+7008x4672  Zoom: 100%
+ILCE-7CM2 | ZEISS Batis 2/40 CF @40mm f/2.0 ISO1000 | Portrait
+Profile: ON 100%
+```
+
+### 現状のアドオン設計に関するメモ
+- **tcxExiv2**: CMakeLists.txt のみ。exiv2 のリンク設定だけ。ラッパーコードなし。
+  exiv2 の API が十分使いやすいので素通しで直接 `#include <exiv2/exiv2.hpp>` して使う。
+- **tcxLensfun**: ラッパーあり（LensCorrector クラス）。lensfun C API を隠蔽。
+  ただし**実際のレンズ補正出力は未検証**。bilinear サンプリング（bicubic の方がよいかも）。
+  `lf_modifier_initialize` のパラメータ（distance, scale等）が適切かも要確認。
+- **tcxLut**: GPU依存（sokol シェーダー）。ヘッドレス/サーバサイドでは使えない。
+  将来サーバでLUT適用済みサムネ生成をやるなら CPU ベースの LUT 適用関数が必要。
+- **アドオン増加の懸念**: brew前提のアドオン（exiv2, lensfun）が増えると環境構築が面倒。
+  FetchContent 化が難しいもの（glib2依存など）もある。方針要検討。
+
 ## テスト用データ
 
 ```
@@ -180,6 +254,17 @@ LibRaw の出力にセンサー端のダークピクセル（暗画素）が含�
 
 ## 今後の予定
 
+### カメラプロファイル関連
+- dcamprof でカメラプロファイル（.cube）を作成する
+- tcxLensfun の実動作検証（補正が正しくかかるか、画質は十分か）
+- tcxLut に CPU ベースの LUT 適用関数を追加（サーバサイド用）
+
+### アドオン構成の見直し
+- brew前提アドオンが増えている（exiv2, lensfun）。環境構築の手間とのトレードオフ
+- exiv2 は PhotoProvider 内で直接使っているだけなので、アドオンにする必要があるか要検討
+- lensfun も同様。最終的に使うかどうかの判断が先
+
+### その他
 - MCP初期化シーケンスの調査と自動テスト
 - マルチパートファイルアップロード（ネットワーク越しの同期対応）
 - EXIF dateTimeOriginal をIDに含める
