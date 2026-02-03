@@ -233,13 +233,22 @@ Profile: ON 100%
 
 ### ビルド依存関係の整理
 - **アドオン（addons.make）**: tcxCurl, tcxLibRaw, tcxLut — 汎用的なもののみ
-- **local.cmake**: exiv2, lensfun — プロジェクト固有のbrew依存。アドオンにせず `local.cmake` で直接リンク
-- **src/LensCorrector.h**: lensfun C API のラッパー。アプリコードとして配置。
-  **実際のレンズ補正出力は未検証**。bilinear サンプリング（bicubic の方がよいかも）。
+- **local.cmake**: exiv2 のみ。brew 前提の唯一の外部依存
+- **src/LensCorrector.h**: lensfun ライブラリ非依存の自前実装。
+  lensfun の XML データベース（`bin/data/lensfun/`）を pugixml でパースし、
+  PTLens歪曲補正・PA周辺光量補正・poly3色収差補正を自前で実装。
+  **実際のレンズ補正出力は未検証**（要テスト）。bilinear サンプリング（bicubic の方がよいかも）。
 - **tcxLut**: GPU依存（sokol シェーダー）。ヘッドレス/サーバサイドでは使えない。
   将来サーバでLUT適用済みサムネ生成をやるなら CPU ベースの LUT 適用関数が必要。
-- **WASM非対応**: exiv2, lensfun, LibRaw のファイルI/O依存、ローカルファイルシステム前提の設計により、
+- **WASM非対応**: exiv2, LibRaw のファイルI/O依存、ローカルファイルシステム前提の設計により、
   TrussPhoto はデスクトップ専用。WASM版は別アーキテクチャが必要。
+
+### exiv2 の配布時の課題
+- 現在 exiv2 は **動的リンク**（`/opt/homebrew/opt/exiv2/lib/libexiv2.28.dylib`）
+- 配布先にも brew の exiv2 が必要。配布時の対策：
+  - `install_name_tool` で rpath を書き換えて `.app/Contents/Frameworks/` に dylib 同梱
+  - または exiv2 をソースから静的ビルド（FetchContent 化）
+  - 開発中は brew の dylib で問題なし。配布フェーズで対応する
 
 ## テスト用データ
 
@@ -253,17 +262,15 @@ Profile: ON 100%
 
 ## 今後の予定
 
+### レンズ補正（要検証）
+- **自前実装済み**だが、実際の補正出力は未検証
+- テスト方法: アプリ起動 → RAW ドロップ → シングルビュー → L キーで ON/OFF 比較
+- 確認ポイント: 歪曲が補正されているか、周辺光量落ちが改善されるか、色収差が減るか
+- 問題があれば: 座標正規化（rNorm）、PTLens 数式の解釈、補間ロジックを疑う
+
 ### カメラプロファイル関連
 - dcamprof でカメラプロファイル（.cube）を作成する
-- レンズ補正の実動作検証（補正が正しくかかるか、画質は十分か）
 - tcxLut に CPU ベースの LUT 適用関数を追加（サーバサイド用）
-
-### レンズ補正の自前実装（lensfun 脱却）
-- lensfun は glib2 に依存しており、iOS 等へのクロスコンパイルが困難
-- lensfun のレンズDBは単なるXML（pugixml でパース可能）。データだけ拝借してアルゴリズムは自前で組む方針
-- 補正モデル: 歪曲(PTLens多項式), 周辺光量(PA多項式), 色収差(poly3, チャンネル別リマップ)
-- 自前実装なら補正の中間データ（歪曲マップ、ビネットマスク、CA分離）を個別に可視化・デバッグできる
-- XML DBの場所: `/opt/homebrew/Cellar/lensfun/0.3.4/share/lensfun/version_1/`
 
 ### その他
 - MCP初期化シーケンスの調査と自動テスト

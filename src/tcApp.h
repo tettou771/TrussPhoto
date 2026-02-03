@@ -12,7 +12,6 @@
 #include "CameraProfileManager.h"
 using namespace std;
 using namespace tc;
-using namespace tcx;
 
 // View mode
 enum class ViewMode {

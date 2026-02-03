@@ -79,6 +79,9 @@ void tcApp::setup() {
     // 10. LUT shader
     lutShader_.load();
 
+    // 11. Lens correction database
+    lensCorrector_.loadDatabase(getDataPath("lensfun"));
+
     logNotice() << "TrussPhoto ready - Library: " << settings_.libraryFolder;
 }
 
