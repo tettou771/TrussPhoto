@@ -5,7 +5,7 @@
 // =============================================================================
 
 #include <TrussC.h>
-#include "PhotoLibrary.h"
+#include "PhotoProvider.h"
 #include "PhotoItem.h"
 #include "AsyncImageLoader.h"
 using namespace std;
@@ -20,8 +20,6 @@ public:
     function<void(int)> onItemClick;
 
     PhotoGrid() {
-        // Don't enableEvents() here - let children handle events
-
         // Create scroll container
         scrollContainer_ = make_shared<ScrollContainer>();
         addChild(scrollContainer_);
@@ -58,20 +56,34 @@ public:
         updateGridLayout();
     }
 
-    // Populate grid from library
-    void populate(PhotoLibrary& library) {
-        library_ = &library;
+    // Populate grid from PhotoProvider
+    void populate(PhotoProvider& provider) {
+        provider_ = &provider;
+
+        // Set thumbnail loader to use provider
+        loader_.setThumbnailLoader([&provider](const string& photoId, Pixels& outPixels) {
+            return provider.getThumbnail(photoId, outPixels);
+        });
 
         // Clear existing items
         content_->removeAllChildren();
         items_.clear();
+        photoIds_.clear();
 
-        // Create items for each entry
-        for (size_t i = 0; i < library.getCount(); i++) {
-            auto& entry = library.getEntry(i);
+        // Get sorted photo IDs
+        auto ids = provider.getSortedIds();
+
+        for (size_t i = 0; i < ids.size(); i++) {
+            auto* photo = provider.getPhoto(ids[i]);
+            if (!photo) continue;
+
+            photoIds_.push_back(ids[i]);
 
             auto item = make_shared<PhotoItem>(i, itemSize_);
-            item->setLabelText(entry.getStem());
+            // Label: stem of filename
+            string stem = fs::path(photo->filename).stem().string();
+            item->setLabelText(stem);
+            item->setSyncState(photo->syncState);
 
             // Connect click event
             item->onClick = [this, i]() {
@@ -95,6 +107,24 @@ public:
 
         updateGridLayout();
         updateVisibility();
+    }
+
+    // Get photo ID at grid index
+    const string& getPhotoId(int index) const {
+        return photoIds_[index];
+    }
+
+    // Get number of photo IDs
+    size_t getPhotoIdCount() const { return photoIds_.size(); }
+
+    // Update sync state badges from provider
+    void updateSyncStates(PhotoProvider& provider) {
+        for (size_t i = 0; i < items_.size() && i < photoIds_.size(); i++) {
+            auto* photo = provider.getPhoto(photoIds_[i]);
+            if (photo) {
+                items_[i]->setSyncState(photo->syncState);
+            }
+        }
     }
 
     // Get item count
@@ -138,7 +168,8 @@ private:
     RectNode::Ptr content_;
     ScrollBar::Ptr scrollBar_;
     vector<PhotoItem::Ptr> items_;
-    PhotoLibrary* library_ = nullptr;
+    PhotoProvider* provider_ = nullptr;
+    vector<string> photoIds_;
 
     AsyncImageLoader loader_;
 
@@ -148,11 +179,8 @@ private:
     float lastScrollY_ = -1;
 
     void requestLoad(int index) {
-        if (!library_ || index < 0 || index >= (int)library_->getCount()) return;
-
-        auto& entry = library_->getEntry(index);
-        // Request thumbnail (max 256px)
-        loader_.requestLoad(index, entry.path, 256);
+        if (!provider_ || index < 0 || index >= (int)photoIds_.size()) return;
+        loader_.requestLoad(index, photoIds_[index]);
     }
 
     void processLoadResults() {
@@ -185,13 +213,10 @@ private:
         float loadTop = viewTop - margin;
         float loadBottom = viewBottom + margin;
 
-        float itemHeight = itemSize_ + 24 + spacing_;  // thumbnail + label + spacing
-
         for (auto& item : items_) {
             float itemY = item->getY();
             float itemBottom = itemY + item->getHeight();
 
-            // Check if item is in visible range (with margin)
             bool shouldBeActive = (itemBottom >= loadTop && itemY <= loadBottom);
 
             if (shouldBeActive != item->getActive()) {

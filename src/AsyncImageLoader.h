@@ -6,6 +6,7 @@
 
 #include <TrussC.h>
 #include <filesystem>
+#include <tcxLibRaw.h>
 using namespace std;
 using namespace tc;
 
@@ -13,8 +14,9 @@ namespace fs = std::filesystem;
 
 // Load request
 struct LoadRequest {
-    int id;             // Photo item ID
-    fs::path path;      // File path
+    int id;             // Photo item ID (grid index)
+    fs::path path;      // File path (used for direct file loading)
+    string photoId;     // Photo ID (used with custom loader)
     int maxSize;        // Max dimension for thumbnail (0 = full size)
 };
 
@@ -25,6 +27,9 @@ struct LoadResult {
     bool success = false;
 };
 
+// Custom thumbnail loader callback
+using ThumbnailLoader = function<bool(const string& photoId, Pixels& outPixels)>;
+
 // Async image loader using Thread + ThreadChannel
 class AsyncImageLoader : public Thread {
 public:
@@ -34,10 +39,15 @@ public:
         stop();
     }
 
+    // Set custom thumbnail loader (called instead of file-based loading)
+    void setThumbnailLoader(ThumbnailLoader loader) {
+        customLoader_ = std::move(loader);
+    }
+
     // Start loader thread
     void start() {
         if (!isThreadRunning()) {
-            requestChannel_.clear();  // Clear any pending requests
+            requestChannel_.clear();
             startThread();
         }
     }
@@ -48,9 +58,22 @@ public:
         waitForThread();
     }
 
-    // Request image load
+    // Request load via custom loader (using photo ID)
+    void requestLoad(int id, const string& photoId) {
+        {
+            lock_guard<mutex> lock(cancelMutex_);
+            cancelledIds_.erase(id);
+        }
+
+        LoadRequest req;
+        req.id = id;
+        req.photoId = photoId;
+        req.maxSize = 256;
+        requestChannel_.send(std::move(req));
+    }
+
+    // Request load from file path (legacy / fallback)
     void requestLoad(int id, const fs::path& path, int maxSize = 0) {
-        // Remove from cancelled list if present (re-request after cancel)
         {
             lock_guard<mutex> lock(cancelMutex_);
             cancelledIds_.erase(id);
@@ -63,14 +86,13 @@ public:
         requestChannel_.send(std::move(req));
     }
 
-    // Cancel pending request (best effort - may already be processing)
+    // Cancel pending request
     void cancelRequest(int id) {
         lock_guard<mutex> lock(cancelMutex_);
         cancelledIds_.insert(id);
     }
 
     // Check for completed loads (call from main thread in update)
-    // Returns true if a result was received
     bool tryGetResult(LoadResult& result) {
         return resultChannel_.tryReceive(result);
     }
@@ -85,7 +107,6 @@ protected:
         LoadRequest req;
 
         while (isThreadRunning()) {
-            // Wait for request (with timeout to check isThreadRunning)
             if (!requestChannel_.tryReceive(req, 100)) {
                 continue;
             }
@@ -103,26 +124,36 @@ protected:
             LoadResult result;
             result.id = req.id;
 
-            if (result.pixels.load(req.path)) {
-                // Resize if needed
-                if (req.maxSize > 0) {
-                    int w = result.pixels.getWidth();
-                    int h = result.pixels.getHeight();
+            bool loaded = false;
 
-                    if (w > req.maxSize || h > req.maxSize) {
-                        // Calculate new size maintaining aspect ratio
-                        float scale = (float)req.maxSize / max(w, h);
-                        int newW = (int)(w * scale);
-                        int newH = (int)(h * scale);
-
-                        // Simple nearest-neighbor resize for now
-                        resizePixels(result.pixels, newW, newH);
+            // Use custom loader if available and photoId is set
+            if (customLoader_ && !req.photoId.empty()) {
+                loaded = customLoader_(req.photoId, result.pixels);
+            }
+            // Fallback: file-based loading
+            else if (!req.path.empty()) {
+                if (RawLoader::isRawFile(req.path)) {
+                    if (req.maxSize > 0) {
+                        loaded = RawLoader::loadWithMaxSize(req.path, result.pixels, req.maxSize);
+                    } else {
+                        loaded = RawLoader::load(req.path, result.pixels);
+                    }
+                } else {
+                    loaded = result.pixels.load(req.path);
+                    if (loaded && req.maxSize > 0) {
+                        int w = result.pixels.getWidth();
+                        int h = result.pixels.getHeight();
+                        if (w > req.maxSize || h > req.maxSize) {
+                            float scale = (float)req.maxSize / max(w, h);
+                            int newW = (int)(w * scale);
+                            int newH = (int)(h * scale);
+                            resizePixels(result.pixels, newW, newH);
+                        }
                     }
                 }
-                result.success = true;
             }
 
-            // Send result
+            result.success = loaded;
             resultChannel_.send(std::move(result));
         }
     }
@@ -130,6 +161,7 @@ protected:
 private:
     ThreadChannel<LoadRequest> requestChannel_;
     ThreadChannel<LoadResult> resultChannel_;
+    ThumbnailLoader customLoader_;
 
     mutex cancelMutex_;
     unordered_set<int> cancelledIds_;
@@ -150,10 +182,8 @@ private:
             int srcY = y * srcH / newH;
             for (int x = 0; x < newW; x++) {
                 int srcX = x * srcW / newW;
-
                 int srcIdx = (srcY * srcW + srcX) * channels;
                 int dstIdx = (y * newW + x) * channels;
-
                 for (int c = 0; c < channels; c++) {
                     dstData[dstIdx + c] = srcData[srcIdx + c];
                 }

@@ -5,7 +5,7 @@
 // =============================================================================
 
 #include <TrussC.h>
-#include "PhotoLibrary.h"
+#include "PhotoProvider.h"
 using namespace std;
 using namespace tc;
 
@@ -207,10 +207,36 @@ public:
             fill();
             drawRect(0, 0, getWidth(), getHeight());
         }
+
+        // Sync state badge (bottom-right corner of thumbnail)
+        float badgeSize = 8;
+        float badgeX = getWidth() - badgeSize - 4;
+        float badgeY = getWidth() - badgeSize - 4;  // thumbnail is square, width = thumbnail height
+        fill();
+        switch (syncState_) {
+            case SyncState::LocalOnly:
+                setColor(0.9f, 0.65f, 0.2f);  // orange
+                drawCircle(badgeX, badgeY, badgeSize);
+                break;
+            case SyncState::Syncing:
+                setColor(0.3f, 0.6f, 0.95f);  // blue
+                drawCircle(badgeX, badgeY, badgeSize);
+                break;
+            case SyncState::Synced:
+                setColor(0.3f, 0.8f, 0.4f);   // green
+                drawCircle(badgeX, badgeY, badgeSize);
+                break;
+            case SyncState::ServerOnly:
+                setColor(0.7f, 0.5f, 0.9f);   // purple
+                drawCircle(badgeX, badgeY, badgeSize);
+                break;
+        }
     }
 
     void setSelected(bool selected) { isSelected_ = selected; }
     bool isSelected() const { return isSelected_; }
+
+    void setSyncState(SyncState state) { syncState_ = state; }
 
 protected:
     bool onMousePress(Vec2 local, int button) override {
@@ -251,4 +277,5 @@ private:
     LabelNode::Ptr label_;
     bool isSelected_ = false;
     LoadState loadState_ = LoadState::Unloaded;
+    SyncState syncState_ = SyncState::LocalOnly;
 };

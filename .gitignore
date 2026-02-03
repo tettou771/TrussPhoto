@@ -19,9 +19,12 @@ vs/
 # Build scripts (generated, OS dependent)
 build-web.*
 
-# Binary output (keep data folder)
+# Binary output (keep data folder structure, not user data)
 bin/*
 !bin/data/
+!bin/data/.gitkeep
+bin/data/*.json
+bin/data/thumbnail_cache/
 
 # IDE specific
 .vscode/

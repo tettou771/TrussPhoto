@@ -1,21 +1,144 @@
 #include "tcApp.h"
+#include <tcxLibRaw.h>
 
 void tcApp::setup() {
-    // Create photo grid
+    // 1. Load settings
+    settings_.load();
+
+    // 2. First-run: ask for library folder
+    if (settings_.isFirstRun()) {
+        auto result = loadDialog(
+            "Select Library Folder",
+            "Choose where to store your photo library",
+            "", true);
+
+        if (result.success) {
+            settings_.libraryFolder = result.filePath;
+        } else {
+            // Default location
+            string home = getenv("HOME") ? getenv("HOME") : ".";
+            settings_.libraryFolder = home + "/Pictures/TrussPhoto";
+        }
+        fs::create_directories(settings_.libraryFolder);
+        settings_.save();
+    }
+
+    // 3. Configure provider
+    provider_.setThumbnailCacheDir(getDataPath("thumbnail_cache"));
+    provider_.setLibraryPath(getDataPath("library.json"));
+    provider_.setLibraryFolder(settings_.libraryFolder);
+    provider_.setServerUrl(settings_.serverUrl);
+
+    // 4. Load library (instant display from previous session)
+    bool hasLibrary = provider_.loadLibrary();
+
+    // 5. Create grid
     grid_ = make_shared<PhotoGrid>();
     grid_->setRect(0, 0, getWindowWidth(), getWindowHeight());
     addChild(grid_);
 
-    // Connect item click event
     grid_->onItemClick = [this](int index) {
         showFullImage(index);
     };
 
-    logNotice() << "TrussPhoto - Drop a folder containing images to start";
+    // Display previous library immediately
+    if (hasLibrary && provider_.getCount() > 0) {
+        grid_->populate(provider_);
+    }
+
+    // 6. Start upload queue (only if server configured)
+    if (settings_.hasServer()) {
+        uploadQueue_.setServerUrl(settings_.serverUrl);
+        uploadQueue_.start();
+        // 7. Trigger server sync on next frame
+        needsServerSync_ = true;
+    }
+
+    // 8. MCP tools
+    mcp::tool("load_folder", "Load a folder containing images")
+        .arg<string>("path", "Path to folder")
+        .bind([this](const string& path) {
+            filesDropped({path});
+            return json{
+                {"status", "ok"},
+                {"count", (int)provider_.getCount()}
+            };
+        });
+
+    mcp::tool("set_server", "Set server URL (empty to disable)")
+        .arg<string>("url", "Server URL (e.g. http://localhost:8080)")
+        .bind([this](const string& url) {
+            configureServer(url);
+            return json{{"status", "ok"}, {"serverUrl", url}};
+        });
+
+    // 9. Camera profile manager
+    string home = getenv("HOME") ? getenv("HOME") : ".";
+    profileManager_.setProfileDir(home + "/.trussc/profiles");
+
+    // 10. LUT shader
+    lutShader_.load();
+
+    logNotice() << "TrussPhoto ready - Library: " << settings_.libraryFolder;
 }
 
 void tcApp::update() {
-    // Grid updates automatically via Node tree
+    // Launch server sync in background thread (non-blocking)
+    if (needsServerSync_ && !syncInProgress_) {
+        needsServerSync_ = false;
+        syncInProgress_ = true;
+        syncCompleted_ = false;
+
+        if (syncThread_.joinable()) syncThread_.join();
+        syncThread_ = thread([this]() {
+            provider_.syncWithServer();
+            syncInProgress_ = false;
+            syncCompleted_ = true;
+        });
+        syncThread_.detach();
+    }
+
+    // Process sync completion on main thread
+    if (syncCompleted_) {
+        syncCompleted_ = false;
+        enqueueLocalOnlyPhotos();
+
+        if (provider_.getCount() > 0 && grid_->getItemCount() != provider_.getCount()) {
+            grid_->populate(provider_);
+        }
+    }
+
+    // Process background file copies
+    provider_.processCopyResults();
+
+    // Process upload results
+    UploadResult uploadResult;
+    while (uploadQueue_.tryGetResult(uploadResult)) {
+        auto* photo = provider_.getPhoto(uploadResult.photoId);
+        if (photo) {
+            photo->syncState = uploadResult.success
+                ? SyncState::Synced
+                : SyncState::LocalOnly;
+            provider_.markDirty();
+        }
+    }
+
+    // Update sync state badges
+    if (grid_) {
+        grid_->updateSyncStates(provider_);
+    }
+
+    // Periodic server sync (every ~30 seconds at 60fps, only if server configured)
+    static int syncCounter = 0;
+    if (settings_.hasServer() && ++syncCounter % 1800 == 0 && !syncInProgress_) {
+        needsServerSync_ = true;
+    }
+
+    // Periodic save (every ~5 seconds at 60fps)
+    static int saveCounter = 0;
+    if (++saveCounter % 300 == 0) {
+        provider_.saveIfDirty();
+    }
 }
 
 void tcApp::draw() {
@@ -24,10 +147,8 @@ void tcApp::draw() {
     if (viewMode_ == ViewMode::Single) {
         drawSingleView();
     } else {
-        // Grid draws automatically via Node tree
-
         // Show hint if no images
-        if (library_.getCount() == 0) {
+        if (provider_.getCount() == 0) {
             setColor(0.5f, 0.5f, 0.55f);
             string hint = "Drop a folder containing images";
             float x = getWindowWidth() / 2 - hint.length() * 4;
@@ -36,10 +157,32 @@ void tcApp::draw() {
         }
     }
 
-    // Status bar
-    setColor(0.4f, 0.4f, 0.45f);
-    drawBitmapString(format("Photos: {}  FPS: {:.1f}",
-        library_.getCount(), getFrameRate()), 10, getWindowHeight() - 20);
+    // Status bar background
+    float barHeight = 24;
+    float barY = getWindowHeight() - barHeight;
+    setColor(0.1f, 0.1f, 0.12f, 0.9f);
+    fill();
+    drawRect(0, barY, getWindowWidth(), barHeight);
+
+    // Server status indicator
+    float dotX = 10;
+    float dotY = barY + barHeight / 2;
+    fill();
+    if (provider_.isServerConnected()) {
+        setColor(0.3f, 0.8f, 0.4f);  // green
+    } else {
+        setColor(0.6f, 0.35f, 0.35f);  // dim red
+    }
+    drawCircle(dotX + 4, dotY, 4);
+
+    // Status text
+    setColor(0.55f, 0.55f, 0.6f);
+    string serverLabel = provider_.isServerConnected() ? "Server" : "Offline";
+    size_t pending = uploadQueue_.getPendingCount();
+    string uploadStatus = pending > 0 ? format("  Upload: {}", pending) : "";
+    drawBitmapString(format("{}  Photos: {}{}  FPS: {:.0f}",
+        serverLabel, provider_.getCount(), uploadStatus, getFrameRate()),
+        dotX + 14, barY + 7);
 }
 
 void tcApp::keyPressed(int key) {
@@ -48,11 +191,37 @@ void tcApp::keyPressed(int key) {
             exitFullImage();
         } else if (key == SAPP_KEYCODE_LEFT && selectedIndex_ > 0) {
             showFullImage(selectedIndex_ - 1);
-        } else if (key == SAPP_KEYCODE_RIGHT && selectedIndex_ < (int)library_.getCount() - 1) {
+        } else if (key == SAPP_KEYCODE_RIGHT && selectedIndex_ < (int)grid_->getPhotoIdCount() - 1) {
             showFullImage(selectedIndex_ + 1);
         } else if (key == '0') {
             zoomLevel_ = 1.0f;
             panOffset_ = {0, 0};
+        } else if (key == 'P' || key == 'p') {
+            // Toggle camera profile LUT
+            if (hasProfileLut_) {
+                profileEnabled_ = !profileEnabled_;
+                logNotice() << "[Profile] " << (profileEnabled_ ? "ON" : "OFF");
+            }
+        } else if (key == SAPP_KEYCODE_LEFT_BRACKET) {
+            // Decrease profile blend
+            if (hasProfileLut_) {
+                profileBlend_ = clamp(profileBlend_ - 0.1f, 0.0f, 1.0f);
+                logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
+            }
+        } else if (key == SAPP_KEYCODE_RIGHT_BRACKET) {
+            // Increase profile blend
+            if (hasProfileLut_) {
+                profileBlend_ = clamp(profileBlend_ + 0.1f, 0.0f, 1.0f);
+                logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
+            }
+        } else if (key == 'L' || key == 'l') {
+            // Toggle lens correction (requires re-loading image)
+            lensEnabled_ = !lensEnabled_;
+            logNotice() << "[Lensfun] " << (lensEnabled_ ? "ON" : "OFF");
+            // Re-load current image with/without lens correction
+            if (selectedIndex_ >= 0) {
+                showFullImage(selectedIndex_);
+            }
         }
     }
 }
@@ -88,39 +257,35 @@ void tcApp::mouseDragged(Vec2 pos, int button) {
 }
 
 void tcApp::mouseScrolled(Vec2 delta) {
-    if (viewMode_ == ViewMode::Single && fullImage_.isAllocated()) {
-        float imgW = fullImage_.getWidth();
-        float imgH = fullImage_.getHeight();
+    if (viewMode_ != ViewMode::Single) return;
+
+    bool hasImage = isRawImage_ ? fullTexture_.isAllocated() : fullImage_.isAllocated();
+    if (!hasImage) return;
+
+    {
+        float imgW = isRawImage_ ? fullTexture_.getWidth() : fullImage_.getWidth();
+        float imgH = isRawImage_ ? fullTexture_.getHeight() : fullImage_.getHeight();
         float winW = getWindowWidth();
         float winH = getWindowHeight();
 
-        // Calculate fit scale (minimum zoom = fit to window)
-        float fitScale = min(winW / imgW, winH / imgH);
-        float minZoom = 1.0f;  // 1.0 = fit to window
+        float minZoom = 1.0f;
         float maxZoom = 10.0f;
 
         float oldZoom = zoomLevel_;
         zoomLevel_ *= (1.0f + delta.y * 0.1f);
         zoomLevel_ = clamp(zoomLevel_, minZoom, maxZoom);
 
-        // Zoom toward mouse position
         Vec2 mousePos(getGlobalMouseX(), getGlobalMouseY());
         Vec2 windowCenter(winW / 2.0f, winH / 2.0f);
-
-        // Current image center (with pan offset)
         Vec2 imageCenter = windowCenter + panOffset_;
-
-        // Vector from image center to mouse
         Vec2 toMouse = mousePos - imageCenter;
 
-        // Adjust pan to keep mouse point fixed
         float zoomRatio = zoomLevel_ / oldZoom;
         panOffset_ = panOffset_ - toMouse * (zoomRatio - 1.0f);
     }
 }
 
 void tcApp::windowResized(int width, int height) {
-    // Update grid size
     if (grid_) {
         grid_->setSize(width, height);
     }
@@ -129,103 +294,250 @@ void tcApp::windowResized(int width, int height) {
 void tcApp::filesDropped(const vector<string>& files) {
     if (files.empty()) return;
 
-    // Check if first dropped item is a directory
     fs::path path(files[0]);
 
     if (fs::is_directory(path)) {
-        library_.scanFolder(path.string());
-        grid_->populate(library_);
-        // Thumbnails load automatically via async loader
+        provider_.scanFolder(path.string());
     } else {
-        // Single file - try to find parent folder
         fs::path folder = path.parent_path();
-        library_.scanFolder(folder.string());
-        grid_->populate(library_);
+        provider_.scanFolder(folder.string());
     }
+
+    grid_->populate(provider_);
+    provider_.saveLibrary();
+
+    // Auto-upload new photos
+    enqueueLocalOnlyPhotos();
 }
 
 void tcApp::exit() {
+    uploadQueue_.stop();
+    if (syncThread_.joinable()) syncThread_.join();
+    provider_.saveLibrary();
     logNotice() << "TrussPhoto exiting";
 }
 
+void tcApp::enqueueLocalOnlyPhotos() {
+    if (!settings_.hasServer()) return;
+
+    auto localPhotos = provider_.getLocalOnlyPhotos();
+    for (const auto& [id, path] : localPhotos) {
+        uploadQueue_.enqueue(id, path);
+    }
+    if (!localPhotos.empty()) {
+        logNotice() << "Enqueued " << localPhotos.size() << " photos for upload";
+    }
+}
+
+void tcApp::configureServer(const string& url) {
+    settings_.serverUrl = url;
+    settings_.save();
+
+    provider_.setServerUrl(url);
+    provider_.resetServerCheck();
+
+    if (settings_.hasServer()) {
+        // Start upload queue if not running
+        uploadQueue_.setServerUrl(url);
+        uploadQueue_.start();
+        // Trigger sync
+        needsServerSync_ = true;
+        logNotice() << "Server configured: " << url;
+    } else {
+        uploadQueue_.stop();
+        logNotice() << "Server disabled, running in local-only mode";
+    }
+}
+
+void tcApp::loadProfileForEntry(const PhotoEntry& entry) {
+    string cubePath = profileManager_.findProfile(entry.camera, entry.creativeStyle);
+    if (cubePath.empty() || cubePath == currentProfilePath_) {
+        if (cubePath.empty()) {
+            hasProfileLut_ = false;
+            currentProfilePath_.clear();
+        }
+        return;
+    }
+
+    if (profileLut_.load(cubePath)) {
+        hasProfileLut_ = true;
+        currentProfilePath_ = cubePath;
+        logNotice() << "[Profile] Loaded: " << cubePath;
+    } else {
+        hasProfileLut_ = false;
+        currentProfilePath_.clear();
+        logWarning() << "[Profile] Failed to load: " << cubePath;
+    }
+}
+
 void tcApp::showFullImage(int index) {
-    if (index < 0 || index >= (int)library_.getCount()) return;
+    if (index < 0 || index >= (int)grid_->getPhotoIdCount()) return;
 
-    auto& entry = library_.getEntry(index);
+    const string& photoId = grid_->getPhotoId(index);
+    auto* entry = provider_.getPhoto(photoId);
+    if (!entry) return;
 
-    logNotice() << "Opening image: " << entry.getFileName();
+    logNotice() << "Opening image: " << entry->filename;
 
-    // Load full-size image
-    if (fullImage_.load(entry.path)) {
+    bool loaded = false;
+
+    if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
+        if (entry->isRaw) {
+            if (RawLoader::load(entry->localPath, fullPixels_)) {
+                // Apply lens correction on CPU before GPU upload
+                if (lensEnabled_ && entry->focalLength > 0 && entry->aperture > 0) {
+                    if (lensCorrector_.setup(
+                            entry->cameraMake, entry->camera,
+                            entry->lens, entry->focalLength, entry->aperture,
+                            fullPixels_.getWidth(), fullPixels_.getHeight())) {
+                        lensCorrector_.apply(fullPixels_);
+                    }
+                }
+                fullTexture_.allocate(fullPixels_, TextureUsage::Immutable);
+                isRawImage_ = true;
+                loaded = true;
+            }
+        } else {
+            if (fullImage_.load(entry->localPath)) {
+                isRawImage_ = false;
+                loaded = true;
+            }
+        }
+    }
+
+    if (loaded) {
         selectedIndex_ = index;
         viewMode_ = ViewMode::Single;
         zoomLevel_ = 1.0f;
         panOffset_ = {0, 0};
-
-        // Disable grid (stops update/draw and events)
         grid_->setActive(false);
+        loadProfileForEntry(*entry);
     } else {
-        logWarning() << "Failed to load: " << entry.path.string();
+        logWarning() << "Failed to load: " << entry->localPath;
     }
 }
 
 void tcApp::exitFullImage() {
     viewMode_ = ViewMode::Grid;
-    fullImage_ = Image();  // Release memory
+
+    if (isRawImage_) {
+        fullPixels_.clear();
+        fullTexture_.clear();
+    } else {
+        fullImage_ = Image();
+    }
+    isRawImage_ = false;
     selectedIndex_ = -1;
 
-    // Re-enable grid
+    // Clear profile LUT
+    hasProfileLut_ = false;
+    profileLut_.clear();
+    currentProfilePath_.clear();
+
     grid_->setActive(true);
 }
 
 void tcApp::drawSingleView() {
-    if (!fullImage_.isAllocated()) return;
+    bool hasImage = isRawImage_ ? fullTexture_.isAllocated() : fullImage_.isAllocated();
+    if (!hasImage) return;
 
-    float imgW = fullImage_.getWidth();
-    float imgH = fullImage_.getHeight();
+    float imgW = isRawImage_ ? fullTexture_.getWidth() : fullImage_.getWidth();
+    float imgH = isRawImage_ ? fullTexture_.getHeight() : fullImage_.getHeight();
     float winW = getWindowWidth();
     float winH = getWindowHeight();
 
-    // Calculate fit scale
     float fitScale = min(winW / imgW, winH / imgH);
     float scale = fitScale * zoomLevel_;
 
     float drawW = imgW * scale;
     float drawH = imgH * scale;
 
-    // Clamp pan offset to keep image within window
+    // Clamp pan offset
     if (drawW <= winW) {
-        // Image fits horizontally - center it
         panOffset_.x = 0;
     } else {
-        // Image larger than window - limit pan so edges don't go past window
         float maxPanX = (drawW - winW) / 2;
         panOffset_.x = clamp(panOffset_.x, -maxPanX, maxPanX);
     }
 
     if (drawH <= winH) {
-        // Image fits vertically - center it
         panOffset_.y = 0;
     } else {
         float maxPanY = (drawH - winH) / 2;
         panOffset_.y = clamp(panOffset_.y, -maxPanY, maxPanY);
     }
 
-    // Center position with pan offset
     float x = (winW - drawW) / 2 + panOffset_.x;
     float y = (winH - drawH) / 2 + panOffset_.y;
 
     setColor(1.0f, 1.0f, 1.0f);
-    fullImage_.draw(x, y, drawW, drawH);
+    bool useLut = hasProfileLut_ && profileEnabled_ && profileBlend_ > 0.0f;
+    if (useLut) {
+        lutShader_.setLut(profileLut_);
+        lutShader_.setBlend(profileBlend_);
+        if (isRawImage_) {
+            lutShader_.setTexture(fullTexture_);
+            lutShader_.draw(x, y, drawW, drawH);
+        } else {
+            lutShader_.setTexture(fullImage_.getTexture());
+            lutShader_.draw(x, y, drawW, drawH);
+        }
+    } else if (isRawImage_) {
+        fullTexture_.draw(x, y, drawW, drawH);
+    } else {
+        fullImage_.draw(x, y, drawW, drawH);
+    }
 
     // Info overlay
-    setColor(0.8f, 0.8f, 0.85f);
-    auto& entry = library_.getEntry(selectedIndex_);
-    drawBitmapString(entry.getFileName(), 10, 20);
-    drawBitmapString(format("{}x{}  Zoom: {:.0f}%",
-        (int)imgW, (int)imgH, zoomLevel_ * 100), 10, 40);
+    if (selectedIndex_ >= 0 && selectedIndex_ < (int)grid_->getPhotoIdCount()) {
+        const string& photoId = grid_->getPhotoId(selectedIndex_);
+        auto* entry = provider_.getPhoto(photoId);
+        if (entry) {
+            setColor(0.8f, 0.8f, 0.85f);
+            string typeStr = entry->isRaw ? " [RAW]" : "";
+            drawBitmapString(entry->filename + typeStr, 10, 20);
+            drawBitmapString(format("{}x{}  Zoom: {:.0f}%",
+                (int)imgW, (int)imgH, zoomLevel_ * 100), 10, 40);
 
-    // Navigation hint
+            // Camera / Lens / Shooting info
+            string metaLine;
+            if (!entry->camera.empty()) {
+                metaLine = entry->camera;
+            }
+            if (!entry->lens.empty()) {
+                if (!metaLine.empty()) metaLine += " | ";
+                metaLine += entry->lens;
+                if (entry->focalLength > 0) {
+                    metaLine += format(" @{:.0f}mm", entry->focalLength);
+                }
+            }
+            if (entry->aperture > 0) {
+                metaLine += format(" f/{:.1f}", entry->aperture);
+            }
+            if (entry->iso > 0) {
+                metaLine += format(" ISO{:.0f}", entry->iso);
+            }
+            if (!entry->creativeStyle.empty()) {
+                metaLine += " | " + entry->creativeStyle;
+            }
+            if (!metaLine.empty()) {
+                setColor(0.7f, 0.7f, 0.75f);
+                drawBitmapString(metaLine, 10, 60);
+            }
+
+            // Profile status
+            if (hasProfileLut_) {
+                string profileStatus = format("Profile: {} {:.0f}%",
+                    profileEnabled_ ? "ON" : "OFF", profileBlend_ * 100);
+                setColor(0.5f, 0.75f, 0.5f);
+                drawBitmapString(profileStatus, 10, 80);
+            }
+        }
+    }
+
+    float helpY = hasProfileLut_ ? 100.0f : 80.0f;
     setColor(0.5f, 0.5f, 0.55f);
-    drawBitmapString("ESC: Back  Left/Right: Navigate  Scroll: Zoom  Drag: Pan", 10, 60);
+    string helpStr = "ESC: Back  Left/Right: Navigate  Scroll: Zoom  Drag: Pan  L: Lens";
+    if (hasProfileLut_) helpStr += "  P: Profile  [/]: Blend";
+    drawBitmapString(helpStr, 10, helpY);
 }
