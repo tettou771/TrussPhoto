@@ -2,7 +2,7 @@
 
 #include <TrussC.h>
 #include <tcLut.h>
-#include <tcxLensfun.h>
+#include "LensCorrector.h"
 #include <atomic>
 #include <thread>
 #include "Settings.h"

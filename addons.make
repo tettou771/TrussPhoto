@@ -2,5 +2,3 @@
 tcxCurl
 tcxLibRaw
 tcxLut
-tcxLensfun
-tcxExiv2
