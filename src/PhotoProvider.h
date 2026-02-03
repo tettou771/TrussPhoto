@@ -8,6 +8,7 @@
 #include <tcxLibRaw.h>
 #include <tcxCurl.h>
 #include <nlohmann/json.hpp>
+#include <exiv2/exiv2.hpp>
 #include <filesystem>
 #include <unordered_map>
 #include <unordered_set>
@@ -236,22 +237,8 @@ public:
             photo.isRaw = RawLoader::isRawFile(entry.path());
             photo.syncState = SyncState::LocalOnly;
 
-            // Extract metadata from RAW files
-            if (photo.isRaw) {
-                RawMetadata meta;
-                if (RawLoader::extractMetadata(entry.path(), meta)) {
-                    photo.cameraMake = meta.cameraMake;
-                    photo.camera = meta.cameraModel;
-                    photo.lens = meta.lens;
-                    photo.lensMake = meta.lensMake;
-                    photo.width = meta.width;
-                    photo.height = meta.height;
-                    photo.creativeStyle = meta.creativeStyle;
-                    photo.focalLength = meta.focalLength;
-                    photo.aperture = meta.aperture;
-                    photo.iso = meta.iso;
-                }
-            }
+            // Extract metadata via exiv2
+            extractExifMetadata(path, photo);
 
             photos_[id] = photo;
             added++;
@@ -533,6 +520,49 @@ private:
         const_cast<Pixels&>(pixels).save(cachePath);
         photo.localThumbnailPath = cachePath;
         dirty_ = true;
+    }
+
+    // Extract EXIF/MakerNote metadata using exiv2
+    static void extractExifMetadata(const string& path, PhotoEntry& photo) {
+        try {
+            auto image = Exiv2::ImageFactory::open(path);
+            image->readMetadata();
+            auto& exif = image->exifData();
+
+            auto getString = [&](const char* key) -> string {
+                auto it = exif.findKey(Exiv2::ExifKey(key));
+                if (it != exif.end()) return it->print(&exif);
+                return "";
+            };
+
+            auto getFloat = [&](const char* key) -> float {
+                auto it = exif.findKey(Exiv2::ExifKey(key));
+                if (it != exif.end()) return it->toFloat();
+                return 0;
+            };
+
+            photo.cameraMake = getString("Exif.Image.Make");
+            photo.camera = getString("Exif.Image.Model");
+            photo.lens = getString("Exif.Photo.LensModel");
+            photo.lensMake = getString("Exif.Photo.LensMake");
+            photo.focalLength = getFloat("Exif.Photo.FocalLength");
+            photo.aperture = getFloat("Exif.Photo.FNumber");
+            photo.iso = getFloat("Exif.Photo.ISOSpeedRatings");
+
+            // Image dimensions from EXIF
+            auto wIt = exif.findKey(Exiv2::ExifKey("Exif.Photo.PixelXDimension"));
+            auto hIt = exif.findKey(Exiv2::ExifKey("Exif.Photo.PixelYDimension"));
+            if (wIt != exif.end()) photo.width = (int)wIt->toInt64();
+            if (hIt != exif.end()) photo.height = (int)hIt->toInt64();
+
+            // Sony MakerNote: Creative Style
+            string style = getString("Exif.Sony2.CreativeStyle");
+            if (!style.empty()) {
+                photo.creativeStyle = style;
+            }
+        } catch (...) {
+            // exiv2 failed, leave metadata empty
+        }
     }
 
     static void resizePixels(Pixels& src, int newW, int newH) {
