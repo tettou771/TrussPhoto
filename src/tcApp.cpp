@@ -405,7 +405,7 @@ void tcApp::showFullImage(int index) {
                         lensCorrector_.apply(fullPixels_);
                     }
                 }
-                fullTexture_.allocate(fullPixels_, TextureUsage::Immutable);
+                fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
                 isRawImage_ = true;
                 loaded = true;
             }
