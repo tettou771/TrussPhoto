@@ -169,124 +169,11 @@ public:
 
     bool isReady() const { return ready_; }
 
-    // Apply lens corrections to RGBA pixels
+    // Apply lens corrections to RGBA pixels (auto-detects U8/F32)
     bool apply(Pixels& pixels) {
         if (!ready_) return false;
-
-        int w = pixels.getWidth();
-        int h = pixels.getHeight();
-        int ch = pixels.getChannels();
-        if (w != width_ || h != height_ || ch != 4) return false;
-
-        unsigned char* data = pixels.getData();
-        float cx = (w - 1) * 0.5f;
-        float cy = (h - 1) * 0.5f;
-
-        // 1. Vignetting correction (in-place)
-        // Uses coordinate system (2): r=1 at corner (half-diagonal)
-        // Extra factor 1/arCorrection converts from (1) to (2)
-        //
-        // IMPORTANT: Our pixels are sRGB gamma-encoded (from LibRaw).
-        // Vignetting correction must be applied in linear light space.
-        // We use sRGB decode LUT → linear multiply → sRGB encode.
-        if (hasVignetting_) {
-            // Build sRGB → linear LUT (256 entries, computed once)
-            static float srgb2lin[256] = {};
-            static bool lutReady = false;
-            if (!lutReady) {
-                for (int i = 0; i < 256; i++) {
-                    float v = i / 255.0f;
-                    srgb2lin[i] = (v <= 0.04045f)
-                        ? v / 12.92f
-                        : powf((v + 0.055f) / 1.055f, 2.4f);
-                }
-                lutReady = true;
-            }
-
-            float vigNorm = normScale_ / arCorrection_;
-            for (int y = 0; y < h; y++) {
-                float dy = (y - cy) * vigNorm;
-                float dy2 = dy * dy;
-                for (int x = 0; x < w; x++) {
-                    float dx = (x - cx) * vigNorm;
-                    float r2 = dx * dx + dy2;
-                    float r4 = r2 * r2;
-                    float r6 = r4 * r2;
-                    float c = 1.0f + vig_.k1 * r2 + vig_.k2 * r4 + vig_.k3 * r6;
-                    if (c < 0.01f) c = 0.01f;
-                    float correction = 1.0f / c;
-                    int idx = (y * w + x) * ch;
-                    for (int i = 0; i < 3; i++) {
-                        // Linearize → correct → re-encode sRGB
-                        float lin = srgb2lin[data[idx + i]] * correction;
-                        // sRGB encode
-                        float s = (lin <= 0.0031308f)
-                            ? lin * 12.92f
-                            : 1.055f * powf(lin, 1.0f / 2.4f) - 0.055f;
-                        data[idx + i] = (unsigned char)clamp(s * 255.0f, 0.0f, 255.0f);
-                    }
-                }
-            }
-        }
-
-        // 2. Distortion + TCA correction (coordinate remap)
-        // Uses coordinate system (1): r=1 at half short edge
-        // lensfun v0.3.4 correction mode (reverse=false):
-        //   Scale (priority 100) → Dist_PTLens (priority 750) → TCA_Linear (priority 500 subpixel)
-        //   Dist = direct polynomial, no Newton inversion needed.
-        if (hasDistortion_ || hasTca_) {
-            Pixels corrected;
-            corrected.allocate(w, h, ch);
-            unsigned char* dst = corrected.getData();
-
-            float a = dist_.a, b = dist_.b, c = dist_.c;
-            float d = 1.0f - a - b - c;
-
-            for (int y = 0; y < h; y++) {
-                for (int x = 0; x < w; x++) {
-                    int dstIdx = (y * w + x) * ch;
-                    float px = (x - cx);
-                    float py = (y - cy);
-
-                    // Pre-scale (lensfun: Scale callback at priority 100, before Dist)
-                    float pxs = px * autoScale_;
-                    float pys = py * autoScale_;
-
-                    // Normalize to coordinate system (1)
-                    float nx = pxs * normScale_;
-                    float ny = pys * normScale_;
-                    float r2 = nx * nx + ny * ny;
-                    float r = sqrt(r2);
-
-                    // Direct PTLens polynomial (lensfun v0.3.4 ModifyCoord_Dist_PTLens)
-                    // Rd = Ru * (a*Ru³ + b*Ru² + c*Ru + d), d = 1-a-b-c
-                    // poly3 = a*r²*r + b*r² + c*r + d
-                    float poly = d;
-                    if (hasDistortion_ && r > 1e-8f) {
-                        poly = a * r2 * r + b * r2 + c * r + d;
-                    }
-
-                    // Per-channel with TCA (lensfun: TCA_Linear at priority 500 subpixel)
-                    // Correction mode (reverse=false): multiply by vr/vb directly
-                    for (int i = 0; i < 3; i++) {
-                        float tcaScale = 1.0f;
-                        if (hasTca_) {
-                            if (i == 0) tcaScale = tca_.vr;       // Red
-                            else if (i == 2) tcaScale = tca_.vb;  // Blue
-                        }
-                        // Source = center + pre_scaled_offset * poly * tca
-                        float sx = cx + pxs * poly * tcaScale;
-                        float sy = cy + pys * poly * tcaScale;
-                        dst[dstIdx + i] = sampleBilinear(data, w, h, ch, i, sx, sy);
-                    }
-                    dst[dstIdx + 3] = 255; // Alpha
-                }
-            }
-
-            pixels = std::move(corrected);
-        }
-
-        return true;
+        if (pixels.isFloat()) return applyFloat(pixels);
+        return applyU8(pixels);
     }
 
 private:
@@ -538,6 +425,194 @@ private:
         }
     }
 
+    // Apply corrections to U8 pixels (original implementation)
+    bool applyU8(Pixels& pixels) {
+        if (pixels.isFloat()) return false;
+        int w = pixels.getWidth();
+        int h = pixels.getHeight();
+        int ch = pixels.getChannels();
+        if (w != width_ || h != height_ || ch != 4) return false;
+
+        unsigned char* data = pixels.getData();
+        float cx = (w - 1) * 0.5f;
+        float cy = (h - 1) * 0.5f;
+
+        // 1. Vignetting correction (in-place, linear light)
+        if (hasVignetting_) {
+            static float srgb2lin[256] = {};
+            static bool lutReady = false;
+            if (!lutReady) {
+                for (int i = 0; i < 256; i++) {
+                    float v = i / 255.0f;
+                    srgb2lin[i] = (v <= 0.04045f)
+                        ? v / 12.92f
+                        : powf((v + 0.055f) / 1.055f, 2.4f);
+                }
+                lutReady = true;
+            }
+
+            float vigNorm = normScale_ / arCorrection_;
+            for (int y = 0; y < h; y++) {
+                float dy = (y - cy) * vigNorm;
+                float dy2 = dy * dy;
+                for (int x = 0; x < w; x++) {
+                    float dx = (x - cx) * vigNorm;
+                    float r2 = dx * dx + dy2;
+                    float r4 = r2 * r2;
+                    float r6 = r4 * r2;
+                    float c = 1.0f + vig_.k1 * r2 + vig_.k2 * r4 + vig_.k3 * r6;
+                    if (c < 0.01f) c = 0.01f;
+                    float correction = 1.0f / c;
+                    int idx = (y * w + x) * ch;
+                    for (int i = 0; i < 3; i++) {
+                        float lin = srgb2lin[data[idx + i]] * correction;
+                        float s = (lin <= 0.0031308f)
+                            ? lin * 12.92f
+                            : 1.055f * powf(lin, 1.0f / 2.4f) - 0.055f;
+                        data[idx + i] = (unsigned char)clamp(s * 255.0f, 0.0f, 255.0f);
+                    }
+                }
+            }
+        }
+
+        // 2. Distortion + TCA correction
+        if (hasDistortion_ || hasTca_) {
+            Pixels corrected;
+            corrected.allocate(w, h, ch);
+            unsigned char* dst = corrected.getData();
+
+            float a = dist_.a, b = dist_.b, c = dist_.c;
+            float d = 1.0f - a - b - c;
+
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    int dstIdx = (y * w + x) * ch;
+                    float px = (x - cx);
+                    float py = (y - cy);
+                    float pxs = px * autoScale_;
+                    float pys = py * autoScale_;
+                    float nx = pxs * normScale_;
+                    float ny = pys * normScale_;
+                    float r2 = nx * nx + ny * ny;
+                    float r = sqrt(r2);
+
+                    float poly = d;
+                    if (hasDistortion_ && r > 1e-8f) {
+                        poly = a * r2 * r + b * r2 + c * r + d;
+                    }
+
+                    for (int i = 0; i < 3; i++) {
+                        float tcaScale = 1.0f;
+                        if (hasTca_) {
+                            if (i == 0) tcaScale = tca_.vr;
+                            else if (i == 2) tcaScale = tca_.vb;
+                        }
+                        float sx = cx + pxs * poly * tcaScale;
+                        float sy = cy + pys * poly * tcaScale;
+                        dst[dstIdx + i] = sampleBilinear(data, w, h, ch, i, sx, sy);
+                    }
+                    dst[dstIdx + 3] = 255;
+                }
+            }
+
+            pixels = std::move(corrected);
+        }
+
+        return true;
+    }
+
+    // Apply corrections to F32 pixels (high precision)
+    bool applyFloat(Pixels& pixels) {
+        int w = pixels.getWidth();
+        int h = pixels.getHeight();
+        int ch = pixels.getChannels();
+        if (w != width_ || h != height_ || ch != 4) return false;
+
+        float* data = pixels.getDataF32();
+        float cx = (w - 1) * 0.5f;
+        float cy = (h - 1) * 0.5f;
+
+        // 1. Vignetting correction (in-place, linear light)
+        // Input is sRGB float: decode → linear multiply → re-encode
+        // Float precision avoids clipping that occurred with 8bit
+        if (hasVignetting_) {
+            float vigNorm = normScale_ / arCorrection_;
+            for (int y = 0; y < h; y++) {
+                float dy = (y - cy) * vigNorm;
+                float dy2 = dy * dy;
+                for (int x = 0; x < w; x++) {
+                    float dx = (x - cx) * vigNorm;
+                    float r2 = dx * dx + dy2;
+                    float r4 = r2 * r2;
+                    float r6 = r4 * r2;
+                    float c = 1.0f + vig_.k1 * r2 + vig_.k2 * r4 + vig_.k3 * r6;
+                    if (c < 0.01f) c = 0.01f;
+                    float correction = 1.0f / c;
+                    int idx = (y * w + x) * ch;
+                    for (int i = 0; i < 3; i++) {
+                        // sRGB decode
+                        float v = data[idx + i];
+                        float lin = (v <= 0.04045f)
+                            ? v / 12.92f
+                            : powf((v + 0.055f) / 1.055f, 2.4f);
+                        // Linear multiply (can exceed 1.0 in float — no clipping)
+                        lin *= correction;
+                        // sRGB encode
+                        float s = (lin <= 0.0031308f)
+                            ? lin * 12.92f
+                            : 1.055f * powf(lin, 1.0f / 2.4f) - 0.055f;
+                        data[idx + i] = clamp(s, 0.0f, 1.0f);
+                    }
+                }
+            }
+        }
+
+        // 2. Distortion + TCA correction (float bilinear sampling)
+        if (hasDistortion_ || hasTca_) {
+            Pixels corrected;
+            corrected.allocate(w, h, ch, PixelFormat::F32);
+            float* dst = corrected.getDataF32();
+
+            float a = dist_.a, b = dist_.b, c = dist_.c;
+            float d = 1.0f - a - b - c;
+
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    int dstIdx = (y * w + x) * ch;
+                    float px = (x - cx);
+                    float py = (y - cy);
+                    float pxs = px * autoScale_;
+                    float pys = py * autoScale_;
+                    float nx = pxs * normScale_;
+                    float ny = pys * normScale_;
+                    float r2 = nx * nx + ny * ny;
+                    float r = sqrt(r2);
+
+                    float poly = d;
+                    if (hasDistortion_ && r > 1e-8f) {
+                        poly = a * r2 * r + b * r2 + c * r + d;
+                    }
+
+                    for (int i = 0; i < 3; i++) {
+                        float tcaScale = 1.0f;
+                        if (hasTca_) {
+                            if (i == 0) tcaScale = tca_.vr;
+                            else if (i == 2) tcaScale = tca_.vb;
+                        }
+                        float sx = cx + pxs * poly * tcaScale;
+                        float sy = cy + pys * poly * tcaScale;
+                        dst[dstIdx + i] = sampleBilinearF32(data, w, h, ch, i, sx, sy);
+                    }
+                    dst[dstIdx + 3] = 1.0f;
+                }
+            }
+
+            pixels = std::move(corrected);
+        }
+
+        return true;
+    }
+
     static float lerp(float a, float b, float t) { return a + (b - a) * t; }
 
     // -- Helpers --------------------------------------------------------------
@@ -598,5 +673,34 @@ private:
                 + v11 * dx * dy;
 
         return (unsigned char)clamp(v, 0.0f, 255.0f);
+    }
+
+    static float sampleBilinearF32(const float* data,
+                                    int w, int h, int ch,
+                                    int channel, float fx, float fy) {
+        int x0 = (int)fx;
+        int y0 = (int)fy;
+        int x1 = x0 + 1;
+        int y1 = y0 + 1;
+
+        x0 = clamp(x0, 0, w - 1);
+        y0 = clamp(y0, 0, h - 1);
+        x1 = clamp(x1, 0, w - 1);
+        y1 = clamp(y1, 0, h - 1);
+
+        float dx = fx - (int)fx;
+        float dy = fy - (int)fy;
+        if (dx < 0) dx = 0;
+        if (dy < 0) dy = 0;
+
+        float v00 = data[(y0 * w + x0) * ch + channel];
+        float v10 = data[(y0 * w + x1) * ch + channel];
+        float v01 = data[(y1 * w + x0) * ch + channel];
+        float v11 = data[(y1 * w + x1) * ch + channel];
+
+        return v00 * (1 - dx) * (1 - dy)
+             + v10 * dx * (1 - dy)
+             + v01 * (1 - dx) * dy
+             + v11 * dx * dy;
     }
 };

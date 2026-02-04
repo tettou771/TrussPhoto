@@ -5,8 +5,17 @@ void tcApp::setup() {
     // 1. Load settings
     settings_.load();
 
-    // 2. First-run: ask for library folder
-    if (settings_.isFirstRun()) {
+    // 2. Ask for library folder if first run or folder not accessible
+    bool needsFolder = settings_.isFirstRun();
+    if (!needsFolder && !settings_.libraryFolder.empty()) {
+        if (!fs::exists(settings_.libraryFolder)) {
+            logWarning() << "Library folder not accessible: " << settings_.libraryFolder
+                         << " (re-select to grant access)";
+            needsFolder = true;
+        }
+    }
+
+    if (needsFolder) {
         auto result = loadDialog(
             "Select Library Folder",
             "Choose where to store your photo library",
@@ -386,7 +395,7 @@ void tcApp::showFullImage(int index) {
 
     if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
         if (entry->isRaw) {
-            if (RawLoader::load(entry->localPath, fullPixels_)) {
+            if (RawLoader::loadFloat(entry->localPath, fullPixels_)) {
                 // Apply lens correction on CPU before GPU upload
                 if (lensEnabled_ && entry->focalLength > 0 && entry->aperture > 0) {
                     if (lensCorrector_.setup(
