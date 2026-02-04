@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <fstream>
 #include <mutex>
+#include <sys/stat.h>
 
 using namespace std;
 using namespace tc;
@@ -121,6 +122,10 @@ public:
     void setServerUrl(const string& url) {
         client_.setBaseUrl(url);
         serverChecked_ = false;
+    }
+
+    void setApiKey(const string& key) {
+        client_.setBearerToken(key);
     }
 
     void setThumbnailCacheDir(const string& dir) {
@@ -309,11 +314,18 @@ public:
 
             // Queue file copy if library folder is configured and source is outside it
             if (!libraryFolder_.empty()) {
-                fs::path srcParent = fs::path(path).parent_path();
-                fs::path libPath = fs::path(libraryFolder_);
-                if (srcParent != libPath) {
+                fs::path libPath = fs::canonical(fs::path(libraryFolder_));
+                fs::path srcCanonical = fs::canonical(fs::path(path));
+                string srcStr = srcCanonical.string();
+                string libStr = libPath.string();
+                // Skip if source is already inside library folder
+                if (srcStr.substr(0, libStr.size()) != libStr) {
+                    string subdir = dateToSubdir(photo.dateTimeOriginal, path);
+                    fs::path destDir = libPath / subdir;
+                    fs::create_directories(destDir);
+                    fs::path destPath = resolveDestPath(destDir, fname);
                     lock_guard<mutex> lock(copyMutex_);
-                    pendingCopies_.push_back({id, path, (libPath / fname).string()});
+                    pendingCopies_.push_back({id, path, destPath.string()});
                 }
             }
         }
@@ -394,7 +406,10 @@ public:
         if (isServerReachable()) {
             auto res = client_.get("/api/photos/" + id + "/thumbnail");
             if (res.ok() && !res.body.empty()) {
-                string cachePath = thumbnailCacheDir_ + "/" + id + ".jpg";
+                string subdir = dateToSubdir(photo.dateTimeOriginal, photo.localPath);
+                string cacheDir = thumbnailCacheDir_ + "/" + subdir;
+                fs::create_directories(cacheDir);
+                string cachePath = cacheDir + "/" + id + ".jpg";
                 ofstream file(cachePath, ios::binary);
                 if (file) {
                     file.write(res.body.data(), res.body.size());
@@ -509,6 +524,175 @@ public:
         return !pendingCopies_.empty() || copyThreadRunning_;
     }
 
+    // --- Library consolidation ---
+
+    // Move all files into date-based directory structure (background)
+    void consolidateLibrary() {
+        if (consolidateRunning_) {
+            logWarning() << "[Consolidate] Already running";
+            return;
+        }
+        if (libraryFolder_.empty()) {
+            logWarning() << "[Consolidate] No library folder configured";
+            return;
+        }
+
+        // Build task list on main thread
+        vector<ConsolidateTask> tasks;
+        fs::path libPath = fs::path(libraryFolder_);
+
+        for (auto& [id, photo] : photos_) {
+            if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
+
+            // Re-extract EXIF if dateTimeOriginal is missing
+            if (photo.dateTimeOriginal.empty()) {
+                extractExifMetadata(photo.localPath, photo);
+                dirty_ = true;
+            }
+
+            string subdir = dateToSubdir(photo.dateTimeOriginal, photo.localPath);
+
+            // Check if RAW file needs moving
+            fs::path expectedDir = libPath / subdir;
+            fs::path currentDir = fs::path(photo.localPath).parent_path();
+            string newRawPath;
+            string oldRawPath = photo.localPath;
+
+            bool needsRawMove = false;
+            try {
+                needsRawMove = (fs::canonical(currentDir) != fs::canonical(expectedDir));
+            } catch (...) {
+                needsRawMove = (currentDir != expectedDir);
+            }
+
+            if (needsRawMove) {
+                fs::create_directories(expectedDir);
+                fs::path dest = resolveDestPath(expectedDir, photo.filename);
+                newRawPath = dest.string();
+            }
+
+            // Check if thumbnail needs moving
+            string newThumbPath;
+            string oldThumbPath = photo.localThumbnailPath;
+            if (!photo.localThumbnailPath.empty() && fs::exists(photo.localThumbnailPath) &&
+                !thumbnailCacheDir_.empty()) {
+                fs::path expectedThumbDir = fs::path(thumbnailCacheDir_) / subdir;
+                fs::path currentThumbDir = fs::path(photo.localThumbnailPath).parent_path();
+
+                bool needsThumbMove = false;
+                try {
+                    needsThumbMove = (fs::canonical(currentThumbDir) != fs::canonical(expectedThumbDir));
+                } catch (...) {
+                    needsThumbMove = (currentThumbDir != expectedThumbDir);
+                }
+
+                if (needsThumbMove) {
+                    fs::create_directories(expectedThumbDir);
+                    string thumbFilename = fs::path(photo.localThumbnailPath).filename().string();
+                    newThumbPath = (expectedThumbDir / thumbFilename).string();
+                }
+            }
+
+            if (!newRawPath.empty() || !newThumbPath.empty()) {
+                tasks.push_back({
+                    id,
+                    newRawPath.empty() ? "" : oldRawPath,
+                    newRawPath,
+                    newThumbPath.empty() ? "" : oldThumbPath,
+                    newThumbPath
+                });
+            }
+        }
+
+        if (tasks.empty()) {
+            logNotice() << "[Consolidate] All files already in correct location";
+            return;
+        }
+
+        consolidateTotal_ = (int)tasks.size();
+        consolidateProgress_ = 0;
+        consolidateRunning_ = true;
+
+        if (consolidateThread_.joinable()) consolidateThread_.join();
+
+        consolidateThread_ = thread([this, tasks = std::move(tasks)]() {
+            int progress = 0;
+            for (const auto& task : tasks) {
+                bool rawOk = true;
+                bool thumbOk = true;
+
+                // Move RAW file
+                if (!task.oldPath.empty() && !task.newPath.empty()) {
+                    try {
+                        fs::rename(task.oldPath, task.newPath);
+                    } catch (...) {
+                        try {
+                            fs::copy_file(task.oldPath, task.newPath);
+                            fs::remove(task.oldPath);
+                        } catch (const exception& e) {
+                            logWarning() << "[Consolidate] Failed: " << task.oldPath << " -> " << e.what();
+                            rawOk = false;
+                        }
+                    }
+                }
+
+                // Move thumbnail
+                if (!task.oldThumbnailPath.empty() && !task.newThumbnailPath.empty()) {
+                    try {
+                        fs::rename(task.oldThumbnailPath, task.newThumbnailPath);
+                    } catch (...) {
+                        try {
+                            fs::copy_file(task.oldThumbnailPath, task.newThumbnailPath);
+                            fs::remove(task.oldThumbnailPath);
+                        } catch (const exception& e) {
+                            logWarning() << "[Consolidate] Thumb failed: " << e.what();
+                            thumbOk = false;
+                        }
+                    }
+                }
+
+                if (rawOk || thumbOk) {
+                    ConsolidateTask completed = task;
+                    if (!rawOk) { completed.oldPath.clear(); completed.newPath.clear(); }
+                    if (!thumbOk) { completed.oldThumbnailPath.clear(); completed.newThumbnailPath.clear(); }
+                    lock_guard<mutex> lock(consolidateMutex_);
+                    completedConsolidates_.push_back(completed);
+                }
+
+                consolidateProgress_ = ++progress;
+            }
+
+            consolidateRunning_ = false;
+            logNotice() << "[Consolidate] Done: " << progress << " files processed";
+        });
+    }
+
+    // Process completed consolidation results (call from main thread)
+    void processConsolidateResults() {
+        lock_guard<mutex> lock(consolidateMutex_);
+        for (const auto& result : completedConsolidates_) {
+            auto it = photos_.find(result.photoId);
+            if (it == photos_.end()) continue;
+
+            if (!result.newPath.empty()) {
+                it->second.localPath = result.newPath;
+                dirty_ = true;
+            }
+            if (!result.newThumbnailPath.empty()) {
+                it->second.localThumbnailPath = result.newThumbnailPath;
+                dirty_ = true;
+            }
+        }
+        completedConsolidates_.clear();
+    }
+
+    bool isConsolidateRunning() const { return consolidateRunning_; }
+    int getConsolidateTotal() const { return consolidateTotal_; }
+    int getConsolidateProgress() const { return consolidateProgress_; }
+    void joinConsolidate() {
+        if (consolidateThread_.joinable()) consolidateThread_.join();
+    }
+
 private:
     HttpClient client_;
     unordered_map<string, PhotoEntry> photos_;
@@ -531,6 +715,22 @@ private:
     vector<CopyTask> completedCopies_;
     bool copyThreadRunning_ = false;
     thread copyThread_;
+
+    // Background consolidation
+    struct ConsolidateTask {
+        string photoId;
+        string oldPath;
+        string newPath;
+        string oldThumbnailPath;
+        string newThumbnailPath;
+    };
+
+    mutable mutex consolidateMutex_;
+    vector<ConsolidateTask> completedConsolidates_;
+    atomic<bool> consolidateRunning_{false};
+    atomic<int> consolidateTotal_{0};
+    atomic<int> consolidateProgress_{0};
+    thread consolidateThread_;
 
     void startCopyThread() {
         lock_guard<mutex> lock(copyMutex_);
@@ -585,7 +785,10 @@ private:
 
     void saveThumbnailCache(const string& id, PhotoEntry& photo, const Pixels& pixels) {
         if (thumbnailCacheDir_.empty()) return;
-        string cachePath = thumbnailCacheDir_ + "/" + id + ".jpg";
+        string subdir = dateToSubdir(photo.dateTimeOriginal, photo.localPath);
+        string dir = thumbnailCacheDir_ + "/" + subdir;
+        fs::create_directories(dir);
+        string cachePath = dir + "/" + id + ".jpg";
         const_cast<Pixels&>(pixels).save(cachePath);
         photo.localThumbnailPath = cachePath;
         dirty_ = true;
@@ -617,6 +820,7 @@ private:
             photo.focalLength = getFloat("Exif.Photo.FocalLength");
             photo.aperture = getFloat("Exif.Photo.FNumber");
             photo.iso = getFloat("Exif.Photo.ISOSpeedRatings");
+            photo.dateTimeOriginal = getString("Exif.Photo.DateTimeOriginal");
 
             // Image dimensions from EXIF
             auto wIt = exif.findKey(Exiv2::ExifKey("Exif.Photo.PixelXDimension"));
@@ -632,6 +836,51 @@ private:
         } catch (...) {
             // exiv2 failed, leave metadata empty
         }
+    }
+
+    // Convert "YYYY:MM:DD HH:MM:SS" to "YYYY/MM/DD", fallback to mtime or "unknown"
+    static string dateToSubdir(const string& dateTimeOriginal, const string& filePath = "") {
+        // Try parsing EXIF date format
+        if (dateTimeOriginal.size() >= 10 && dateTimeOriginal[4] == ':' && dateTimeOriginal[7] == ':') {
+            string y = dateTimeOriginal.substr(0, 4);
+            string m = dateTimeOriginal.substr(5, 2);
+            string d = dateTimeOriginal.substr(8, 2);
+            // Validate numeric
+            if (y.find_first_not_of("0123456789") == string::npos &&
+                m.find_first_not_of("0123456789") == string::npos &&
+                d.find_first_not_of("0123456789") == string::npos) {
+                return y + "/" + m + "/" + d;
+            }
+        }
+        // Fallback: file modification time via stat
+        if (!filePath.empty() && fs::exists(filePath)) {
+            try {
+                struct stat st;
+                if (stat(filePath.c_str(), &st) == 0) {
+                    tm ltm;
+                    localtime_r(&st.st_mtime, &ltm);
+                    char buf[16];
+                    snprintf(buf, sizeof(buf), "%04d/%02d/%02d",
+                             ltm.tm_year + 1900, ltm.tm_mon + 1, ltm.tm_mday);
+                    return string(buf);
+                }
+            } catch (...) {}
+        }
+        return "unknown";
+    }
+
+    // Resolve destination path, adding -1, -2 suffix if file already exists
+    static fs::path resolveDestPath(const fs::path& dir, const string& filename) {
+        fs::path dest = dir / filename;
+        if (!fs::exists(dest)) return dest;
+
+        string stem = fs::path(filename).stem().string();
+        string ext = fs::path(filename).extension().string();
+        for (int i = 1; i < 10000; i++) {
+            dest = dir / (stem + "-" + to_string(i) + ext);
+            if (!fs::exists(dest)) return dest;
+        }
+        return dest; // unlikely fallback
     }
 
     static void resizePixels(Pixels& src, int newW, int newH) {

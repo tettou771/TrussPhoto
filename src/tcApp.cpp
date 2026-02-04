@@ -37,6 +37,7 @@ void tcApp::setup() {
     provider_.setLibraryPath(getDataPath("library.json"));
     provider_.setLibraryFolder(settings_.libraryFolder);
     provider_.setServerUrl(settings_.serverUrl);
+    provider_.setApiKey(settings_.apiKey);
 
     // 4. Load library (instant display from previous session)
     bool hasLibrary = provider_.loadLibrary();
@@ -58,6 +59,7 @@ void tcApp::setup() {
     // 6. Start upload queue (only if server configured)
     if (settings_.hasServer()) {
         uploadQueue_.setServerUrl(settings_.serverUrl);
+        uploadQueue_.setApiKey(settings_.apiKey);
         uploadQueue_.start();
         // 7. Trigger server sync on next frame
         needsServerSync_ = true;
@@ -74,10 +76,13 @@ void tcApp::setup() {
             };
         });
 
-    mcp::tool("set_server", "Set server URL (empty to disable)")
+    mcp::tool("set_server", "Set server URL and API key (empty URL to disable)")
         .arg<string>("url", "Server URL (e.g. http://localhost:8080)")
-        .bind([this](const string& url) {
-            configureServer(url);
+        .arg<string>("apiKey", "API key for authentication", false)
+        .bind([this](const json& args) {
+            string url = args.at("url").get<string>();
+            string key = args.contains("apiKey") ? args["apiKey"].get<string>() : "";
+            configureServer(url, key);
             return json{{"status", "ok"}, {"serverUrl", url}};
         });
 
@@ -97,6 +102,18 @@ void tcApp::setup() {
                 {"missing", missing},
                 {"added", added},
                 {"total", (int)provider_.getCount()}
+            };
+        });
+
+    mcp::tool("consolidate_library", "Reorganize library into date-based directory structure")
+        .bind([this]() {
+            if (provider_.isConsolidateRunning()) {
+                return json{{"status", "error"}, {"message", "Already running"}};
+            }
+            provider_.consolidateLibrary();
+            return json{
+                {"status", "ok"},
+                {"total", provider_.getConsolidateTotal()}
             };
         });
 
@@ -141,6 +158,9 @@ void tcApp::update() {
 
     // Process background file copies
     provider_.processCopyResults();
+
+    // Process consolidation results
+    provider_.processConsolidateResults();
 
     // Process upload results
     UploadResult uploadResult;
@@ -211,8 +231,13 @@ void tcApp::draw() {
     string serverLabel = provider_.isServerConnected() ? "Server" : "Offline";
     size_t pending = uploadQueue_.getPendingCount();
     string uploadStatus = pending > 0 ? format("  Upload: {}", pending) : "";
-    drawBitmapString(format("{}  Photos: {}{}  FPS: {:.0f}",
-        serverLabel, provider_.getCount(), uploadStatus, getFrameRate()),
+    string consolidateStatus;
+    if (provider_.isConsolidateRunning()) {
+        consolidateStatus = format("  Consolidate: {}/{}",
+            provider_.getConsolidateProgress(), provider_.getConsolidateTotal());
+    }
+    drawBitmapString(format("{}  Photos: {}{}{}  FPS: {:.0f}",
+        serverLabel, provider_.getCount(), uploadStatus, consolidateStatus, getFrameRate()),
         dotX + 14, barY + 7);
 }
 
@@ -257,6 +282,8 @@ void tcApp::keyPressed(int key) {
         // Grid mode keys
         if (key == 'R' || key == 'r') {
             repairLibrary();
+        } else if (key == 'C') {  // Shift+C only (uppercase)
+            consolidateLibrary();
         }
     }
 }
@@ -348,6 +375,12 @@ void tcApp::filesDropped(const vector<string>& files) {
 void tcApp::exit() {
     uploadQueue_.stop();
     if (syncThread_.joinable()) syncThread_.join();
+    // Wait for consolidation to finish before saving
+    if (provider_.isConsolidateRunning()) {
+        logNotice() << "Waiting for consolidation to finish...";
+    }
+    provider_.joinConsolidate();
+    provider_.processConsolidateResults();
     provider_.saveLibrary();
     logNotice() << "TrussPhoto exiting";
 }
@@ -364,16 +397,21 @@ void tcApp::enqueueLocalOnlyPhotos() {
     }
 }
 
-void tcApp::configureServer(const string& url) {
+void tcApp::configureServer(const string& url, const string& key) {
     settings_.serverUrl = url;
+    if (!key.empty()) {
+        settings_.apiKey = key;
+    }
     settings_.save();
 
     provider_.setServerUrl(url);
+    provider_.setApiKey(settings_.apiKey);
     provider_.resetServerCheck();
 
     if (settings_.hasServer()) {
         // Start upload queue if not running
         uploadQueue_.setServerUrl(url);
+        uploadQueue_.setApiKey(settings_.apiKey);
         uploadQueue_.start();
         // Trigger sync
         needsServerSync_ = true;
@@ -395,6 +433,19 @@ void tcApp::repairLibrary() {
     // Trigger server sync to resolve Missing vs ServerOnly
     if (settings_.hasServer() && !syncInProgress_) {
         needsServerSync_ = true;
+    }
+}
+
+void tcApp::consolidateLibrary() {
+    if (provider_.isConsolidateRunning()) {
+        logWarning() << "[Consolidate] Already running";
+        return;
+    }
+    bool ok = confirmDialog("Consolidate Library",
+        "Reorganize all files into date-based folders (YYYY/MM/DD)?\n"
+        "This will move files within the library folder.");
+    if (ok) {
+        provider_.consolidateLibrary();
     }
 }
 

@@ -17,6 +17,7 @@ namespace fs = std::filesystem;
 class Settings {
 public:
     string serverUrl = "http://localhost:8080";
+    string apiKey;           // API key for server authentication
     string libraryFolder;   // Where to copy/store photos
 
     // Load from settings.json
@@ -31,6 +32,7 @@ public:
             nlohmann::json j;
             file >> j;
             serverUrl = j.value("serverUrl", serverUrl);
+            apiKey = j.value("apiKey", string(""));
             libraryFolder = j.value("libraryFolder", string(""));
             return true;
         } catch (...) {
@@ -43,6 +45,7 @@ public:
         string path = getSettingsPath();
         nlohmann::json j = {
             {"serverUrl", serverUrl},
+            {"apiKey", apiKey},
             {"libraryFolder", libraryFolder}
         };
         ofstream file(path);

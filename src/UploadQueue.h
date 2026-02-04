@@ -39,6 +39,10 @@ public:
         serverUrl_ = url;
     }
 
+    void setApiKey(const string& key) {
+        apiKey_ = key;
+    }
+
     // Enqueue a photo for upload
     void enqueue(const string& photoId, const string& localPath) {
         lock_guard<mutex> lock(queueMutex_);
@@ -77,6 +81,7 @@ protected:
     void threadedFunction() override {
         HttpClient client;
         client.setBaseUrl(serverUrl_);
+        client.setBearerToken(apiKey_);
 
         while (isThreadRunning()) {
             UploadTask task;
@@ -137,6 +142,7 @@ protected:
 
 private:
     string serverUrl_;
+    string apiKey_;
     deque<UploadTask> pending_;
     mutex queueMutex_;
     ThreadChannel<UploadResult> resultChannel_;

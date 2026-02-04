@@ -79,7 +79,8 @@ private:
     void exitFullImage();
     void drawSingleView();
     void enqueueLocalOnlyPhotos();
-    void configureServer(const string& url);
+    void configureServer(const string& url, const string& key = "");
     void loadProfileForEntry(const PhotoEntry& entry);
     void repairLibrary();
+    void consolidateLibrary();
 };
