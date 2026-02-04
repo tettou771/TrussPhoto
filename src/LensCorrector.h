@@ -114,16 +114,24 @@ public:
         width_ = width;
         height_ = height;
         cropFactor_ = cropFactor;
+        focalLength_ = focalLength;
         hasDistortion_ = !found->distortion.empty();
         hasVignetting_ = !found->vignetting.empty();
         hasTca_ = !found->tca.empty();
         ready_ = hasDistortion_ || hasVignetting_ || hasTca_;
 
+        // Compute auto-scale to crop black borders from distortion correction
+        autoScale_ = 1.0f;
+        if (hasDistortion_) {
+            computeAutoScale();
+        }
+
         if (ready_) {
             logNotice() << "[LensCorrector] Corrections: "
                         << (hasDistortion_ ? "distortion " : "")
                         << (hasVignetting_ ? "vignetting " : "")
-                        << (hasTca_ ? "TCA" : "");
+                        << (hasTca_ ? "TCA" : "")
+                        << " autoScale=" << autoScale_;
         }
         return ready_;
     }
@@ -142,25 +150,31 @@ public:
         unsigned char* data = pixels.getData();
         float cx = w * 0.5f;
         float cy = h * 0.5f;
-        float rNorm = min(cx, cy); // normalization radius
+        // Vignetting PA model: r=1 at image corner (half-diagonal)
+        float rNormVig = sqrt(cx * cx + cy * cy);
+
+        // Distortion/TCA: lensfun-compatible NormScale
+        // NormScale = sensor_diag / crop / image_diag / focal
+        float sensorDiag = sqrt(36.0f * 36.0f + 24.0f * 24.0f); // 43.27mm full-frame
+        float imageDiag = sqrt((w + 1.0f) * (w + 1.0f) + (h + 1.0f) * (h + 1.0f));
+        float distNormScale = sensorDiag / cropFactor_ / imageDiag / focalLength_;
 
         // 1. Vignetting correction (in-place)
         if (hasVignetting_) {
             for (int y = 0; y < h; y++) {
                 for (int x = 0; x < w; x++) {
-                    float dx = (x - cx) / rNorm;
-                    float dy = (y - cy) / rNorm;
+                    float dx = (x - cx) / rNormVig;
+                    float dy = (y - cy) / rNormVig;
                     float r2 = dx * dx + dy * dy;
                     float r4 = r2 * r2;
                     float r6 = r4 * r2;
                     float v = 1.0f + vig_.k1 * r2 + vig_.k2 * r4 + vig_.k3 * r6;
-                    if (v > 0.0f) {
-                        float correction = 1.0f / v;
-                        int idx = (y * w + x) * ch;
-                        for (int c = 0; c < 3; c++) {
-                            float val = data[idx + c] * correction;
-                            data[idx + c] = (unsigned char)clamp(val, 0.0f, 255.0f);
-                        }
+                    if (v < 0.01f) v = 0.01f; // clamp like lensfun
+                    float correction = 1.0f / v;
+                    int idx = (y * w + x) * ch;
+                    for (int c = 0; c < 3; c++) {
+                        float val = data[idx + c] * correction;
+                        data[idx + c] = (unsigned char)clamp(val, 0.0f, 255.0f);
                     }
                 }
             }
@@ -176,35 +190,43 @@ public:
                 for (int x = 0; x < w; x++) {
                     int dstIdx = (y * w + x) * ch;
 
-                    // Normalized coordinates from center
-                    float dx = (x - cx) / rNorm;
-                    float dy = (y - cy) / rNorm;
-                    float r = sqrt(dx * dx + dy * dy);
+                    // Pixel offset from center
+                    float pxDx = x - cx;
+                    float pxDy = y - cy;
+
+                    // Normalize + auto-scale (applied before TCA/distortion)
+                    float nx = pxDx * distNormScale * autoScale_;
+                    float ny = pxDy * distNormScale * autoScale_;
+                    float r = sqrt(nx * nx + ny * ny);
 
                     // Per-channel coordinate remap
+                    // lensfun order: TCA first, then distortion
                     for (int c = 0; c < 3; c++) {
-                        float channelR = r;
-
-                        // TCA: scale radius per channel
+                        // TCA: per-channel radius scaling
+                        float tcaScale = 1.0f;
                         if (hasTca_) {
-                            if (c == 0) channelR *= tca_.vr;      // Red
-                            else if (c == 2) channelR *= tca_.vb; // Blue
-                            // Green: no change
+                            if (c == 0) tcaScale = tca_.vr;       // Red
+                            else if (c == 2) tcaScale = tca_.vb;  // Blue
                         }
+                        float channelR = r * tcaScale;
 
-                        // Distortion: PTLens model
-                        float newR = channelR;
+                        // Distortion: PTLens model (direct)
+                        // Rd = Ru * (a*Ru³ + b*Ru² + c*Ru + d), d=1-a-b-c
+                        // distScale = poly(Ru) = Rd/Ru
+                        float distScale = 1.0f;
                         if (hasDistortion_ && channelR > 0.0001f) {
                             float r2 = channelR * channelR;
                             float r3 = r2 * channelR;
                             float d = 1.0f - dist_.a - dist_.b - dist_.c;
-                            newR = dist_.a * r3 + dist_.b * r2 + dist_.c * channelR + d * channelR;
+                            float poly = dist_.a * r3 + dist_.b * r2 + dist_.c * channelR + d;
+                            // Double the correction amount for testing
+                            distScale = 1.0f + 2.0f * (poly - 1.0f);
                         }
 
-                        // Map back to pixel coordinates
-                        float scale = (r > 0.0001f) ? (newR / r) : 1.0f;
-                        float sx = cx + dx * scale * rNorm;
-                        float sy = cy + dy * scale * rNorm;
+                        // Combined: autoScale * TCA * distortion
+                        float totalScale = autoScale_ * tcaScale * distScale;
+                        float sx = cx + pxDx * totalScale;
+                        float sy = cy + pxDy * totalScale;
 
                         dst[dstIdx + c] = sampleBilinear(data, w, h, ch, c, sx, sy);
                     }
@@ -225,12 +247,69 @@ private:
     bool ready_ = false;
     int width_ = 0, height_ = 0;
     float cropFactor_ = 1.0f;
+    float focalLength_ = 50.0f;
     bool hasDistortion_ = false, hasVignetting_ = false, hasTca_ = false;
+    float autoScale_ = 1.0f;
 
     // Interpolated parameters for current setup
     struct { float a = 0, b = 0, c = 0; } dist_;
     struct { float k1 = 0, k2 = 0, k3 = 0; } vig_;
     struct { float vr = 1.0f, vb = 1.0f; } tca_;
+
+    // -- Newton's method for PTLens inversion --------------------------------
+
+    // PTLens: Ru = Rd * (a*Rd³ + b*Rd² + c*Rd + d),  d = 1-a-b-c
+    // Given Ru (undistorted), solve for Rd (distorted)
+    float solveDistortedR(float ru) const {
+        if (ru < 0.0001f) return ru;
+        float a = dist_.a, b = dist_.b, c = dist_.c;
+        float d = 1.0f - a - b - c;
+        float rd = ru; // initial guess
+        for (int i = 0; i < 10; i++) {
+            float rd2 = rd * rd;
+            float rd3 = rd2 * rd;
+            float rd4 = rd3 * rd;
+            float f = a * rd4 + b * rd3 + c * rd2 + d * rd - ru;
+            float fp = 4.0f * a * rd3 + 3.0f * b * rd2 + 2.0f * c * rd + d;
+            if (fabs(fp) < 1e-10f) break;
+            float delta = f / fp;
+            rd -= delta;
+            if (fabs(delta) < 1e-8f) break;
+        }
+        return rd;
+    }
+
+    // Compute auto-scale to crop black borders from undistortion
+    void computeAutoScale() {
+        float sensorDiag = sqrt(36.0f * 36.0f + 24.0f * 24.0f);
+        float imageDiag = sqrt((width_ + 1.0f) * (width_ + 1.0f) +
+                               (height_ + 1.0f) * (height_ + 1.0f));
+        float ns = sensorDiag / cropFactor_ / imageDiag / focalLength_;
+        float cx = width_ * 0.5f;
+        float cy = height_ * 0.5f;
+
+        // Sample edge midpoints and corners
+        float pts[][2] = {
+            {0, cy}, {(float)width_, cy},
+            {cx, 0}, {cx, (float)height_},
+            {0, 0}, {(float)width_, 0},
+            {0, (float)height_}, {(float)width_, (float)height_}
+        };
+
+        float maxScale = 0;
+        for (auto& p : pts) {
+            float r = sqrt((p[0] - cx) * (p[0] - cx) + (p[1] - cy) * (p[1] - cy)) * ns;
+            if (r < 0.001f) continue;
+            float r2 = r * r;
+            float r3 = r2 * r;
+            float d = 1.0f - dist_.a - dist_.b - dist_.c;
+            float poly = dist_.a * r3 + dist_.b * r2 + dist_.c * r + d;
+            float s = 1.0f + 2.0f * (poly - 1.0f); // match doubled correction
+            if (s > maxScale) maxScale = s;
+        }
+
+        autoScale_ = (maxScale > 1.0f) ? (1.0f / maxScale) : 1.0f;
+    }
 
     // -- XML Parsing ----------------------------------------------------------
 
@@ -442,11 +521,30 @@ private:
 
     // -- Helpers --------------------------------------------------------------
 
+    // Normalize lens/camera name for matching:
+    // lowercase, remove slashes, collapse whitespace
+    static string normalizeName(const string& s) {
+        string out;
+        out.reserve(s.size());
+        bool lastSpace = false;
+        for (char c : s) {
+            if (c == '/') continue;  // "f/4" -> "f4"
+            char lc = ::tolower(c);
+            if (lc == ' ') {
+                if (!lastSpace) out += ' ';
+                lastSpace = true;
+            } else {
+                out += lc;
+                lastSpace = false;
+            }
+        }
+        return out;
+    }
+
     static bool containsIgnoreCase(const string& haystack, const string& needle) {
         if (needle.empty() || haystack.empty()) return false;
-        string h = haystack, n = needle;
-        transform(h.begin(), h.end(), h.begin(), ::tolower);
-        transform(n.begin(), n.end(), n.begin(), ::tolower);
+        string h = normalizeName(haystack);
+        string n = normalizeName(needle);
         return h.find(n) != string::npos;
     }
 
