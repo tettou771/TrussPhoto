@@ -113,12 +113,42 @@ bin/data/
 
 ## 使用アドオン
 
+クライアント（addons.make に記載）:
 - **tcxCurl** - HTTPクライアント（libcurl / Emscripten Fetch）
-- **tcxLibRaw** - RAW画像デコード（LibRaw、FetchContent）
+- **tcxLibRaw** - RAW画像デコード（LibRaw、FetchContent、OpenMP並列デモザイク）
 - **tcxLut** - LUTカラーグレーディング（GPU シェーダー、header-only）
-- **tcxExiv2** - EXIF/MakerNote メタデータ（libexiv2、brew前提）
-- **tcxLensfun** - レンズ補正（lensfun、brew前提）
-- **tcxCrow** - HTTPサーバ（Crow） ※サーバのみ
+
+サーバのみ:
+- **tcxCrow** - HTTPサーバ（Crow）
+
+アドオン不使用（直接リンク）:
+- **exiv2** - EXIF/MakerNote メタデータ（brew の dylib を local.cmake でリンク）
+- **lensfun** - レンズ補正は自前実装（`LensCorrector.h`）。lensfun の XML DB のみ使用
+
+### アドオンの Git 管理
+
+アドオン（`TrussC/addons/tcx*`）は TrussC 本体リポジトリとは**別の独立した Git リポジトリ**で管理されている。
+TrussC の `.gitignore` がアドオンディレクトリ配下の `.git` を無視するため、各アドオンは個別にコミット・プッシュが必要。
+
+```
+TrussC/                    ← TrussC 本体 (git repo)
+├── trussc/                ← コアライブラリ
+├── addons/
+│   ├── tcxCurl/           ← 独立 git repo
+│   ├── tcxLibRaw/         ← 独立 git repo
+│   ├── tcxLut/            ← 独立 git repo
+│   ├── tcxCrow/           ← 独立 git repo
+│   └── ...               （他にも tcxBox2d, tcxOsc 等あり）
+├── apps/
+│   ├── TrussPhoto/        ← 独立 git repo (このプロジェクト)
+│   └── TrussPhotoServer/  ← TrussC 本体 repo に含まれる
+└── ...
+```
+
+**コミット時の注意:**
+- アドオンを変更した場合、そのアドオンのディレクトリに `cd` してからコミットする
+- TrussPhoto のコミットとアドオンのコミットは別々に行う
+- `apps/TrussPhotoServer` は TrussC 本体リポジトリに含まれるので注意（独立 repo ではない）
 
 ## 開発時の注意点・失敗談
 
