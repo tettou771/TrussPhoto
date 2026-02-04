@@ -24,10 +24,11 @@ namespace fs = std::filesystem;
 
 // Sync state of a photo
 enum class SyncState {
-    LocalOnly = 0,   // Only on local disk (not yet uploaded)
-    Syncing   = 1,   // Upload in progress
-    Synced    = 2,   // Both local and server
-    ServerOnly = 3   // Only on server (local RAW deleted)
+    LocalOnly  = 0,   // Only on local disk (not yet uploaded)
+    Syncing    = 1,   // Upload in progress
+    Synced     = 2,   // Both local and server
+    ServerOnly = 3,   // Only on server (local RAW deleted)
+    Missing    = 4    // In library.json but localPath file not found
 };
 
 // Photo entry with sync awareness
@@ -202,6 +203,69 @@ public:
         }
     }
 
+    // --- Library validation ---
+
+    // Check all entries for missing local files, returns count of newly missing/changed
+    int validateLibrary() {
+        int changedCount = 0;
+        for (auto& [id, photo] : photos_) {
+            // ServerOnly has no local file by design
+            if (photo.syncState == SyncState::ServerOnly) continue;
+
+            if (photo.localPath.empty() || !fs::exists(photo.localPath)) {
+                if (photo.syncState == SyncState::Synced) {
+                    // Server still has it — just lost the local copy
+                    photo.syncState = SyncState::ServerOnly;
+                    dirty_ = true;
+                    changedCount++;
+                } else if (photo.syncState != SyncState::Missing) {
+                    // LocalOnly / Syncing — truly lost
+                    photo.syncState = SyncState::Missing;
+                    dirty_ = true;
+                    changedCount++;
+                }
+            } else {
+                // File reappeared — restore to LocalOnly
+                if (photo.syncState == SyncState::Missing) {
+                    photo.syncState = SyncState::LocalOnly;
+                    dirty_ = true;
+                    changedCount++;
+                }
+            }
+        }
+        return changedCount;
+    }
+
+    // Scan library folder for unregistered files, returns count of added
+    int scanLibraryFolder() {
+        if (libraryFolder_.empty() || !fs::exists(libraryFolder_)) return 0;
+
+        int addedCount = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(libraryFolder_)) {
+            if (!entry.is_regular_file()) continue;
+            if (!isSupportedImage(entry.path())) continue;
+
+            string fname = entry.path().filename().string();
+            uintmax_t fsize = entry.file_size();
+            string id = fname + "_" + to_string(fsize);
+
+            if (photos_.count(id)) continue;
+
+            PhotoEntry photo;
+            photo.id = id;
+            photo.filename = fname;
+            photo.fileSize = fsize;
+            photo.localPath = entry.path().string();
+            photo.isRaw = RawLoader::isRawFile(entry.path());
+            photo.syncState = SyncState::LocalOnly;
+            extractExifMetadata(photo.localPath, photo);
+            photos_[id] = photo;
+            dirty_ = true;
+            addedCount++;
+        }
+        return addedCount;
+    }
+
     // --- Scan and import ---
 
     // Scan local folder for image files (non-blocking, copies happen in background)
@@ -279,8 +343,13 @@ public:
 
             if (photos_.count(id)) {
                 // Already known locally
-                if (photos_[id].syncState == SyncState::LocalOnly) {
-                    photos_[id].syncState = SyncState::Synced;
+                auto& state = photos_[id].syncState;
+                if (state == SyncState::LocalOnly) {
+                    state = SyncState::Synced;
+                    dirty_ = true;
+                } else if (state == SyncState::Missing) {
+                    // Local file gone but server has it → ServerOnly
+                    state = SyncState::ServerOnly;
                     dirty_ = true;
                 }
             } else {

@@ -81,6 +81,25 @@ void tcApp::setup() {
             return json{{"status", "ok"}, {"serverUrl", url}};
         });
 
+    mcp::tool("repair_library", "Validate library and scan for unregistered files")
+        .bind([this]() {
+            int missing = provider_.validateLibrary();
+            int added = provider_.scanLibraryFolder();
+            if (missing > 0 || added > 0) {
+                provider_.saveLibrary();
+                grid_->populate(provider_);
+            }
+            if (settings_.hasServer() && !syncInProgress_) {
+                needsServerSync_ = true;
+            }
+            return json{
+                {"status", "ok"},
+                {"missing", missing},
+                {"added", added},
+                {"total", (int)provider_.getCount()}
+            };
+        });
+
     // 9. Camera profile manager
     string home = getenv("HOME") ? getenv("HOME") : ".";
     profileManager_.setProfileDir(home + "/.trussc/profiles");
@@ -234,6 +253,11 @@ void tcApp::keyPressed(int key) {
                 reprocessImage();
             }
         }
+    } else {
+        // Grid mode keys
+        if (key == 'R' || key == 'r') {
+            repairLibrary();
+        }
     }
 }
 
@@ -357,6 +381,20 @@ void tcApp::configureServer(const string& url) {
     } else {
         uploadQueue_.stop();
         logNotice() << "Server disabled, running in local-only mode";
+    }
+}
+
+void tcApp::repairLibrary() {
+    int missing = provider_.validateLibrary();
+    int added = provider_.scanLibraryFolder();
+    logNotice() << "[Repair] Missing: " << missing << ", Added: " << added;
+    if (missing > 0 || added > 0) {
+        provider_.saveLibrary();
+        grid_->populate(provider_);
+    }
+    // Trigger server sync to resolve Missing vs ServerOnly
+    if (settings_.hasServer() && !syncInProgress_) {
+        needsServerSync_ = true;
     }
 }
 

@@ -230,6 +230,10 @@ public:
                 setColor(0.7f, 0.5f, 0.9f);   // purple
                 drawCircle(badgeX, badgeY, badgeSize);
                 break;
+            case SyncState::Missing:
+                setColor(0.9f, 0.3f, 0.3f);   // red
+                drawCircle(badgeX, badgeY, badgeSize);
+                break;
         }
     }
 

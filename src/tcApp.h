@@ -81,4 +81,5 @@ private:
     void enqueueLocalOnlyPhotos();
     void configureServer(const string& url);
     void loadProfileForEntry(const PhotoEntry& entry);
+    void repairLibrary();
 };
