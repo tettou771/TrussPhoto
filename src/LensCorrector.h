@@ -185,7 +185,24 @@ public:
         // 1. Vignetting correction (in-place)
         // Uses coordinate system (2): r=1 at corner (half-diagonal)
         // Extra factor 1/arCorrection converts from (1) to (2)
+        //
+        // IMPORTANT: Our pixels are sRGB gamma-encoded (from LibRaw).
+        // Vignetting correction must be applied in linear light space.
+        // We use sRGB decode LUT → linear multiply → sRGB encode.
         if (hasVignetting_) {
+            // Build sRGB → linear LUT (256 entries, computed once)
+            static float srgb2lin[256] = {};
+            static bool lutReady = false;
+            if (!lutReady) {
+                for (int i = 0; i < 256; i++) {
+                    float v = i / 255.0f;
+                    srgb2lin[i] = (v <= 0.04045f)
+                        ? v / 12.92f
+                        : powf((v + 0.055f) / 1.055f, 2.4f);
+                }
+                lutReady = true;
+            }
+
             float vigNorm = normScale_ / arCorrection_;
             for (int y = 0; y < h; y++) {
                 float dy = (y - cy) * vigNorm;
@@ -200,8 +217,13 @@ public:
                     float correction = 1.0f / c;
                     int idx = (y * w + x) * ch;
                     for (int i = 0; i < 3; i++) {
-                        float val = data[idx + i] * correction;
-                        data[idx + i] = (unsigned char)clamp(val, 0.0f, 255.0f);
+                        // Linearize → correct → re-encode sRGB
+                        float lin = srgb2lin[data[idx + i]] * correction;
+                        // sRGB encode
+                        float s = (lin <= 0.0031308f)
+                            ? lin * 12.92f
+                            : 1.055f * powf(lin, 1.0f / 2.4f) - 0.055f;
+                        data[idx + i] = (unsigned char)clamp(s * 255.0f, 0.0f, 255.0f);
                     }
                 }
             }
