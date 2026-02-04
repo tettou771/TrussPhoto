@@ -6,6 +6,7 @@
 
 int main() {
     tc::WindowSettings settings;
+    settings.setHighDpi(true);
     settings.setSize(960, 600);
 
     return tc::runApp<tcApp>(settings);

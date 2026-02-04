@@ -18,6 +18,7 @@
 #include <pugixml/pugixml.hpp>
 #include <cstring>
 #include <algorithm>
+#include <thread>
 using namespace std;
 using namespace tc;
 
@@ -170,6 +171,9 @@ public:
     bool isReady() const { return ready_; }
 
     // Apply lens corrections to RGBA pixels (auto-detects U8/F32)
+    // TODO: template-ify applyU8/applyFloat — core loop is identical,
+    //       difference is sRGB conversion (U8 uses LUT, F32 uses powf)
+    //       and bilinear sampling (unsigned char vs float).
     bool apply(Pixels& pixels) {
         if (!ready_) return false;
         if (pixels.isFloat()) return applyFloat(pixels);
@@ -425,7 +429,7 @@ private:
         }
     }
 
-    // Apply corrections to U8 pixels (original implementation)
+    // Apply corrections to U8 pixels (multi-threaded)
     bool applyU8(Pixels& pixels) {
         if (pixels.isFloat()) return false;
         int w = pixels.getWidth();
@@ -436,8 +440,9 @@ private:
         unsigned char* data = pixels.getData();
         float cx = (w - 1) * 0.5f;
         float cy = (h - 1) * 0.5f;
+        int nThreads = max(1u, std::thread::hardware_concurrency());
 
-        // 1. Vignetting correction (in-place, linear light)
+        // 1. Vignetting correction (in-place, linear light, parallel by rows)
         if (hasVignetting_) {
             static float srgb2lin[256] = {};
             static bool lutReady = false;
@@ -452,7 +457,9 @@ private:
             }
 
             float vigNorm = normScale_ / arCorrection_;
-            for (int y = 0; y < h; y++) {
+            float vk1 = vig_.k1, vk2 = vig_.k2, vk3 = vig_.k3;
+
+            parallelRows(h, nThreads, [=](int y) {
                 float dy = (y - cy) * vigNorm;
                 float dy2 = dy * dy;
                 for (int x = 0; x < w; x++) {
@@ -460,7 +467,7 @@ private:
                     float r2 = dx * dx + dy2;
                     float r4 = r2 * r2;
                     float r6 = r4 * r2;
-                    float c = 1.0f + vig_.k1 * r2 + vig_.k2 * r4 + vig_.k3 * r6;
+                    float c = 1.0f + vk1 * r2 + vk2 * r4 + vk3 * r6;
                     if (c < 0.01f) c = 0.01f;
                     float correction = 1.0f / c;
                     int idx = (y * w + x) * ch;
@@ -472,40 +479,43 @@ private:
                         data[idx + i] = (unsigned char)clamp(s * 255.0f, 0.0f, 255.0f);
                     }
                 }
-            }
+            });
         }
 
-        // 2. Distortion + TCA correction
+        // 2. Distortion + TCA correction (parallel by rows)
         if (hasDistortion_ || hasTca_) {
             Pixels corrected;
             corrected.allocate(w, h, ch);
             unsigned char* dst = corrected.getData();
 
-            float a = dist_.a, b = dist_.b, c = dist_.c;
-            float d = 1.0f - a - b - c;
+            float a = dist_.a, b = dist_.b, c_coeff = dist_.c;
+            float d = 1.0f - a - b - c_coeff;
+            float as = autoScale_, ns = normScale_;
+            float tvr = tca_.vr, tvb = tca_.vb;
+            bool doDist = hasDistortion_, doTca = hasTca_;
 
-            for (int y = 0; y < h; y++) {
+            parallelRows(h, nThreads, [=](int y) {
                 for (int x = 0; x < w; x++) {
                     int dstIdx = (y * w + x) * ch;
                     float px = (x - cx);
                     float py = (y - cy);
-                    float pxs = px * autoScale_;
-                    float pys = py * autoScale_;
-                    float nx = pxs * normScale_;
-                    float ny = pys * normScale_;
+                    float pxs = px * as;
+                    float pys = py * as;
+                    float nx = pxs * ns;
+                    float ny = pys * ns;
                     float r2 = nx * nx + ny * ny;
                     float r = sqrt(r2);
 
                     float poly = d;
-                    if (hasDistortion_ && r > 1e-8f) {
-                        poly = a * r2 * r + b * r2 + c * r + d;
+                    if (doDist && r > 1e-8f) {
+                        poly = a * r2 * r + b * r2 + c_coeff * r + d;
                     }
 
                     for (int i = 0; i < 3; i++) {
                         float tcaScale = 1.0f;
-                        if (hasTca_) {
-                            if (i == 0) tcaScale = tca_.vr;
-                            else if (i == 2) tcaScale = tca_.vb;
+                        if (doTca) {
+                            if (i == 0) tcaScale = tvr;
+                            else if (i == 2) tcaScale = tvb;
                         }
                         float sx = cx + pxs * poly * tcaScale;
                         float sy = cy + pys * poly * tcaScale;
@@ -513,7 +523,7 @@ private:
                     }
                     dst[dstIdx + 3] = 255;
                 }
-            }
+            });
 
             pixels = std::move(corrected);
         }
@@ -521,7 +531,7 @@ private:
         return true;
     }
 
-    // Apply corrections to F32 pixels (high precision)
+    // Apply corrections to F32 pixels (high precision, multi-threaded)
     bool applyFloat(Pixels& pixels) {
         int w = pixels.getWidth();
         int h = pixels.getHeight();
@@ -531,13 +541,16 @@ private:
         float* data = pixels.getDataF32();
         float cx = (w - 1) * 0.5f;
         float cy = (h - 1) * 0.5f;
+        int nThreads = max(1u, std::thread::hardware_concurrency());
+        auto t0 = std::chrono::high_resolution_clock::now();
 
-        // 1. Vignetting correction (in-place, linear light)
-        // Input is sRGB float: decode → linear multiply → re-encode
-        // Float precision avoids clipping that occurred with 8bit
+        // 1. Vignetting correction (in-place, linear light, parallel by rows)
         if (hasVignetting_) {
+            auto tv0 = std::chrono::high_resolution_clock::now();
             float vigNorm = normScale_ / arCorrection_;
-            for (int y = 0; y < h; y++) {
+            float vk1 = vig_.k1, vk2 = vig_.k2, vk3 = vig_.k3;
+
+            parallelRows(h, nThreads, [=](int y) {
                 float dy = (y - cy) * vigNorm;
                 float dy2 = dy * dy;
                 for (int x = 0; x < w; x++) {
@@ -545,59 +558,63 @@ private:
                     float r2 = dx * dx + dy2;
                     float r4 = r2 * r2;
                     float r6 = r4 * r2;
-                    float c = 1.0f + vig_.k1 * r2 + vig_.k2 * r4 + vig_.k3 * r6;
+                    float c = 1.0f + vk1 * r2 + vk2 * r4 + vk3 * r6;
                     if (c < 0.01f) c = 0.01f;
                     float correction = 1.0f / c;
                     int idx = (y * w + x) * ch;
                     for (int i = 0; i < 3; i++) {
-                        // sRGB decode
                         float v = data[idx + i];
                         float lin = (v <= 0.04045f)
                             ? v / 12.92f
                             : powf((v + 0.055f) / 1.055f, 2.4f);
-                        // Linear multiply (can exceed 1.0 in float — no clipping)
                         lin *= correction;
-                        // sRGB encode
                         float s = (lin <= 0.0031308f)
                             ? lin * 12.92f
                             : 1.055f * powf(lin, 1.0f / 2.4f) - 0.055f;
                         data[idx + i] = clamp(s, 0.0f, 1.0f);
                     }
                 }
-            }
+            });
+            auto tv1 = std::chrono::high_resolution_clock::now();
+            logNotice() << "[LensCorrector] Vignetting: "
+                << std::chrono::duration_cast<std::chrono::milliseconds>(tv1 - tv0).count() << "ms";
         }
 
-        // 2. Distortion + TCA correction (float bilinear sampling)
+        // 2. Distortion + TCA correction (float bilinear sampling, parallel by rows)
         if (hasDistortion_ || hasTca_) {
+            auto td0 = std::chrono::high_resolution_clock::now();
             Pixels corrected;
             corrected.allocate(w, h, ch, PixelFormat::F32);
             float* dst = corrected.getDataF32();
 
-            float a = dist_.a, b = dist_.b, c = dist_.c;
-            float d = 1.0f - a - b - c;
+            float a = dist_.a, b = dist_.b, c_coeff = dist_.c;
+            float d = 1.0f - a - b - c_coeff;
+            float as = autoScale_, ns = normScale_;
+            float tvr = tca_.vr, tvb = tca_.vb;
+            bool doDist = hasDistortion_, doTca = hasTca_;
 
-            for (int y = 0; y < h; y++) {
+            parallelRows(h, nThreads, [=](int y) {
                 for (int x = 0; x < w; x++) {
                     int dstIdx = (y * w + x) * ch;
                     float px = (x - cx);
                     float py = (y - cy);
-                    float pxs = px * autoScale_;
-                    float pys = py * autoScale_;
-                    float nx = pxs * normScale_;
-                    float ny = pys * normScale_;
+                    float pxs = px * as;
+                    float pys = py * as;
+                    float nx = pxs * ns;
+                    float ny = pys * ns;
                     float r2 = nx * nx + ny * ny;
                     float r = sqrt(r2);
 
                     float poly = d;
-                    if (hasDistortion_ && r > 1e-8f) {
-                        poly = a * r2 * r + b * r2 + c * r + d;
+                    if (doDist && r > 1e-8f) {
+                        poly = a * r2 * r + b * r2 + c_coeff * r + d;
                     }
 
                     for (int i = 0; i < 3; i++) {
                         float tcaScale = 1.0f;
-                        if (hasTca_) {
-                            if (i == 0) tcaScale = tca_.vr;
-                            else if (i == 2) tcaScale = tca_.vb;
+                        if (doTca) {
+                            if (i == 0) tcaScale = tvr;
+                            else if (i == 2) tcaScale = tvb;
                         }
                         float sx = cx + pxs * poly * tcaScale;
                         float sy = cy + pys * poly * tcaScale;
@@ -605,12 +622,40 @@ private:
                     }
                     dst[dstIdx + 3] = 1.0f;
                 }
-            }
+            });
 
+            auto td1 = std::chrono::high_resolution_clock::now();
+            logNotice() << "[LensCorrector] Distortion+TCA: "
+                << std::chrono::duration_cast<std::chrono::milliseconds>(td1 - td0).count() << "ms";
             pixels = std::move(corrected);
         }
 
+        auto t1 = std::chrono::high_resolution_clock::now();
+        logNotice() << "[LensCorrector] Total: "
+            << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+            << "ms (" << nThreads << " threads, " << w << "x" << h << ")";
         return true;
+    }
+
+    // Run func(y) for each row, split across nThreads
+    template<typename Func>
+    static void parallelRows(int height, int nThreads, Func func) {
+        if (nThreads <= 1) {
+            for (int y = 0; y < height; y++) func(y);
+            return;
+        }
+        vector<std::thread> threads;
+        threads.reserve(nThreads);
+        int rowsPerThread = (height + nThreads - 1) / nThreads;
+        for (int t = 0; t < nThreads; t++) {
+            int y0 = t * rowsPerThread;
+            int y1 = min(y0 + rowsPerThread, height);
+            if (y0 >= y1) break;
+            threads.emplace_back([=]() {
+                for (int y = y0; y < y1; y++) func(y);
+            });
+        }
+        for (auto& th : threads) th.join();
     }
 
     static float lerp(float a, float b, float t) { return a + (b - a) * t; }

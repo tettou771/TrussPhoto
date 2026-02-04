@@ -227,12 +227,11 @@ void tcApp::keyPressed(int key) {
                 logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
             }
         } else if (key == 'L' || key == 'l') {
-            // Toggle lens correction (requires re-loading image)
             lensEnabled_ = !lensEnabled_;
             logNotice() << "[Lensfun] " << (lensEnabled_ ? "ON" : "OFF");
-            // Re-load current image with/without lens correction
-            if (selectedIndex_ >= 0) {
-                showFullImage(selectedIndex_);
+            // Re-process from cached RAW pixels (no re-decode)
+            if (selectedIndex_ >= 0 && isRawImage_ && rawPixels_.isAllocated()) {
+                reprocessImage();
             }
         }
     }
@@ -395,15 +394,18 @@ void tcApp::showFullImage(int index) {
 
     if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
         if (entry->isRaw) {
-            if (RawLoader::loadFloat(entry->localPath, fullPixels_)) {
-                // Apply lens correction on CPU before GPU upload
-                if (lensEnabled_ && entry->focalLength > 0 && entry->aperture > 0) {
-                    if (lensCorrector_.setup(
-                            entry->cameraMake, entry->camera,
-                            entry->lens, entry->focalLength, entry->aperture,
-                            fullPixels_.getWidth(), fullPixels_.getHeight())) {
-                        lensCorrector_.apply(fullPixels_);
-                    }
+            if (RawLoader::loadFloat(entry->localPath, rawPixels_)) {
+                // Setup lens corrector for this image
+                if (entry->focalLength > 0 && entry->aperture > 0) {
+                    lensCorrector_.setup(
+                        entry->cameraMake, entry->camera,
+                        entry->lens, entry->focalLength, entry->aperture,
+                        rawPixels_.getWidth(), rawPixels_.getHeight());
+                }
+                // Clone and apply lens correction
+                fullPixels_ = rawPixels_.clone();
+                if (lensEnabled_ && lensCorrector_.isReady()) {
+                    lensCorrector_.apply(fullPixels_);
                 }
                 fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
                 isRawImage_ = true;
@@ -429,10 +431,19 @@ void tcApp::showFullImage(int index) {
     }
 }
 
+void tcApp::reprocessImage() {
+    fullPixels_ = rawPixels_.clone();
+    if (lensEnabled_ && lensCorrector_.isReady()) {
+        lensCorrector_.apply(fullPixels_);
+    }
+    fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
+}
+
 void tcApp::exitFullImage() {
     viewMode_ = ViewMode::Grid;
 
     if (isRawImage_) {
+        rawPixels_.clear();
         fullPixels_.clear();
         fullTexture_.clear();
     } else {

@@ -52,6 +52,7 @@ private:
     // Single view state
     int selectedIndex_ = -1;
     Image fullImage_;
+    Pixels rawPixels_;       // decoded RAW cache (before lens correction)
     Pixels fullPixels_;
     Texture fullTexture_;
     bool isRawImage_ = false;
@@ -74,6 +75,7 @@ private:
     bool lensEnabled_ = true;
 
     void showFullImage(int index);
+    void reprocessImage();   // re-apply lens correction from rawPixels_ cache
     void exitFullImage();
     void drawSingleView();
     void enqueueLocalOnlyPhotos();
