@@ -23,14 +23,7 @@ using namespace tcx;
 
 namespace fs = std::filesystem;
 
-// Sync state of a photo
-enum class SyncState {
-    LocalOnly  = 0,   // Only on local disk (not yet uploaded)
-    Syncing    = 1,   // Upload in progress
-    Synced     = 2,   // Both local and server
-    ServerOnly = 3,   // Only on server (local RAW deleted)
-    Missing    = 4    // In library.json but localPath file not found
-};
+#include "Constants.h"
 
 // Photo entry with sync awareness
 struct PhotoEntry {
@@ -427,7 +420,23 @@ public:
         // 3. Fallback: decode from local file
         if (!photo.localPath.empty() && fs::exists(photo.localPath)) {
             if (photo.isRaw) {
-                if (RawLoader::loadWithMaxSize(photo.localPath, outPixels, 256)) {
+                // Try embedded JPEG first (fast), fallback to RAW decode
+                bool loaded = RawLoader::loadEmbeddedPreview(photo.localPath, outPixels);
+                if (loaded) {
+                    // Embedded preview returns float RGBA — convert to 8-bit for thumbnails
+                    convertF32ToU8(outPixels);
+                }
+                if (!loaded) {
+                    loaded = RawLoader::loadWithMaxSize(photo.localPath, outPixels, THUMBNAIL_MAX_SIZE);
+                }
+                if (loaded) {
+                    // Resize if needed (embedded preview may be larger)
+                    int w = outPixels.getWidth();
+                    int h = outPixels.getHeight();
+                    if (w > THUMBNAIL_MAX_SIZE || h > THUMBNAIL_MAX_SIZE) {
+                        float scale = (float)THUMBNAIL_MAX_SIZE / max(w, h);
+                        resizePixels(outPixels, (int)(w * scale), (int)(h * scale));
+                    }
                     saveThumbnailCache(id, photo, outPixels);
                     return true;
                 }
@@ -436,8 +445,8 @@ public:
                 if (full.load(photo.localPath)) {
                     int w = full.getWidth();
                     int h = full.getHeight();
-                    if (w > 256 || h > 256) {
-                        float scale = 256.0f / max(w, h);
+                    if (w > THUMBNAIL_MAX_SIZE || h > THUMBNAIL_MAX_SIZE) {
+                        float scale = (float)THUMBNAIL_MAX_SIZE / max(w, h);
                         resizePixels(full, (int)(w * scale), (int)(h * scale));
                     }
                     outPixels = std::move(full);
@@ -783,13 +792,33 @@ private:
         return false;
     }
 
-    void saveThumbnailCache(const string& id, PhotoEntry& photo, const Pixels& pixels) {
+    void saveThumbnailCache(const string& id, PhotoEntry& photo, Pixels& pixels) {
         if (thumbnailCacheDir_.empty()) return;
         string subdir = dateToSubdir(photo.dateTimeOriginal, photo.localPath);
         string dir = thumbnailCacheDir_ + "/" + subdir;
         fs::create_directories(dir);
         string cachePath = dir + "/" + id + ".jpg";
-        const_cast<Pixels&>(pixels).save(cachePath);
+
+        // Convert to 8-bit if float, or clone if already 8-bit
+        Pixels savePixels;
+        if (pixels.getFormat() == PixelFormat::F32) {
+            savePixels.allocate(pixels.getWidth(), pixels.getHeight(), pixels.getChannels());
+            const float* src = pixels.getDataF32();
+            unsigned char* dst = savePixels.getData();
+            int count = pixels.getWidth() * pixels.getHeight() * pixels.getChannels();
+            for (int i = 0; i < count; i++) {
+                dst[i] = (unsigned char)(clamp(src[i], 0.0f, 1.0f) * 255.0f);
+            }
+        } else {
+            savePixels = pixels.clone();
+        }
+
+        // Save with low quality for small file size
+        stbi_write_jpg(cachePath.c_str(),
+            savePixels.getWidth(), savePixels.getHeight(),
+            savePixels.getChannels(), savePixels.getData(),
+            THUMBNAIL_JPEG_QUALITY);
+
         photo.localThumbnailPath = cachePath;
         dirty_ = true;
     }
@@ -881,6 +910,23 @@ private:
             if (!fs::exists(dest)) return dest;
         }
         return dest; // unlikely fallback
+    }
+
+    // Convert float RGBA pixels to 8-bit RGBA in-place
+    static void convertF32ToU8(Pixels& pixels) {
+        if (pixels.getFormat() != PixelFormat::F32) return;
+        int w = pixels.getWidth();
+        int h = pixels.getHeight();
+        int ch = pixels.getChannels();
+        Pixels u8;
+        u8.allocate(w, h, ch);
+        const float* src = pixels.getDataF32();
+        unsigned char* dst = u8.getData();
+        int count = w * h * ch;
+        for (int i = 0; i < count; i++) {
+            dst[i] = (unsigned char)(clamp(src[i], 0.0f, 1.0f) * 255.0f);
+        }
+        pixels = std::move(u8);
     }
 
     static void resizePixels(Pixels& src, int newW, int newH) {

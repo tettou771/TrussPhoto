@@ -7,6 +7,7 @@
 #include <TrussC.h>
 #include <filesystem>
 #include <tcxLibRaw.h>
+#include "Constants.h"
 using namespace std;
 using namespace tc;
 
@@ -68,7 +69,7 @@ public:
         LoadRequest req;
         req.id = id;
         req.photoId = photoId;
-        req.maxSize = 256;
+        req.maxSize = THUMBNAIL_MAX_SIZE;
         requestChannel_.send(std::move(req));
     }
 

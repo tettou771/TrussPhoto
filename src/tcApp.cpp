@@ -530,9 +530,15 @@ void tcApp::showFullImage(int index) {
 
     if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
         if (entry->isRaw) {
-            // Step 1: Load half-size preview immediately (fast, no demosaic)
+            // Step 1: Try embedded JPEG first (fastest, ~10-20ms)
+            // Fallback to half-size preview if no embedded JPEG
             Pixels previewPixels;
-            if (RawLoader::loadFloatPreview(entry->localPath, previewPixels)) {
+            bool hasPreview = RawLoader::loadEmbeddedPreview(entry->localPath, previewPixels);
+            if (!hasPreview) {
+                hasPreview = RawLoader::loadFloatPreview(entry->localPath, previewPixels);
+            }
+
+            if (hasPreview) {
                 previewTexture_.allocate(previewPixels, TextureUsage::Immutable, true);
                 fullTexture_.clear();
                 rawPixels_.clear();
