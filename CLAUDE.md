@@ -141,14 +141,14 @@ TrussC/                    ← TrussC 本体 (git repo)
 │   └── ...               （他にも tcxBox2d, tcxOsc 等あり）
 ├── apps/
 │   ├── TrussPhoto/        ← 独立 git repo (このプロジェクト)
-│   └── TrussPhotoServer/  ← TrussC 本体 repo に含まれる
+│   └── TrussPhotoServer/  ← 独立 git repo
 └── ...
 ```
 
 **コミット時の注意:**
 - アドオンを変更した場合、そのアドオンのディレクトリに `cd` してからコミットする
-- TrussPhoto のコミットとアドオンのコミットは別々に行う
-- `apps/TrussPhotoServer` は TrussC 本体リポジトリに含まれるので注意（独立 repo ではない）
+- TrussPhoto / TrussPhotoServer / 各アドオンのコミットは別々に行う
+- TrussC 本体の `apps/` は `.gitignore` で除外されている
 
 ## 開発時の注意点・失敗談
 
@@ -216,16 +216,58 @@ tcxLensfun の .git を見つけてそちらの CMakePresets.json を要求し�
 → **アドオンに独自の .git がある場合、ダミーの CMakePresets.json を置く必要がある**
 （macos, windows, linux, web プリセットを定義）
 
+## イベント駆動レンダリング（redraw）
+
+### 省電力モード
+`setIndependentFps(VSYNC, 0)` で update のみ回し、draw は `redraw()` 呼び出し時のみ実行。
+バッテリー消費を大幅に削減できる。
+
+### redraw() が必要な箇所
+表示内容が変わる全ての箇所で `redraw()` を呼ぶ必要がある:
+
+| 箇所 | トリガー |
+|------|----------|
+| `keyPressed()` | 全てのキー入力後 |
+| `mouseReleased()` | ドラッグ終了時 |
+| `mouseDragged()` | パン操作中 |
+| `mouseScrolled()` | ズーム操作 |
+| `windowResized()` | ウィンドウサイズ変更 |
+| `filesDropped()` | フォルダドロップ後 |
+| `showFullImage()` | 画像ロード完了時 |
+| `exitFullImage()` | グリッドに戻る時 |
+| `update()` 内 sync 完了 | グリッド再構築時 |
+| `update()` 内 syncState 変更 | バッジ色更新時（変更があった場合のみ） |
+| `update()` 内 RAW ロード完了 | フルサイズ表示切替時 |
+| `repairLibrary()` | グリッド再構築後 |
+
+### 変更検知パターン
+無駄な redraw を避けるため、変更があった場合のみ redraw する:
+```cpp
+// PhotoGrid::updateSyncStates() は変更があれば true を返す
+if (grid_ && grid_->updateSyncStates(provider_)) {
+    redraw();
+}
+```
+
 ## カメラプロファイル＋レンズ補正パイプライン
 
 ### 処理順序（フルビュー表示時）
-1. **LibRaw**: RAW → sRGB ピクセル（CPU）
+
+**プログレッシブロード方式を採用:**
+1. **即時表示（~100ms）**: `half_size=1` でプレビューをロード → `previewTexture_` に表示
+2. **バックグラウンド**: フルサイズRAWをデコード + レンズ補正 → `rawPixels_` / `fullPixels_`
+3. **完了時**: `fullTexture_` に差し替え、`previewTexture_` を破棄
+
+**フルサイズパイプライン:**
+1. **LibRaw**: RAW → sRGB ピクセル（CPU、OpenMP並列デモザイク）
 2. **lensfun**: レンズ補正 - 歪曲・周辺光量・色収差（CPU、ピクセル書き換え）
 3. **GPU upload**: テクスチャ作成（Immutable）
 4. **LutShader**: カメラプロファイルLUT適用（GPU、リアルタイム）
 
-- レンズ補正はCPUでピクセル変形するため、GPU upload前に実行
-- LUTはGPUシェーダーでリアルタイム適用（ブレンド調整可能、Pキーでトグル）
+**設計ポイント:**
+- `rawLoadTargetIndex_` で「どの画像のロードか」を追跡。ユーザーが別画像に移動したら結果を破棄
+- レンズ補正はフルサイズのみ。プレビューには適用しない（速度優先）
+- LUTはGPUシェーダーなのでプレビュー/フルサイズ両方に適用される
 - サムネイルにはLUT/レンズ補正は適用しない
 
 ### カメラプロファイルディレクトリ構造
