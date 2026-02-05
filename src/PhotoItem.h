@@ -179,20 +179,30 @@ public:
 
     // Load state management
     LoadState getLoadState() const { return loadState_; }
-    void setLoadState(LoadState state) { loadState_ = state; }
+    void setLoadState(LoadState state) {
+        loadState_ = state;
+        redraw();
+    }
 
     // Set pixels from async loader (call from main thread)
     void setPixels(Pixels&& pix) {
         thumbnail_->setPixels(std::move(pix));
-        loadState_ = LoadState::Loaded;
+        setLoadState(LoadState::Loaded);
     }
 
     // Unload image to free memory
     void unloadImage() {
         thumbnail_->clearImage();
-        loadState_ = LoadState::Unloaded;
+        setLoadState(LoadState::Unloaded);
     }
-
+    
+    void update() override {
+        if (pastMouseOver != isMouseOver()) {
+            pastMouseOver = isMouseOver();
+            redraw();
+        }
+    }
+    
     void draw() override {
         // Hover highlight
         if (isMouseOver()) {
@@ -241,6 +251,7 @@ public:
     bool isSelected() const { return isSelected_; }
 
     void setSyncState(SyncState state) { syncState_ = state; }
+    SyncState getSyncState() const { return syncState_; }
 
 protected:
     bool onMousePress(Vec2 local, int button) override {
@@ -280,6 +291,7 @@ private:
     ThumbnailNode::Ptr thumbnail_;
     LabelNode::Ptr label_;
     bool isSelected_ = false;
+    bool pastMouseOver = false;
     LoadState loadState_ = LoadState::Unloaded;
     SyncState syncState_ = SyncState::LocalOnly;
 };

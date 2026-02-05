@@ -117,14 +117,17 @@ public:
     // Get number of photo IDs
     size_t getPhotoIdCount() const { return photoIds_.size(); }
 
-    // Update sync state badges from provider
-    void updateSyncStates(PhotoProvider& provider) {
+    // Update sync state badges from provider, returns true if any changed
+    bool updateSyncStates(PhotoProvider& provider) {
+        bool changed = false;
         for (size_t i = 0; i < items_.size() && i < photoIds_.size(); i++) {
             auto* photo = provider.getPhoto(photoIds_[i]);
-            if (photo) {
+            if (photo && items_[i]->getSyncState() != photo->syncState) {
                 items_[i]->setSyncState(photo->syncState);
+                changed = true;
             }
         }
+        return changed;
     }
 
     // Get item count

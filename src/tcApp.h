@@ -55,11 +55,20 @@ private:
     Pixels rawPixels_;       // decoded RAW cache (before lens correction)
     Pixels fullPixels_;
     Texture fullTexture_;
+    Texture previewTexture_; // half-size preview (shown while full loads)
     bool isRawImage_ = false;
     Vec2 panOffset_ = {0, 0};
     float zoomLevel_ = 1.0f;
     bool isDragging_ = false;
     Vec2 dragStart_;
+
+    // Background full-size RAW loading
+    thread rawLoadThread_;
+    atomic<bool> rawLoadInProgress_{false};
+    atomic<bool> rawLoadCompleted_{false};
+    atomic<int> rawLoadTargetIndex_{-1};  // which image the load is for
+    Pixels pendingRawPixels_;    // loaded in background thread
+    mutex rawLoadMutex_;
 
     // Camera profile (LUT)
     CameraProfileManager profileManager_;

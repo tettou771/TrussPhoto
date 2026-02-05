@@ -127,6 +127,9 @@ void tcApp::setup() {
     // 11. Lens correction database
     lensCorrector_.loadDatabase(getDataPath("lensfun"));
 
+    // 12. Setup event driven mode
+    setIndependentFps(VSYNC, 0);
+    
     logNotice() << "TrussPhoto ready - Library: " << settings_.libraryFolder;
 }
 
@@ -153,6 +156,7 @@ void tcApp::update() {
 
         if (provider_.getCount() > 0 && grid_->getItemCount() != provider_.getCount()) {
             grid_->populate(provider_);
+            redraw();
         }
     }
 
@@ -161,6 +165,30 @@ void tcApp::update() {
 
     // Process consolidation results
     provider_.processConsolidateResults();
+
+    // Process background RAW load completion
+    if (rawLoadCompleted_ && viewMode_ == ViewMode::Single && isRawImage_) {
+        // Only apply if we're still viewing the same image
+        if (rawLoadTargetIndex_ == selectedIndex_) {
+            lock_guard<mutex> lock(rawLoadMutex_);
+            if (pendingRawPixels_.isAllocated()) {
+                rawPixels_ = std::move(pendingRawPixels_);
+                fullPixels_ = rawPixels_.clone();
+                if (lensEnabled_ && lensCorrector_.isReady()) {
+                    lensCorrector_.apply(fullPixels_);
+                }
+                fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
+                previewTexture_.clear();
+                logNotice() << "Full-size RAW loaded: " << rawPixels_.getWidth() << "x" << rawPixels_.getHeight();
+                redraw();
+            }
+        } else {
+            // User switched to different image, discard the loaded data
+            lock_guard<mutex> lock(rawLoadMutex_);
+            pendingRawPixels_.clear();
+        }
+        rawLoadCompleted_ = false;
+    }
 
     // Process upload results
     UploadResult uploadResult;
@@ -175,8 +203,8 @@ void tcApp::update() {
     }
 
     // Update sync state badges
-    if (grid_) {
-        grid_->updateSyncStates(provider_);
+    if (grid_ && grid_->updateSyncStates(provider_)) {
+        redraw();
     }
 
     // Periodic server sync (every ~30 seconds at 60fps, only if server configured)
@@ -286,6 +314,8 @@ void tcApp::keyPressed(int key) {
             consolidateLibrary();
         }
     }
+    
+    redraw();
 }
 
 void tcApp::keyReleased(int key) {
@@ -303,6 +333,7 @@ void tcApp::mouseReleased(Vec2 pos, int button) {
     (void)pos;
     if (button == 0) {
         isDragging_ = false;
+        redraw();
     }
 }
 
@@ -315,18 +346,24 @@ void tcApp::mouseDragged(Vec2 pos, int button) {
         Vec2 delta = pos - dragStart_;
         panOffset_ = panOffset_ + delta;
         dragStart_ = pos;
+        redraw();
     }
 }
 
 void tcApp::mouseScrolled(Vec2 delta) {
+    redraw();
+
     if (viewMode_ != ViewMode::Single) return;
 
-    bool hasImage = isRawImage_ ? fullTexture_.isAllocated() : fullImage_.isAllocated();
+    bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
+    bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
+    bool hasImage = isRawImage_ ? (hasFullRaw || hasPreviewRaw) : fullImage_.isAllocated();
     if (!hasImage) return;
 
     {
-        float imgW = isRawImage_ ? fullTexture_.getWidth() : fullImage_.getWidth();
-        float imgH = isRawImage_ ? fullTexture_.getHeight() : fullImage_.getHeight();
+        Texture* rawTex = hasFullRaw ? &fullTexture_ : &previewTexture_;
+        float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
+        float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
         float winW = getWindowWidth();
         float winH = getWindowHeight();
 
@@ -351,6 +388,7 @@ void tcApp::windowResized(int width, int height) {
     if (grid_) {
         grid_->setSize(width, height);
     }
+    redraw();
 }
 
 void tcApp::filesDropped(const vector<string>& files) {
@@ -367,6 +405,7 @@ void tcApp::filesDropped(const vector<string>& files) {
 
     grid_->populate(provider_);
     provider_.saveLibrary();
+    redraw();
 
     // Auto-upload new photos
     enqueueLocalOnlyPhotos();
@@ -375,6 +414,7 @@ void tcApp::filesDropped(const vector<string>& files) {
 void tcApp::exit() {
     uploadQueue_.stop();
     if (syncThread_.joinable()) syncThread_.join();
+    if (rawLoadThread_.joinable()) rawLoadThread_.join();
     // Wait for consolidation to finish before saving
     if (provider_.isConsolidateRunning()) {
         logNotice() << "Waiting for consolidation to finish...";
@@ -429,6 +469,7 @@ void tcApp::repairLibrary() {
     if (missing > 0 || added > 0) {
         provider_.saveLibrary();
         grid_->populate(provider_);
+        redraw();
     }
     // Trigger server sync to resolve Missing vs ServerOnly
     if (settings_.hasServer() && !syncInProgress_) {
@@ -479,33 +520,61 @@ void tcApp::showFullImage(int index) {
 
     logNotice() << "Opening image: " << entry->filename;
 
+    // Cancel any pending background load
+    if (rawLoadInProgress_) {
+        // Let it finish, we'll ignore the result
+        rawLoadCompleted_ = false;
+    }
+
     bool loaded = false;
 
     if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
         if (entry->isRaw) {
-            if (RawLoader::loadFloat(entry->localPath, rawPixels_)) {
-                // Setup lens corrector for this image
-                if (entry->focalLength > 0 && entry->aperture > 0) {
-                    lensCorrector_.setup(
-                        entry->cameraMake, entry->camera,
-                        entry->lens, entry->focalLength, entry->aperture,
-                        rawPixels_.getWidth(), rawPixels_.getHeight());
-                }
-                // Clone and apply lens correction
-                fullPixels_ = rawPixels_.clone();
-                if (lensEnabled_ && lensCorrector_.isReady()) {
-                    lensCorrector_.apply(fullPixels_);
-                }
-                fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
+            // Step 1: Load half-size preview immediately (fast, no demosaic)
+            Pixels previewPixels;
+            if (RawLoader::loadFloatPreview(entry->localPath, previewPixels)) {
+                previewTexture_.allocate(previewPixels, TextureUsage::Immutable, true);
+                fullTexture_.clear();
+                rawPixels_.clear();
                 isRawImage_ = true;
                 loaded = true;
+
+                // Step 2: Start full-size load in background
+                string path = entry->localPath;
+                string cameraMake = entry->cameraMake;
+                string camera = entry->camera;
+                string lens = entry->lens;
+                float focalLength = entry->focalLength;
+                float aperture = entry->aperture;
+
+                rawLoadInProgress_ = true;
+                rawLoadCompleted_ = false;
+                rawLoadTargetIndex_ = index;
+
+                if (rawLoadThread_.joinable()) rawLoadThread_.join();
+                rawLoadThread_ = thread([this, index, path, cameraMake, camera, lens, focalLength, aperture]() {
+                    Pixels loadedPixels;
+                    if (RawLoader::loadFloat(path, loadedPixels)) {
+                        lock_guard<mutex> lock(rawLoadMutex_);
+                        pendingRawPixels_ = std::move(loadedPixels);
+                        // Store lens info for correction on main thread
+                        if (focalLength > 0 && aperture > 0) {
+                            lensCorrector_.setup(cameraMake, camera, lens, focalLength, aperture,
+                                pendingRawPixels_.getWidth(), pendingRawPixels_.getHeight());
+                        }
+                        rawLoadCompleted_ = true;
+                    }
+                    rawLoadInProgress_ = false;
+                });
             }
         } else {
             if (fullImage_.load(entry->localPath)) {
+                previewTexture_.clear();
                 isRawImage_ = false;
                 loaded = true;
             }
         }
+        redraw();
     }
 
     if (loaded) {
@@ -531,10 +600,22 @@ void tcApp::reprocessImage() {
 void tcApp::exitFullImage() {
     viewMode_ = ViewMode::Grid;
 
+    // Wait for background load to finish
+    if (rawLoadThread_.joinable()) {
+        rawLoadThread_.join();
+    }
+    rawLoadInProgress_ = false;
+    rawLoadCompleted_ = false;
+
     if (isRawImage_) {
         rawPixels_.clear();
         fullPixels_.clear();
         fullTexture_.clear();
+        previewTexture_.clear();
+        {
+            lock_guard<mutex> lock(rawLoadMutex_);
+            pendingRawPixels_.clear();
+        }
     } else {
         fullImage_ = Image();
     }
@@ -547,14 +628,19 @@ void tcApp::exitFullImage() {
     currentProfilePath_.clear();
 
     grid_->setActive(true);
+    redraw();
 }
 
 void tcApp::drawSingleView() {
-    bool hasImage = isRawImage_ ? fullTexture_.isAllocated() : fullImage_.isAllocated();
+    // For RAW: prefer fullTexture, fallback to previewTexture
+    bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
+    bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
+    bool hasImage = isRawImage_ ? (hasFullRaw || hasPreviewRaw) : fullImage_.isAllocated();
     if (!hasImage) return;
 
-    float imgW = isRawImage_ ? fullTexture_.getWidth() : fullImage_.getWidth();
-    float imgH = isRawImage_ ? fullTexture_.getHeight() : fullImage_.getHeight();
+    Texture* rawTex = hasFullRaw ? &fullTexture_ : &previewTexture_;
+    float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
+    float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
     float winW = getWindowWidth();
     float winH = getWindowHeight();
 
@@ -588,14 +674,14 @@ void tcApp::drawSingleView() {
         lutShader_.setLut(profileLut_);
         lutShader_.setBlend(profileBlend_);
         if (isRawImage_) {
-            lutShader_.setTexture(fullTexture_);
+            lutShader_.setTexture(*rawTex);
             lutShader_.draw(x, y, drawW, drawH);
         } else {
             lutShader_.setTexture(fullImage_.getTexture());
             lutShader_.draw(x, y, drawW, drawH);
         }
     } else if (isRawImage_) {
-        fullTexture_.draw(x, y, drawW, drawH);
+        rawTex->draw(x, y, drawW, drawH);
     } else {
         fullImage_.draw(x, y, drawW, drawH);
     }
@@ -607,9 +693,9 @@ void tcApp::drawSingleView() {
         if (entry) {
             setColor(0.8f, 0.8f, 0.85f);
             string typeStr = entry->isRaw ? " [RAW]" : "";
-            drawBitmapString(entry->filename + typeStr, 10, 20);
-            drawBitmapString(format("{}x{}  Zoom: {:.0f}%",
-                (int)imgW, (int)imgH, zoomLevel_ * 100), 10, 40);
+            drawBitmapStringHighlight(entry->filename + typeStr, 10, 20, Color(0, 0.3));
+            drawBitmapStringHighlight(format("{}x{}  Zoom: {:.0f}%",
+                (int)imgW, (int)imgH, zoomLevel_ * 100), 10, 40, Color(0, 0.3));
 
             // Camera / Lens / Shooting info
             string metaLine;
@@ -634,7 +720,7 @@ void tcApp::drawSingleView() {
             }
             if (!metaLine.empty()) {
                 setColor(0.7f, 0.7f, 0.75f);
-                drawBitmapString(metaLine, 10, 60);
+                drawBitmapStringHighlight(metaLine, 10, 60, Color(0, 0.3));
             }
 
             // Profile status
@@ -642,7 +728,7 @@ void tcApp::drawSingleView() {
                 string profileStatus = format("Profile: {} {:.0f}%",
                     profileEnabled_ ? "ON" : "OFF", profileBlend_ * 100);
                 setColor(0.5f, 0.75f, 0.5f);
-                drawBitmapString(profileStatus, 10, 80);
+                drawBitmapStringHighlight(profileStatus, 10, 80, Color(0, 0.3));
             }
         }
     }
@@ -651,5 +737,5 @@ void tcApp::drawSingleView() {
     setColor(0.5f, 0.5f, 0.55f);
     string helpStr = "ESC: Back  Left/Right: Navigate  Scroll: Zoom  Drag: Pan  L: Lens";
     if (hasProfileLut_) helpStr += "  P: Profile  [/]: Blend";
-    drawBitmapString(helpStr, 10, helpY);
+    drawBitmapStringHighlight(helpStr, 10, helpY, Color(0, 0.3));
 }
