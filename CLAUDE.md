@@ -2,34 +2,55 @@
 
 ## 概要
 
-TrussC ベースの写真管理アプリ。クライアント（TrussPhoto）とサーバ（TrussPhotoServer）の2つのアプリで構成。
+TrussC ベースの写真管理・RAW現像アプリ。**1バイナリ2モード**設計。
 
-- **TrussPhoto**: デスクトップ写真ビューア + サーバ同期クライアント
-- **TrussPhotoServer**: REST API サーバ（RAWインポート、サムネイル生成、メタデータ管理）
+- **GUIモード**（デフォルト）: デスクトップ写真ビューア + サーバ同期クライアント
+- **サーバモード**（`--server`）: ヘッドレス REST API サーバ（Crow HTTP）
+
+旧 TrussPhotoServer は別リポジトリに残存するが、機能は TrussPhoto に統合済み。
 
 ## ビルド方法
 
 ```bash
-# クライアント
 cd apps/TrussPhoto
-cmake --preset macos
-cmake --build build-macos
-
-# サーバ
-cd apps/TrussPhotoServer
 cmake --preset macos
 cmake --build build-macos
 ```
 
 ソースファイルを追加/削除した場合は `cmake --preset macos` の再実行が必要（GLOB ベース）。
 
+## 起動モード
+
+```bash
+# GUI モード（デフォルト）
+./bin/TrussPhoto.app/Contents/MacOS/TrussPhoto
+
+# サーバモード（ヘッドレス）
+./bin/TrussPhoto.app/Contents/MacOS/TrussPhoto --server
+
+# サーバモード + オプション
+./bin/TrussPhoto.app/Contents/MacOS/TrussPhoto --server --port 8080 --library-dir /path/to/photos
+```
+
+### コマンドライン引数
+| フラグ | 説明 | デフォルト |
+|--------|------|-----------|
+| `--server` | ヘッドレスサーバモード | GUI モード |
+| `--port N` | サーバポート | 18730 |
+| `--library-dir PATH` | ライブラリフォルダ上書き | settings.json の値 |
+
 ## アーキテクチャ
 
-### クライアント (TrussPhoto)
+### ソース構成
 ```
 src/
-├── tcApp.h/cpp        # メインアプリ（起動フロー、イベント処理）
-├── Settings.h         # 設定永続化（settings.json）
+├── main.cpp           # エントリポイント（GUI / --server 分岐）
+├── tcApp.h/cpp        # メインアプリ（起動フロー、イベント処理、モード分岐）
+├── AppConfig.h        # コマンドライン引数パース（--server, --port, --library-dir）
+├── AppPaths.h         # OS標準パス定義 + bin/data/ からの自動マイグレーション
+├── Settings.h         # 設定永続化（settings.json → tpDataPath）
+├── ServerConfig.h     # APIキー生成・永続化（サーバモード用）
+├── PhotoServer.h      # Crow HTTPサーバ（PhotoProvider をREST公開）
 ├── PhotoEntry.h       # PhotoEntry構造体 + JSON シリアライズ
 ├── Database.h         # SQLite3 薄い RAII ラッパー
 ├── PhotoDatabase.h    # photos テーブル CRUD、スキーマ管理、JSON マイグレーション
@@ -38,14 +59,6 @@ src/
 ├── PhotoItem.h        # 個々の写真アイテム（サムネ + ラベル）
 ├── AsyncImageLoader.h # バックグラウンドサムネイルローダー
 └── UploadQueue.h      # バックグラウンドアップロード（リトライ付き）
-```
-
-### サーバ (TrussPhotoServer)
-```
-src/
-├── tcApp.h/cpp       # Crow REST APIサーバ
-├── Photo.h           # Photo構造体（NLOHMANN_DEFINE_TYPE_INTRUSIVE）
-└── JsonStorage.h     # JSONファイルベースのストレージ
 ```
 
 ### データフロー
@@ -86,24 +99,32 @@ UploadQueue が起動し、sync + 自動アップロードが始まる。
 写真IDは `filename_filesize` 形式で統一（サーバ・クライアント共通）。
 例: `DSC00001.ARW_42991616`
 
-### 永続化ファイル（クライアント）
+### 永続化ファイル
+
 ```
-bin/data/
-├── settings.json          # サーバURL、ライブラリフォルダ
-├── library.db             # SQLite - 全写真エントリ（即時書き込み）
-├── library.json.migrated  # 移行バックアップ（削除可能）
-└── thumbnail_cache/       # サムネイル JPEG キャッシュ
+tpDataPath/                          ← ~/Library/Application Support/TrussPhoto/ (macOS)
+├── settings.json                    # サーバURL、ライブラリフォルダ
+├── library.db                       # SQLite - 全写真エントリ（即時書き込み）
+└── server_config.json               # APIキー、ポート（サーバモード用）
+
+tpCachePath/                         ← ~/Library/Caches/TrussPhoto/ (macOS)
+└── thumbnail_cache/                 # サムネイル JPEG キャッシュ
+
+bin/data/                            ← バンドルリソース（読み取り専用）
+└── lensfun/                         # レンズ補正データベース
+
+libraryFolder                        ← ユーザ設定（例: ~/Pictures/TrussPhoto/）
+└── 2026/01/15/                      # RAW オリジナル（日付別）
+    └── DSC00001.ARW
 ```
 
-**SQLite移行**: library.json → library.db に移行済み。起動時に library.json が存在し library.db がなければ自動マイグレーション。
-マイグレーション後、library.json は library.json.migrated にリネームされる。
+| OS | tpDataPath | tpCachePath |
+|----|-----------|-------------|
+| macOS | `~/Library/Application Support/TrussPhoto/` | `~/Library/Caches/TrussPhoto/` |
+| Linux | `~/.local/share/TrussPhoto/` | `~/.cache/TrussPhoto/` |
+| Windows | `%APPDATA%/TrussPhoto/` | `%LOCALAPPDATA%/TrussPhoto/` |
 
-### 永続化ファイル（サーバ）
-```
-bin/data/
-├── storage/library.json  # 全写真メタデータ
-└── thumbnails/           # 生成サムネイル
-```
+**bin/data/ からの自動マイグレーション**: 起動時に tpDataPath に library.db がなく bin/data/ にある場合、自動コピー。settings.json、thumbnail_cache も同様。元ファイルは安全のため残す。
 
 ## サーバAPI
 
@@ -116,17 +137,16 @@ bin/data/
 | POST | /api/import | RAWインポート `{"path": "/path/to/file.ARW"}` |
 | DELETE | /api/photos/:id | 写真削除 |
 
-サーバポート: **8080**
+サーバポート: **18730**（デフォルト、`--port` で変更可能）
+認証: Bearer トークン（`/api/health` 以外すべて）。APIキーは `server_config.json` に自動生成。
 
 ## 使用アドオン
 
-クライアント（addons.make に記載）:
+addons.make に記載（すべて統合バイナリに含まれる）:
 - **tcxCurl** - HTTPクライアント（libcurl / Emscripten Fetch）
+- **tcxCrow** - HTTPサーバ（Crow、--server モード用）
 - **tcxLibRaw** - RAW画像デコード（LibRaw、FetchContent、OpenMP並列デモザイク）
 - **tcxLut** - LUTカラーグレーディング（GPU シェーダー、header-only）
-
-サーバのみ:
-- **tcxCrow** - HTTPサーバ（Crow）
 
 アドオン不使用（直接リンク）:
 - **exiv2** - EXIF/MakerNote メタデータ（brew の dylib を local.cmake でリンク）
@@ -313,7 +333,7 @@ Profile: ON 100%
 ```
 
 ### ビルド依存関係の整理
-- **アドオン（addons.make）**: tcxCurl, tcxLibRaw, tcxLut — 汎用的なもののみ
+- **アドオン（addons.make）**: tcxCurl, tcxCrow, tcxLibRaw, tcxLut
 - **local.cmake**: exiv2 のみ。brew 前提の唯一の外部依存
 - **src/LensCorrector.h**: lensfun ライブラリ非依存の自前実装。
   lensfun の XML データベース（`bin/data/lensfun/`）を pugixml でパースし、

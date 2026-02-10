@@ -5,11 +5,15 @@
 #include "LensCorrector.h"
 #include <atomic>
 #include <thread>
+#include "AppConfig.h"
+#include "AppPaths.h"
 #include "Settings.h"
 #include "PhotoProvider.h"
 #include "PhotoGrid.h"
 #include "UploadQueue.h"
 #include "CameraProfileManager.h"
+#include "ServerConfig.h"
+#include "PhotoServer.h"
 using namespace std;
 using namespace tc;
 
@@ -82,6 +86,10 @@ private:
     // Lens correction
     LensCorrector lensCorrector_;
     bool lensEnabled_ = true;
+
+    // Server mode
+    PhotoServer server_;
+    ServerConfig serverConfig_;
 
     void showFullImage(int index);
     void reprocessImage();   // re-apply lens correction from rawPixels_ cache

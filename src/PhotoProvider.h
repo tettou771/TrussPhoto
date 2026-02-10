@@ -420,6 +420,15 @@ public:
         return (it != photos_.end()) ? &it->second : nullptr;
     }
 
+    // Remove a photo from memory and database
+    bool removePhoto(const string& id) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        db_.deletePhoto(id);
+        photos_.erase(it);
+        return true;
+    }
+
     // Get sorted photo list (by filename)
     vector<string> getSortedIds() const {
         vector<string> ids;

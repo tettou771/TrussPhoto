@@ -2,46 +2,86 @@
 #include <tcxLibRaw.h>
 
 void tcApp::setup() {
-    // 1. Load settings
+    // 0. Ensure OS-standard paths exist + migrate from bin/data/
+    AppPaths::ensureDirectories();
+    AppPaths::migrateFromBinData();
+
+    // 1. Load settings (from tpDataPath)
     settings_.load();
 
-    // 2. Ask for library folder if first run or folder not accessible
-    bool needsFolder = settings_.isFirstRun();
-    if (!needsFolder && !settings_.libraryFolder.empty()) {
-        if (!fs::exists(settings_.libraryFolder)) {
-            logWarning() << "Library folder not accessible: " << settings_.libraryFolder
-                         << " (re-select to grant access)";
-            needsFolder = true;
+    if (AppConfig::serverMode) {
+        // === Server mode: headless ===
+        // Only override libraryFolder, don't touch serverUrl/apiKey
+        bool needsSave = false;
+        if (!AppConfig::libraryDir.empty()) {
+            settings_.libraryFolder = AppConfig::libraryDir;
+            needsSave = true;
         }
-    }
-
-    if (needsFolder) {
-        auto result = loadDialog(
-            "Select Library Folder",
-            "Choose where to store your photo library",
-            "", true);
-
-        if (result.success) {
-            settings_.libraryFolder = result.filePath;
-        } else {
-            // Default location
+        if (settings_.libraryFolder.empty()) {
             string home = getenv("HOME") ? getenv("HOME") : ".";
             settings_.libraryFolder = home + "/Pictures/TrussPhoto";
+            needsSave = true;
         }
         fs::create_directories(settings_.libraryFolder);
-        settings_.save();
+        if (needsSave) settings_.save();
+    } else {
+        // === GUI mode: ask for library folder if needed ===
+        bool needsFolder = settings_.isFirstRun();
+        if (!needsFolder && !settings_.libraryFolder.empty()) {
+            if (!fs::exists(settings_.libraryFolder)) {
+                logWarning() << "Library folder not accessible: " << settings_.libraryFolder
+                             << " (re-select to grant access)";
+                needsFolder = true;
+            }
+        }
+
+        if (needsFolder) {
+            auto result = loadDialog(
+                "Select Library Folder",
+                "Choose where to store your photo library",
+                "", true);
+
+            if (result.success) {
+                settings_.libraryFolder = result.filePath;
+            } else {
+                string home = getenv("HOME") ? getenv("HOME") : ".";
+                settings_.libraryFolder = home + "/Pictures/TrussPhoto";
+            }
+            fs::create_directories(settings_.libraryFolder);
+            settings_.save();
+        }
     }
 
-    // 3. Configure provider
-    provider_.setThumbnailCacheDir(getDataPath("thumbnail_cache"));
-    provider_.setDatabasePath(getDataPath("library.db"));
-    provider_.setJsonMigrationPath(getDataPath("library.json"));
+    // 3. Configure provider (paths use tpDataPath / tpCachePath)
+    provider_.setThumbnailCacheDir(AppPaths::cachePath() + "/thumbnail_cache");
+    provider_.setDatabasePath(AppPaths::dataPath() + "/library.db");
+    provider_.setJsonMigrationPath(AppPaths::dataPath() + "/library.json");
     provider_.setLibraryFolder(settings_.libraryFolder);
     provider_.setServerUrl(settings_.serverUrl);
     provider_.setApiKey(settings_.apiKey);
 
     // 4. Load library (instant display from previous session)
     bool hasLibrary = provider_.loadLibrary();
+
+    if (AppConfig::serverMode) {
+        // === Server mode setup ===
+        serverConfig_.load(AppPaths::dataPath() + "/server_config.json");
+        serverConfig_.generateKeyIfMissing();
+        serverConfig_.save();
+
+        int port = AppConfig::serverPort;
+        server_.setup(provider_, AppPaths::cachePath() + "/thumbnail_cache");
+        server_.start(port, serverConfig_.apiKey);
+
+        logNotice() << "=== TrussPhoto Server ===";
+        logNotice() << "Port: " << port;
+        logNotice() << "API Key: " << serverConfig_.apiKey;
+        logNotice() << "Library: " << settings_.libraryFolder;
+        logNotice() << "Photos: " << provider_.getCount();
+        return;
+    }
+
+    // === GUI mode setup (below) ===
 
     // 5. Create grid
     grid_ = make_shared<PhotoGrid>();
@@ -129,11 +169,17 @@ void tcApp::setup() {
 
     // 12. Setup event driven mode
     setIndependentFps(VSYNC, 0);
-    
+
     logNotice() << "TrussPhoto ready - Library: " << settings_.libraryFolder;
 }
 
 void tcApp::update() {
+    if (AppConfig::serverMode) {
+        // Server mode: minimal update
+        provider_.processCopyResults();
+        return;
+    }
+
     // Launch server sync in background thread (non-blocking)
     if (needsServerSync_ && !syncInProgress_) {
         needsServerSync_ = false;
@@ -214,6 +260,8 @@ void tcApp::update() {
 }
 
 void tcApp::draw() {
+    if (AppConfig::serverMode) return;
+
     clear(0.06f, 0.06f, 0.08f);
 
     if (viewMode_ == ViewMode::Single) {
@@ -404,6 +452,10 @@ void tcApp::filesDropped(const vector<string>& files) {
 }
 
 void tcApp::exit() {
+    if (AppConfig::serverMode) {
+        server_.stop();
+    }
+
     uploadQueue_.stop();
     if (syncThread_.joinable()) syncThread_.join();
     if (rawLoadThread_.joinable()) rawLoadThread_.join();

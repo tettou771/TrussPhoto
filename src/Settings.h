@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <fstream>
+#include "AppPaths.h"
 
 using namespace std;
 using namespace tc;
@@ -67,6 +68,6 @@ public:
 
 private:
     static string getSettingsPath() {
-        return getDataPath("settings.json");
+        return AppPaths::dataPath() + "/settings.json";
     }
 };
