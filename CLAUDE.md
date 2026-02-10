@@ -28,13 +28,16 @@ cmake --build build-macos
 ### クライアント (TrussPhoto)
 ```
 src/
-├── tcApp.h/cpp       # メインアプリ（起動フロー、イベント処理）
-├── Settings.h        # 設定永続化（settings.json）
-├── PhotoProvider.h   # 写真管理の中核（ローカル + サーバ抽象化）
-├── PhotoGrid.h       # スクロール可能なサムネイルグリッドUI
-├── PhotoItem.h       # 個々の写真アイテム（サムネ + ラベル）
+├── tcApp.h/cpp        # メインアプリ（起動フロー、イベント処理）
+├── Settings.h         # 設定永続化（settings.json）
+├── PhotoEntry.h       # PhotoEntry構造体 + JSON シリアライズ
+├── Database.h         # SQLite3 薄い RAII ラッパー
+├── PhotoDatabase.h    # photos テーブル CRUD、スキーマ管理、JSON マイグレーション
+├── PhotoProvider.h    # 写真管理の中核（ローカル + サーバ抽象化、SQLite永続化）
+├── PhotoGrid.h        # スクロール可能なサムネイルグリッドUI
+├── PhotoItem.h        # 個々の写真アイテム（サムネ + ラベル）
 ├── AsyncImageLoader.h # バックグラウンドサムネイルローダー
-└── UploadQueue.h     # バックグラウンドアップロード（リトライ付き）
+└── UploadQueue.h      # バックグラウンドアップロード（リトライ付き）
 ```
 
 ### サーバ (TrussPhotoServer)
@@ -86,10 +89,14 @@ UploadQueue が起動し、sync + 自動アップロードが始まる。
 ### 永続化ファイル（クライアント）
 ```
 bin/data/
-├── settings.json       # サーバURL、ライブラリフォルダ
-├── library.json        # 全写真エントリ（SyncState含む）
-└── thumbnail_cache/    # サムネイルJPEGキャッシュ
+├── settings.json          # サーバURL、ライブラリフォルダ
+├── library.db             # SQLite - 全写真エントリ（即時書き込み）
+├── library.json.migrated  # 移行バックアップ（削除可能）
+└── thumbnail_cache/       # サムネイル JPEG キャッシュ
 ```
+
+**SQLite移行**: library.json → library.db に移行済み。起動時に library.json が存在し library.db がなければ自動マイグレーション。
+マイグレーション後、library.json は library.json.migrated にリネームされる。
 
 ### 永続化ファイル（サーバ）
 ```
@@ -179,10 +186,12 @@ JsonStorage.h で `using namespace std;` を使うと `tc::map`（TrussCのマ�
 macOS の bash は 3.x で `coproc` 未対応。zsh の coproc で試したが、MCP初期化ハンドシェイク（`initialize` メソッド）が必要な可能性があり、単純な tool call だけでは動かなかった。
 → **MCP テストは GUI から直接操作するか、初期化シーケンスを含むスクリプトを用意する必要がある**（要調査）
 
-### NLOHMANN_DEFINE_TYPE_INTRUSIVE のフィールド追加
-Photo構造体にフィールドを追加した場合、INTRUSIVE マクロのリストに追加しないとJSONシリアライズされない。
-また、既存のlibrary.jsonにそのフィールドがないとパースエラーになる。
-→ **フィールド追加時は既存のlibrary.jsonを削除してやり直す**（開発フェーズ）
+### PhotoEntry へのフィールド追加
+PhotoEntry にフィールドを追加した場合:
+1. `PhotoEntry.h` の構造体と `to_json`/`from_json` に追加
+2. `PhotoDatabase.h` の CREATE TABLE、bindEntry()、loadAll() に追加
+3. `PhotoDatabase::SCHEMA_VERSION` をインクリメントし、ALTER TABLE マイグレーションを追加
+4. 開発中は `library.db` を削除して再作成するのが手っ取り早い
 
 ### UploadQueue の sleep() デッドロック
 `UploadQueue::threadedFunction()` 内で `lock_guard<mutex>` のスコープ内に POSIX `sleep(1000)` を書いてしまい、

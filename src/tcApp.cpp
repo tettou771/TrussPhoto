@@ -34,7 +34,8 @@ void tcApp::setup() {
 
     // 3. Configure provider
     provider_.setThumbnailCacheDir(getDataPath("thumbnail_cache"));
-    provider_.setLibraryPath(getDataPath("library.json"));
+    provider_.setDatabasePath(getDataPath("library.db"));
+    provider_.setJsonMigrationPath(getDataPath("library.json"));
     provider_.setLibraryFolder(settings_.libraryFolder);
     provider_.setServerUrl(settings_.serverUrl);
     provider_.setApiKey(settings_.apiKey);
@@ -91,7 +92,6 @@ void tcApp::setup() {
             int missing = provider_.validateLibrary();
             int added = provider_.scanLibraryFolder();
             if (missing > 0 || added > 0) {
-                provider_.saveLibrary();
                 grid_->populate(provider_);
             }
             if (settings_.hasServer() && !syncInProgress_) {
@@ -193,13 +193,10 @@ void tcApp::update() {
     // Process upload results
     UploadResult uploadResult;
     while (uploadQueue_.tryGetResult(uploadResult)) {
-        auto* photo = provider_.getPhoto(uploadResult.photoId);
-        if (photo) {
-            photo->syncState = uploadResult.success
-                ? SyncState::Synced
-                : SyncState::LocalOnly;
-            provider_.markDirty();
-        }
+        SyncState newState = uploadResult.success
+            ? SyncState::Synced
+            : SyncState::LocalOnly;
+        provider_.setSyncState(uploadResult.photoId, newState);
     }
 
     // Update sync state badges
@@ -213,11 +210,7 @@ void tcApp::update() {
         needsServerSync_ = true;
     }
 
-    // Periodic save (every ~5 seconds at 60fps)
-    static int saveCounter = 0;
-    if (++saveCounter % 300 == 0) {
-        provider_.saveIfDirty();
-    }
+    // SQLite writes are immediate, no periodic save needed
 }
 
 void tcApp::draw() {
@@ -404,7 +397,6 @@ void tcApp::filesDropped(const vector<string>& files) {
     }
 
     grid_->populate(provider_);
-    provider_.saveLibrary();
     redraw();
 
     // Auto-upload new photos
@@ -421,7 +413,7 @@ void tcApp::exit() {
     }
     provider_.joinConsolidate();
     provider_.processConsolidateResults();
-    provider_.saveLibrary();
+    // SQLite writes are immediate, no final save needed
     logNotice() << "TrussPhoto exiting";
 }
 
@@ -467,7 +459,6 @@ void tcApp::repairLibrary() {
     int added = provider_.scanLibraryFolder();
     logNotice() << "[Repair] Missing: " << missing << ", Added: " << added;
     if (missing > 0 || added > 0) {
-        provider_.saveLibrary();
         grid_->populate(provider_);
         redraw();
     }

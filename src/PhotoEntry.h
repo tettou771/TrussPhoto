@@ -1,0 +1,91 @@
+#pragma once
+
+// =============================================================================
+// PhotoEntry - Photo metadata structure with JSON serialization
+// =============================================================================
+
+#include <string>
+#include <nlohmann/json.hpp>
+#include "Constants.h"
+
+using namespace std;
+
+// Photo entry with sync awareness
+struct PhotoEntry {
+    // Identity (filename + size + dateTime)
+    string id;
+    string filename;
+    uintmax_t fileSize = 0;
+    string dateTimeOriginal;
+
+    // Paths
+    string localPath;            // Local file path (RAW or standard)
+    string localThumbnailPath;   // Cached thumbnail path
+
+    // Metadata
+    string cameraMake;
+    string camera;
+    string lens;
+    string lensMake;
+    int width = 0;
+    int height = 0;
+    bool isRaw = false;
+    string creativeStyle;
+    float focalLength = 0;
+    float aperture = 0;
+    float iso = 0;
+
+    // State
+    SyncState syncState = SyncState::LocalOnly;
+};
+
+// JSON serialization for PhotoEntry
+inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
+    j = nlohmann::json{
+        {"id", e.id},
+        {"filename", e.filename},
+        {"fileSize", e.fileSize},
+        {"dateTimeOriginal", e.dateTimeOriginal},
+        {"localPath", e.localPath},
+        {"localThumbnailPath", e.localThumbnailPath},
+        {"cameraMake", e.cameraMake},
+        {"camera", e.camera},
+        {"lens", e.lens},
+        {"lensMake", e.lensMake},
+        {"width", e.width},
+        {"height", e.height},
+        {"isRaw", e.isRaw},
+        {"creativeStyle", e.creativeStyle},
+        {"focalLength", e.focalLength},
+        {"aperture", e.aperture},
+        {"iso", e.iso},
+        {"syncState", static_cast<int>(e.syncState)}
+    };
+}
+
+inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
+    e.id = j.value("id", string(""));
+    e.filename = j.value("filename", string(""));
+    e.fileSize = j.value("fileSize", (uintmax_t)0);
+    e.dateTimeOriginal = j.value("dateTimeOriginal", string(""));
+    e.localPath = j.value("localPath", string(""));
+    e.localThumbnailPath = j.value("localThumbnailPath", string(""));
+    e.cameraMake = j.value("cameraMake", string(""));
+    e.camera = j.value("camera", string(""));
+    e.lens = j.value("lens", string(""));
+    e.lensMake = j.value("lensMake", string(""));
+    e.width = j.value("width", 0);
+    e.height = j.value("height", 0);
+    e.isRaw = j.value("isRaw", false);
+    e.creativeStyle = j.value("creativeStyle", string(""));
+    e.focalLength = j.value("focalLength", 0.0f);
+    e.aperture = j.value("aperture", 0.0f);
+    e.iso = j.value("iso", 0.0f);
+
+    int state = j.value("syncState", 0);
+    e.syncState = static_cast<SyncState>(state);
+    // Syncing state doesn't survive restart - revert to LocalOnly
+    if (e.syncState == SyncState::Syncing) {
+        e.syncState = SyncState::LocalOnly;
+    }
+}

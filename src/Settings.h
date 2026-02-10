@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 
 class Settings {
 public:
-    string serverUrl = "http://localhost:8080";
+    string serverUrl;
     string apiKey;           // API key for server authentication
     string libraryFolder;   // Where to copy/store photos
 

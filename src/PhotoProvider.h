@@ -23,87 +23,8 @@ using namespace tcx;
 
 namespace fs = std::filesystem;
 
-#include "Constants.h"
-
-// Photo entry with sync awareness
-struct PhotoEntry {
-    // Identity (filename + size + dateTime)
-    string id;
-    string filename;
-    uintmax_t fileSize = 0;
-    string dateTimeOriginal;
-
-    // Paths
-    string localPath;            // Local file path (RAW or standard)
-    string localThumbnailPath;   // Cached thumbnail path
-
-    // Metadata
-    string cameraMake;
-    string camera;
-    string lens;
-    string lensMake;
-    int width = 0;
-    int height = 0;
-    bool isRaw = false;
-    string creativeStyle;
-    float focalLength = 0;
-    float aperture = 0;
-    float iso = 0;
-
-    // State
-    SyncState syncState = SyncState::LocalOnly;
-};
-
-// JSON serialization for PhotoEntry
-inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
-    j = nlohmann::json{
-        {"id", e.id},
-        {"filename", e.filename},
-        {"fileSize", e.fileSize},
-        {"dateTimeOriginal", e.dateTimeOriginal},
-        {"localPath", e.localPath},
-        {"localThumbnailPath", e.localThumbnailPath},
-        {"cameraMake", e.cameraMake},
-        {"camera", e.camera},
-        {"lens", e.lens},
-        {"lensMake", e.lensMake},
-        {"width", e.width},
-        {"height", e.height},
-        {"isRaw", e.isRaw},
-        {"creativeStyle", e.creativeStyle},
-        {"focalLength", e.focalLength},
-        {"aperture", e.aperture},
-        {"iso", e.iso},
-        {"syncState", static_cast<int>(e.syncState)}
-    };
-}
-
-inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
-    e.id = j.value("id", string(""));
-    e.filename = j.value("filename", string(""));
-    e.fileSize = j.value("fileSize", (uintmax_t)0);
-    e.dateTimeOriginal = j.value("dateTimeOriginal", string(""));
-    e.localPath = j.value("localPath", string(""));
-    e.localThumbnailPath = j.value("localThumbnailPath", string(""));
-    e.cameraMake = j.value("cameraMake", string(""));
-    e.camera = j.value("camera", string(""));
-    e.lens = j.value("lens", string(""));
-    e.lensMake = j.value("lensMake", string(""));
-    e.width = j.value("width", 0);
-    e.height = j.value("height", 0);
-    e.isRaw = j.value("isRaw", false);
-    e.creativeStyle = j.value("creativeStyle", string(""));
-    e.focalLength = j.value("focalLength", 0.0f);
-    e.aperture = j.value("aperture", 0.0f);
-    e.iso = j.value("iso", 0.0f);
-
-    int state = j.value("syncState", 0);
-    e.syncState = static_cast<SyncState>(state);
-    // Syncing state doesn't survive restart - revert to LocalOnly
-    if (e.syncState == SyncState::Syncing) {
-        e.syncState = SyncState::LocalOnly;
-    }
-}
+#include "PhotoEntry.h"
+#include "PhotoDatabase.h"
 
 // Photo provider - manages local + server photos
 class PhotoProvider {
@@ -126,8 +47,17 @@ public:
         fs::create_directories(dir);
     }
 
+    void setDatabasePath(const string& path) {
+        databasePath_ = path;
+    }
+
+    void setJsonMigrationPath(const string& path) {
+        jsonMigrationPath_ = path;
+    }
+
+    // Kept for backward compatibility but unused with SQLite
     void setLibraryPath(const string& path) {
-        libraryPath_ = path;
+        (void)path;
     }
 
     void setLibraryFolder(const string& folder) {
@@ -151,54 +81,37 @@ public:
     void resetServerCheck() { serverChecked_ = false; }
     bool isServerConnected() const { return serverReachable_; }
 
-    // --- Library persistence ---
+    // --- Library persistence (SQLite) ---
 
     void saveLibrary() {
-        if (libraryPath_.empty()) return;
-
-        nlohmann::json j;
-        j["photos"] = nlohmann::json::array();
-        for (const auto& [id, entry] : photos_) {
-            j["photos"].push_back(entry);
-        }
-
-        ofstream file(libraryPath_);
-        if (file) {
-            file << j.dump(2);
-            dirty_ = false;
-            logNotice() << "[PhotoProvider] Library saved: " << photos_.size() << " photos";
-        }
+        // No-op: SQLite writes are immediate
     }
 
     bool loadLibrary() {
-        if (libraryPath_.empty()) return false;
-        if (!fs::exists(libraryPath_)) return false;
+        if (databasePath_.empty()) return false;
 
-        ifstream file(libraryPath_);
-        if (!file) return false;
+        if (!db_.open(databasePath_)) return false;
 
-        try {
-            nlohmann::json j;
-            file >> j;
-
-            for (const auto& photoJson : j["photos"]) {
-                PhotoEntry entry = photoJson.get<PhotoEntry>();
-                photos_[entry.id] = entry;
-            }
-            logNotice() << "[PhotoProvider] Library loaded: " << photos_.size() << " photos";
-            return true;
-        } catch (const exception& e) {
-            logWarning() << "[PhotoProvider] Failed to load library: " << e.what();
-            return false;
+        // Auto-migrate from JSON if DB is empty and JSON exists
+        if (!jsonMigrationPath_.empty() && fs::exists(jsonMigrationPath_)) {
+            db_.migrateFromJson(jsonMigrationPath_);
         }
+
+        // Load all entries into memory
+        auto entries = db_.loadAll();
+        for (auto& entry : entries) {
+            photos_[entry.id] = std::move(entry);
+        }
+        logNotice() << "[PhotoProvider] Library loaded from DB: " << photos_.size() << " photos";
+        return !photos_.empty();
     }
 
-    void markDirty() { dirty_ = true; }
+    void markDirty() {
+        // No-op: SQLite writes are immediate
+    }
 
     void saveIfDirty() {
-        if (dirty_) {
-            saveLibrary();
-        }
+        // No-op: SQLite writes are immediate
     }
 
     // --- Library validation ---
@@ -212,21 +125,18 @@ public:
 
             if (photo.localPath.empty() || !fs::exists(photo.localPath)) {
                 if (photo.syncState == SyncState::Synced) {
-                    // Server still has it — just lost the local copy
                     photo.syncState = SyncState::ServerOnly;
-                    dirty_ = true;
+                    db_.updateSyncState(id, photo.syncState);
                     changedCount++;
                 } else if (photo.syncState != SyncState::Missing) {
-                    // LocalOnly / Syncing — truly lost
                     photo.syncState = SyncState::Missing;
-                    dirty_ = true;
+                    db_.updateSyncState(id, photo.syncState);
                     changedCount++;
                 }
             } else {
-                // File reappeared — restore to LocalOnly
                 if (photo.syncState == SyncState::Missing) {
                     photo.syncState = SyncState::LocalOnly;
-                    dirty_ = true;
+                    db_.updateSyncState(id, photo.syncState);
                     changedCount++;
                 }
             }
@@ -239,6 +149,7 @@ public:
         if (libraryFolder_.empty() || !fs::exists(libraryFolder_)) return 0;
 
         int addedCount = 0;
+        vector<PhotoEntry> newEntries;
         for (const auto& entry : fs::recursive_directory_iterator(libraryFolder_)) {
             if (!entry.is_regular_file()) continue;
             if (!isSupportedImage(entry.path())) continue;
@@ -258,8 +169,11 @@ public:
             photo.syncState = SyncState::LocalOnly;
             extractExifMetadata(photo.localPath, photo);
             photos_[id] = photo;
-            dirty_ = true;
+            newEntries.push_back(photo);
             addedCount++;
+        }
+        if (!newEntries.empty()) {
+            db_.insertPhotos(newEntries);
         }
         return addedCount;
     }
@@ -276,6 +190,7 @@ public:
 
         logNotice() << "[PhotoProvider] Scanning folder: " << folderPath;
         int added = 0;
+        vector<PhotoEntry> newEntries;
 
         for (const auto& entry : fs::recursive_directory_iterator(folder)) {
             if (!entry.is_regular_file()) continue;
@@ -303,6 +218,7 @@ public:
             extractExifMetadata(path, photo);
 
             photos_[id] = photo;
+            newEntries.push_back(photo);
             added++;
 
             // Queue file copy if library folder is configured and source is outside it
@@ -323,7 +239,9 @@ public:
             }
         }
 
-        if (added > 0) dirty_ = true;
+        if (!newEntries.empty()) {
+            db_.insertPhotos(newEntries);
+        }
         logNotice() << "[PhotoProvider] Found " << added << " new images (total: " << photos_.size() << ")";
 
         // Start background copy if there are pending copies
@@ -341,24 +259,23 @@ public:
         // Collect server-side IDs
         unordered_set<string> serverIds;
         auto data = res.json();
+        vector<PhotoEntry> newServerPhotos;
+
         for (const auto& p : data["photos"]) {
             string id = p.value("id", string(""));
             if (id.empty()) continue;
             serverIds.insert(id);
 
             if (photos_.count(id)) {
-                // Already known locally
                 auto& state = photos_[id].syncState;
                 if (state == SyncState::LocalOnly) {
                     state = SyncState::Synced;
-                    dirty_ = true;
+                    db_.updateSyncState(id, state);
                 } else if (state == SyncState::Missing) {
-                    // Local file gone but server has it → ServerOnly
                     state = SyncState::ServerOnly;
-                    dirty_ = true;
+                    db_.updateSyncState(id, state);
                 }
             } else {
-                // Server-only photo
                 PhotoEntry photo;
                 photo.id = id;
                 photo.filename = p.value("filename", string(""));
@@ -367,15 +284,19 @@ public:
                 photo.height = p.value("height", 0);
                 photo.syncState = SyncState::ServerOnly;
                 photos_[id] = photo;
-                dirty_ = true;
+                newServerPhotos.push_back(photo);
             }
+        }
+
+        if (!newServerPhotos.empty()) {
+            db_.insertPhotos(newServerPhotos);
         }
 
         // Revert Synced photos not found on server back to LocalOnly
         for (auto& [id, photo] : photos_) {
             if (photo.syncState == SyncState::Synced && !serverIds.count(id)) {
                 photo.syncState = SyncState::LocalOnly;
-                dirty_ = true;
+                db_.updateSyncState(id, photo.syncState);
             }
         }
     }
@@ -408,7 +329,7 @@ public:
                     file.write(res.body.data(), res.body.size());
                     file.close();
                     photo.localThumbnailPath = cachePath;
-                    dirty_ = true;
+                    db_.updateThumbnailPath(id, cachePath);
 
                     if (outPixels.load(cachePath)) {
                         return true;
@@ -473,7 +394,7 @@ public:
         auto res = client_.post("/api/import", {{"path", photo.localPath}});
         if (res.ok()) {
             photo.syncState = SyncState::Synced;
-            dirty_ = true;
+            db_.updateSyncState(id, photo.syncState);
             return true;
         }
 
@@ -482,6 +403,14 @@ public:
     }
 
     // --- Accessors ---
+
+    void setSyncState(const string& id, SyncState state) {
+        auto it = photos_.find(id);
+        if (it != photos_.end()) {
+            it->second.syncState = state;
+            db_.updateSyncState(id, state);
+        }
+    }
 
     const unordered_map<string, PhotoEntry>& photos() const { return photos_; }
     size_t getCount() const { return photos_.size(); }
@@ -522,7 +451,7 @@ public:
             auto it = photos_.find(result.photoId);
             if (it != photos_.end() && !result.destPath.empty()) {
                 it->second.localPath = result.destPath;
-                dirty_ = true;
+                db_.updateLocalPath(result.photoId, result.destPath);
             }
         }
         completedCopies_.clear();
@@ -556,7 +485,7 @@ public:
             // Re-extract EXIF if dateTimeOriginal is missing
             if (photo.dateTimeOriginal.empty()) {
                 extractExifMetadata(photo.localPath, photo);
-                dirty_ = true;
+                db_.updatePhoto(photo);
             }
 
             string subdir = dateToSubdir(photo.dateTimeOriginal, photo.localPath);
@@ -683,13 +612,18 @@ public:
             auto it = photos_.find(result.photoId);
             if (it == photos_.end()) continue;
 
+            bool changed = false;
             if (!result.newPath.empty()) {
                 it->second.localPath = result.newPath;
-                dirty_ = true;
+                changed = true;
             }
             if (!result.newThumbnailPath.empty()) {
                 it->second.localThumbnailPath = result.newThumbnailPath;
-                dirty_ = true;
+                changed = true;
+            }
+            if (changed) {
+                db_.updateLocalAndThumbnailPaths(result.photoId,
+                    it->second.localPath, it->second.localThumbnailPath);
             }
         }
         completedConsolidates_.clear();
@@ -704,13 +638,14 @@ public:
 
 private:
     HttpClient client_;
+    PhotoDatabase db_;
     unordered_map<string, PhotoEntry> photos_;
     string thumbnailCacheDir_;
-    string libraryPath_;
+    string databasePath_;
+    string jsonMigrationPath_;
     string libraryFolder_;
     bool serverReachable_ = false;
     bool serverChecked_ = false;
-    bool dirty_ = false;
 
     // Background file copy
     struct CopyTask {
@@ -820,7 +755,7 @@ private:
             THUMBNAIL_JPEG_QUALITY);
 
         photo.localThumbnailPath = cachePath;
-        dirty_ = true;
+        db_.updateThumbnailPath(photo.id, cachePath);
     }
 
     // Extract EXIF/MakerNote metadata using exiv2
