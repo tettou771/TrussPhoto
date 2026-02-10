@@ -89,7 +89,26 @@ void tcApp::setup() {
     addChild(grid_);
 
     grid_->onItemClick = [this](int index) {
-        showFullImage(index);
+        if (cmdDown_ && shiftDown_) {
+            // Shift+Cmd+click: range select/deselect from anchor
+            int anchor = grid_->getSelectionAnchor();
+            if (anchor >= 0) {
+                // If clicked item is already selected, deselect the range
+                bool select = !grid_->isSelected(index);
+                grid_->selectRange(anchor, index, select);
+            } else {
+                grid_->toggleSelection(index);
+            }
+        } else if (cmdDown_) {
+            // Cmd+click: toggle single
+            grid_->toggleSelection(index);
+        } else {
+            // Normal click: clear selection and open full view
+            if (grid_->hasSelection()) {
+                grid_->clearSelection();
+            }
+            showFullImage(index);
+        }
     };
 
     // Display previous library immediately
@@ -349,18 +368,45 @@ void tcApp::keyPressed(int key) {
         }
     } else {
         // Grid mode keys
-        if (key == 'R' || key == 'r') {
+        if (key == SAPP_KEYCODE_BACKSPACE || key == SAPP_KEYCODE_DELETE) {
+            deleteSelectedPhotos();
+        } else if (key == SAPP_KEYCODE_ESCAPE) {
+            if (grid_ && grid_->hasSelection()) {
+                grid_->clearSelection();
+            }
+        } else if (key == 'A' || key == 'a') {
+            if (cmdDown_ && grid_) {
+                if (shiftDown_) {
+                    grid_->clearSelection();
+                } else {
+                    grid_->selectAll();
+                }
+            }
+        } else if (key == 'R' || key == 'r') {
             repairLibrary();
         } else if (key == 'C') {  // Shift+C only (uppercase)
             consolidateLibrary();
         }
     }
-    
+
+    // Track modifier key state
+    if (key == SAPP_KEYCODE_LEFT_SUPER || key == SAPP_KEYCODE_RIGHT_SUPER) {
+        cmdDown_ = true;
+    }
+    if (key == SAPP_KEYCODE_LEFT_SHIFT || key == SAPP_KEYCODE_RIGHT_SHIFT) {
+        shiftDown_ = true;
+    }
+
     redraw();
 }
 
 void tcApp::keyReleased(int key) {
-    (void)key;
+    if (key == SAPP_KEYCODE_LEFT_SUPER || key == SAPP_KEYCODE_RIGHT_SUPER) {
+        cmdDown_ = false;
+    }
+    if (key == SAPP_KEYCODE_LEFT_SHIFT || key == SAPP_KEYCODE_RIGHT_SHIFT) {
+        shiftDown_ = false;
+    }
 }
 
 void tcApp::mousePressed(Vec2 pos, int button) {
@@ -435,20 +481,28 @@ void tcApp::windowResized(int width, int height) {
 void tcApp::filesDropped(const vector<string>& files) {
     if (files.empty()) return;
 
-    fs::path path(files[0]);
+    bool added = false;
+    vector<string> filesToImport;
 
-    if (fs::is_directory(path)) {
-        provider_.scanFolder(path.string());
-    } else {
-        fs::path folder = path.parent_path();
-        provider_.scanFolder(folder.string());
+    for (const auto& f : files) {
+        if (fs::is_directory(f)) {
+            provider_.scanFolder(f);
+            added = true;
+        } else if (provider_.isSupportedFile(f)) {
+            filesToImport.push_back(f);
+        }
     }
 
-    grid_->populate(provider_);
-    redraw();
+    if (!filesToImport.empty()) {
+        provider_.importFiles(filesToImport);
+        added = true;
+    }
 
-    // Auto-upload new photos
-    enqueueLocalOnlyPhotos();
+    if (added) {
+        grid_->populate(provider_);
+        redraw();
+        enqueueLocalOnlyPhotos();
+    }
 }
 
 void tcApp::exit() {
@@ -531,6 +585,25 @@ void tcApp::consolidateLibrary() {
     if (ok) {
         provider_.consolidateLibrary();
     }
+}
+
+void tcApp::deleteSelectedPhotos() {
+    if (!grid_ || !grid_->hasSelection()) return;
+
+    auto selectedIds = grid_->getSelectedIds();
+    int count = (int)selectedIds.size();
+
+    string msg = format("Delete {} photo{}?\nThis will permanently remove the file{} from disk.",
+        count, count > 1 ? "s" : "", count > 1 ? "s" : "");
+
+    bool ok = confirmDialog("Delete Photos", msg);
+    if (!ok) return;
+
+    int deleted = provider_.deletePhotos(selectedIds);
+    logNotice() << "[Delete] Removed " << deleted << " photos";
+
+    grid_->populate(provider_);
+    redraw();
 }
 
 void tcApp::loadProfileForEntry(const PhotoEntry& entry) {

@@ -132,10 +132,8 @@ class PhotoItem : public RectNode {
 public:
     using Ptr = shared_ptr<PhotoItem>;
 
-    // Callback for click (set by parent)
+    // Callbacks (set by parent)
     function<void()> onClick;
-
-    // Callback for load request (set by parent)
     function<void(int)> onRequestLoad;
     function<void(int)> onRequestUnload;
 

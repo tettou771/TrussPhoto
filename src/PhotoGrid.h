@@ -16,8 +16,9 @@ class PhotoGrid : public RectNode {
 public:
     using Ptr = shared_ptr<PhotoGrid>;
 
-    // Item click callback (passes entry index)
-    function<void(int)> onItemClick;
+    // Callbacks
+    function<void(int)> onItemClick;           // normal click → full view
+    function<void(vector<string>)> onDeleteRequest;  // delete selected photos
 
     PhotoGrid() {
         // Create scroll container
@@ -130,6 +131,69 @@ public:
         return changed;
     }
 
+    // --- Selection management ---
+
+    void toggleSelection(int index) {
+        if (index < 0 || index >= (int)items_.size()) return;
+        bool sel = !items_[index]->isSelected();
+        items_[index]->setSelected(sel);
+        selectionAnchor_ = index;
+        redraw();
+    }
+
+    void selectAll() {
+        for (auto& item : items_) item->setSelected(true);
+        redraw();
+    }
+
+    void selectRange(int from, int to, bool select = true) {
+        int lo = min(from, to), hi = max(from, to);
+        for (int i = lo; i <= hi && i < (int)items_.size(); i++) {
+            items_[i]->setSelected(select);
+        }
+        redraw();
+    }
+
+    int getSelectionAnchor() const { return selectionAnchor_; }
+
+    bool isSelected(int index) const {
+        if (index < 0 || index >= (int)items_.size()) return false;
+        return items_[index]->isSelected();
+    }
+
+    void clearSelection() {
+        for (auto& item : items_) {
+            item->setSelected(false);
+        }
+        redraw();
+    }
+
+    bool hasSelection() const {
+        for (auto& item : items_) {
+            if (item->isSelected()) return true;
+        }
+        return false;
+    }
+
+    // Get selected photo IDs
+    vector<string> getSelectedIds() const {
+        vector<string> ids;
+        for (size_t i = 0; i < items_.size() && i < photoIds_.size(); i++) {
+            if (items_[i]->isSelected()) {
+                ids.push_back(photoIds_[i]);
+            }
+        }
+        return ids;
+    }
+
+    int getSelectionCount() const {
+        int count = 0;
+        for (auto& item : items_) {
+            if (item->isSelected()) count++;
+        }
+        return count;
+    }
+
     // Get item count
     size_t getItemCount() const { return items_.size(); }
 
@@ -180,6 +244,7 @@ private:
     float spacing_ = 10;
     float padding_ = 10;
     float lastScrollY_ = -1;
+    int selectionAnchor_ = -1;
 
     void requestLoad(int index) {
         if (!provider_ || index < 0 || index >= (int)photoIds_.size()) return;

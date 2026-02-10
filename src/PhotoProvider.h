@@ -178,6 +178,67 @@ public:
         return addedCount;
     }
 
+    // Check if a file path is a supported image
+    bool isSupportedFile(const string& path) const {
+        return isSupportedImage(fs::path(path));
+    }
+
+    // Import individual files (non-blocking, copies happen in background)
+    int importFiles(const vector<string>& filePaths) {
+        int added = 0;
+        vector<PhotoEntry> newEntries;
+
+        for (const auto& filePath : filePaths) {
+            fs::path p(filePath);
+            if (!fs::exists(p) || !fs::is_regular_file(p)) continue;
+            if (!isSupportedImage(p)) continue;
+
+            string fname = p.filename().string();
+            uintmax_t fsize = fs::file_size(p);
+            string id = fname + "_" + to_string(fsize);
+
+            if (photos_.count(id)) continue;
+
+            PhotoEntry photo;
+            photo.id = id;
+            photo.filename = fname;
+            photo.fileSize = fsize;
+            photo.localPath = filePath;
+            photo.isRaw = RawLoader::isRawFile(p);
+            photo.syncState = SyncState::LocalOnly;
+            extractExifMetadata(filePath, photo);
+
+            photos_[id] = photo;
+            newEntries.push_back(photo);
+            added++;
+
+            // Queue file copy if library folder configured and source is outside it
+            if (!libraryFolder_.empty()) {
+                fs::path libPath = fs::canonical(fs::path(libraryFolder_));
+                fs::path srcCanonical = fs::canonical(p);
+                string srcStr = srcCanonical.string();
+                string libStr = libPath.string();
+                if (srcStr.substr(0, libStr.size()) != libStr) {
+                    string subdir = dateToSubdir(photo.dateTimeOriginal, filePath);
+                    fs::path destDir = libPath / subdir;
+                    fs::create_directories(destDir);
+                    fs::path destPath = resolveDestPath(destDir, fname);
+                    lock_guard<mutex> lock(copyMutex_);
+                    pendingCopies_.push_back({id, filePath, destPath.string()});
+                }
+            }
+        }
+
+        if (!newEntries.empty()) {
+            db_.insertPhotos(newEntries);
+        }
+        if (added > 0) {
+            logNotice() << "[PhotoProvider] Imported " << added << " files (total: " << photos_.size() << ")";
+            startCopyThread();
+        }
+        return added;
+    }
+
     // --- Scan and import ---
 
     // Scan local folder for image files (non-blocking, copies happen in background)
@@ -427,6 +488,38 @@ public:
         db_.deletePhoto(id);
         photos_.erase(it);
         return true;
+    }
+
+    // Fully delete photos: local file + thumbnail + DB + memory
+    int deletePhotos(const vector<string>& ids) {
+        int deleted = 0;
+        for (const auto& id : ids) {
+            auto it = photos_.find(id);
+            if (it == photos_.end()) continue;
+
+            auto& photo = it->second;
+
+            // Delete local RAW/image file
+            if (!photo.localPath.empty() && fs::exists(photo.localPath)) {
+                try {
+                    fs::remove(photo.localPath);
+                    logNotice() << "[Delete] Removed file: " << photo.localPath;
+                } catch (const exception& e) {
+                    logWarning() << "[Delete] Failed to remove file: " << e.what();
+                }
+            }
+
+            // Delete thumbnail cache
+            if (!photo.localThumbnailPath.empty() && fs::exists(photo.localThumbnailPath)) {
+                try { fs::remove(photo.localThumbnailPath); } catch (...) {}
+            }
+
+            // Delete from DB and memory
+            db_.deletePhoto(id);
+            photos_.erase(it);
+            deleted++;
+        }
+        return deleted;
     }
 
     // Get sorted photo list (by filename)

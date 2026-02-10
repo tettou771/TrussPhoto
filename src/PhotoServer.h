@@ -156,8 +156,10 @@ public:
 
         // Start server thread
         running_ = true;
+        threadDone_ = false;
         serverThread_ = thread([this, port]() {
             app_.port(port).multithreaded().run();
+            threadDone_ = true;
         });
 
         logNotice() << "[PhotoServer] Started on port " << port;
@@ -165,11 +167,23 @@ public:
 
     void stop() {
         if (running_) {
+            logNotice() << "[PhotoServer] Stopping...";
             app_.stop();
-            if (serverThread_.joinable()) {
-                serverThread_.join();
-            }
             running_ = false;
+            // Wait briefly for Crow to finish, then detach
+            // Crow's ASIO can take time to drain; don't block exit
+            auto start = chrono::steady_clock::now();
+            while (!threadDone_ && chrono::steady_clock::now() - start < chrono::seconds(2)) {
+                this_thread::sleep_for(chrono::milliseconds(50));
+            }
+            if (serverThread_.joinable()) {
+                if (threadDone_) {
+                    serverThread_.join();
+                } else {
+                    serverThread_.detach();
+                    logWarning() << "[PhotoServer] Force detached (Crow slow to stop)";
+                }
+            }
             logNotice() << "[PhotoServer] Stopped";
         }
     }
@@ -180,6 +194,7 @@ private:
     crow::SimpleApp app_;
     thread serverThread_;
     atomic<bool> running_{false};
+    atomic<bool> threadDone_{false};
     PhotoProvider* provider_ = nullptr;
     string thumbnailDir_;
     string apiKey_;

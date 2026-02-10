@@ -91,7 +91,12 @@ private:
     PhotoServer server_;
     ServerConfig serverConfig_;
 
+    // Modifier key tracking
+    bool cmdDown_ = false;
+    bool shiftDown_ = false;
+
     void showFullImage(int index);
+    void deleteSelectedPhotos();
     void reprocessImage();   // re-apply lens correction from rawPixels_ cache
     void exitFullImage();
     void drawSingleView();
