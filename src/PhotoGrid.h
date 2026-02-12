@@ -80,6 +80,13 @@ public:
 
     const string& getFilterPath() const { return filterPath_; }
 
+    // Set text filter query (empty = no filter)
+    void setTextFilter(const string& query) {
+        textFilter_ = query;
+    }
+
+    const string& getTextFilter() const { return textFilter_; }
+
     // Populate grid from PhotoProvider
     void populate(PhotoProvider& provider) {
         provider_ = &provider;
@@ -106,6 +113,9 @@ public:
                 string dir = fs::path(photo->localPath).parent_path().string();
                 if (dir.substr(0, filterPath_.size()) != filterPath_) continue;
             }
+
+            // Filter by text query
+            if (!textFilter_.empty() && !matchesTextFilter(*photo, textFilter_)) continue;
 
             int gridIndex = (int)photoIds_.size();
             photoIds_.push_back(ids[i]);
@@ -269,6 +279,7 @@ private:
     PhotoProvider* provider_ = nullptr;
     vector<string> photoIds_;
     string filterPath_;
+    string textFilter_;
 
     AsyncImageLoader loader_;
     Font labelFont_;
@@ -324,6 +335,38 @@ private:
                 item->setActive(shouldBeActive);
             }
         }
+    }
+
+    // Case-insensitive substring match across metadata fields
+    static bool matchesTextFilter(const PhotoEntry& photo, const string& query) {
+        // Convert query to lowercase
+        string lq = query;
+        transform(lq.begin(), lq.end(), lq.begin(), ::tolower);
+
+        auto contains = [&lq](const string& field) {
+            if (field.empty()) return false;
+            string lf = field;
+            transform(lf.begin(), lf.end(), lf.begin(), ::tolower);
+            return lf.find(lq) != string::npos;
+        };
+
+        // Search across multiple fields
+        if (contains(fs::path(photo.filename).stem().string())) return true;
+        if (contains(photo.camera)) return true;
+        if (contains(photo.cameraMake)) return true;
+        if (contains(photo.lens)) return true;
+        if (contains(photo.lensMake)) return true;
+        if (contains(photo.memo)) return true;
+        if (contains(photo.colorLabel)) return true;
+        if (contains(photo.creativeStyle)) return true;
+        if (contains(photo.dateTimeOriginal)) return true;
+
+        // Tags: JSON array string like '["travel","sunrise"]'
+        if (!photo.tags.empty()) {
+            if (contains(photo.tags)) return true;
+        }
+
+        return false;
     }
 
     void updateGridLayout() {

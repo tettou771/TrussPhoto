@@ -14,6 +14,7 @@
 #include "FolderTree.h"
 #include "MetadataPanel.h"
 #include "PaneToggle.h"
+#include "SearchBar.h"
 #include "UploadQueue.h"
 #include "CameraProfileManager.h"
 #include "ServerConfig.h"
@@ -58,6 +59,8 @@ private:
     bool showMetadata_ = true;
     float metadataWidth_ = 260;
     MetadataPanel::Ptr metadataPanel_;
+    SearchBar::Ptr searchBar_;
+    float searchBarHeight_ = 36;
     PaneToggle::Ptr leftToggle_;
     PaneToggle::Ptr rightToggle_;
     UploadQueue uploadQueue_;

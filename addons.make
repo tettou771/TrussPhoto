@@ -3,3 +3,4 @@ tcxCrow
 tcxCurl
 tcxLibRaw
 tcxLut
+tcxIME

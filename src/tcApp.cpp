@@ -90,6 +90,18 @@ void tcApp::setup() {
     grid_ = make_shared<PhotoGrid>();
     addChild(grid_);
 
+    // 5a. Create search bar
+    searchBar_ = make_shared<SearchBar>();
+    addChild(searchBar_);
+
+    searchBar_->onSearch = [this](const string& query) {
+        if (grid_) {
+            grid_->setTextFilter(query);
+            grid_->populate(provider_);
+            redraw();
+        }
+    };
+
     // 5b. Create folder tree sidebar
     folderTree_ = make_shared<FolderTree>();
     addChild(folderTree_);
@@ -493,6 +505,7 @@ void tcApp::draw() {
 
     // Model download / loading progress
     if (provider_.isEmbedderInitializing()) {
+        pushStyle();
         float leftW = leftPaneWidth_;
         float rightW = rightPaneWidth_;
         float contentW = getWindowWidth() - leftW - rightW;
@@ -526,6 +539,7 @@ void tcApp::draw() {
             fontSmall_.drawString(format("{:.0f}%", progress * 100),
                 centerX, barY2 + 20, Direction::Center, Direction::Center);
         }
+        popStyle();
     }
 
     // Status bar background
@@ -653,14 +667,30 @@ void tcApp::keyPressed(int key) {
                 hasProfileLut_, lensEnabled_, isSmartPreview_);
         }
     } else {
+        // Grid mode: if search bar is active, only handle ESC
+        if (searchBar_ && searchBar_->isActive()) {
+            if (key == SAPP_KEYCODE_ESCAPE) {
+                searchBar_->deactivate();
+            }
+            // Let IME handle all other keys
+            redraw();
+            return;
+        }
+
         // Grid mode keys
         if (key == SAPP_KEYCODE_BACKSPACE || key == SAPP_KEYCODE_DELETE) {
             deleteSelectedPhotos();
         } else if (key == SAPP_KEYCODE_ESCAPE) {
-            if (grid_ && grid_->hasSelection()) {
+            if (searchBar_ && !searchBar_->getQuery().empty()) {
+                searchBar_->clear();
+                grid_->populate(provider_);
+            } else if (grid_ && grid_->hasSelection()) {
                 grid_->clearSelection();
                 updateMetadataPanel();
             }
+        } else if (key == SAPP_KEYCODE_SLASH) {
+            // '/' to activate search
+            if (searchBar_) searchBar_->activate();
         } else if (key == 'A' || key == 'a') {
             if (cmdDown_ && grid_) {
                 if (shiftDown_) {
@@ -678,7 +708,12 @@ void tcApp::keyPressed(int key) {
     }
 
     // Mode-independent keys
-    if (key == 'F' || key == 'f') {
+    if ((key == 'F' || key == 'f') && cmdDown_) {
+        // Cmd+F: activate search bar (grid mode only)
+        if (viewMode_ == ViewMode::Grid && searchBar_) {
+            searchBar_->activate();
+        }
+    } else if (key == 'F' || key == 'f') {
         relinkMissingPhotos();
     }
     if (key == 'T' || key == 't') {
@@ -1084,6 +1119,7 @@ void tcApp::showFullImage(int index) {
         zoomLevel_ = 1.0f;
         panOffset_ = {0, 0};
         grid_->setActive(false);
+        if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
         leftPaneWidth_ = 0;  // hide left pane in single view (no animation)
         leftTween_.finish();
         updateLayout();
@@ -1216,8 +1252,21 @@ void tcApp::updateLayout() {
     float w = getWindowWidth();
     float h = getWindowHeight() - statusBarHeight_;
 
+    // SearchBar — only in grid mode
+    bool inGrid = viewMode_ == ViewMode::Grid;
+    float searchH = inGrid ? searchBarHeight_ : 0;
+    if (searchBar_) {
+        searchBar_->setActive(inGrid);
+        if (inGrid) {
+            searchBar_->setRect(0, 0, w, searchBarHeight_);
+        }
+    }
+
+    float contentY = searchH;
+    float contentH = h - searchH;
+
     // Animated pane widths (slide in/out)
-    bool leftInGrid = viewMode_ == ViewMode::Grid && folderTree_;
+    bool leftInGrid = inGrid && folderTree_;
     float leftW = leftInGrid ? leftPaneWidth_ : 0;
     float rightW = rightPaneWidth_;
 
@@ -1230,28 +1279,28 @@ void tcApp::updateLayout() {
         bool leftActive = leftInGrid && leftPaneWidth_ > 0;
         folderTree_->setActive(leftActive);
         if (leftActive) {
-            folderTree_->setRect(leftW - sidebarWidth_, 0, sidebarWidth_, h);
+            folderTree_->setRect(leftW - sidebarWidth_, contentY, sidebarWidth_, contentH);
         }
     }
 
     // Grid
-    if (grid_) grid_->setRect(contentX, 0, contentW, h);
+    if (grid_) grid_->setRect(contentX, contentY, contentW, contentH);
 
     // MetadataPanel — always full width, slide via X position
     if (metadataPanel_) {
         bool rightActive = rightPaneWidth_ > 0;
         metadataPanel_->setActive(rightActive);
         if (rightActive) {
-            metadataPanel_->setRect(w - rightW, 0, metadataWidth_, h);
+            metadataPanel_->setRect(w - rightW, contentY, metadataWidth_, contentH);
         }
     }
 
     // Left toggle
     if (leftToggle_) {
-        if (viewMode_ == ViewMode::Grid) {
+        if (inGrid) {
             leftToggle_->setActive(true);
             leftToggle_->direction = showSidebar_ ? PaneToggle::Left : PaneToggle::Right;
-            leftToggle_->setRect(leftW - 12, h / 2 - 15, 12, 30);
+            leftToggle_->setRect(leftW - 12, contentY + contentH / 2 - 15, 12, 30);
             // Clamp to screen edge when collapsed
             if (leftToggle_->getX() < 0) leftToggle_->setPos(0, leftToggle_->getY());
         } else {
@@ -1265,7 +1314,7 @@ void tcApp::updateLayout() {
         rightToggle_->direction = showMetadata_ ? PaneToggle::Right : PaneToggle::Left;
         float toggleX = w - rightW;
         if (toggleX > w - 12) toggleX = w - 12;
-        rightToggle_->setRect(toggleX, h / 2 - 15, 12, 30);
+        rightToggle_->setRect(toggleX, contentY + contentH / 2 - 15, 12, 30);
     }
 }
 
