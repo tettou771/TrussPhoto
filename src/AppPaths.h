@@ -36,6 +36,10 @@ inline string appConfigPath() {
     return appConfigDir() + "/app_config.json";
 }
 
+inline string modelsDir() {
+    return appConfigDir() + "/models";
+}
+
 // --- Legacy paths (for migration) ---
 
 inline string legacyDataPath() {
@@ -68,6 +72,7 @@ inline string legacyCachePath() {
 
 inline void ensureAppConfigDir() {
     fs::create_directories(appConfigDir());
+    fs::create_directories(modelsDir());
 }
 
 inline void ensureCatalogDirectories(const string& catalogPath) {

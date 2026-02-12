@@ -114,6 +114,9 @@ private:
     float rightPaneWidth_ = 260;  // current animated width
     double lastTime_ = 0;
 
+    // Embedding
+    bool embeddingsQueued_ = false;
+
     // Modifier key tracking
     bool cmdDown_ = false;
     bool shiftDown_ = false;

@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 3;
+    static constexpr int SCHEMA_VERSION = 4;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -70,6 +70,8 @@ public:
             ok = db_.exec("CREATE INDEX IF NOT EXISTS idx_photos_sync_state ON photos(sync_state)");
             if (!ok) return false;
 
+            if (!createEmbeddingsTable()) return false;
+
             db_.setSchemaVersion(SCHEMA_VERSION);
             logNotice() << "[PhotoDatabase] Schema v" << SCHEMA_VERSION << " created";
         }
@@ -104,8 +106,19 @@ public:
                 logError() << "[PhotoDatabase] Migration v2->v3 failed";
                 return false;
             }
+            version = 3;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v2 -> v3";
+        }
+
+        // v3 -> v4: add embeddings table
+        if (version == 3) {
+            if (!createEmbeddingsTable()) {
+                logError() << "[PhotoDatabase] Migration v3->v4 failed";
+                return false;
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v2 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v3 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -338,6 +351,79 @@ public:
         return result;
     }
 
+    // --- Embeddings ---
+
+    bool insertEmbedding(const string& photoId, const string& model,
+                         const string& source, const vector<float>& vec) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "INSERT OR REPLACE INTO embeddings (photo_id, model, source, vector, created_at) "
+            "VALUES (?1, ?2, ?3, ?4, ?5)");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, photoId);
+        stmt.bind(2, model);
+        stmt.bind(3, source);
+        stmt.bindBlob(4, vec.data(), (int)(vec.size() * sizeof(float)));
+        stmt.bind(5, (int64_t)chrono::duration_cast<chrono::milliseconds>(
+            chrono::system_clock::now().time_since_epoch()).count());
+        return stmt.execute();
+    }
+
+    vector<float> getEmbedding(const string& photoId, const string& model,
+                               const string& source = "image") {
+        auto stmt = db_.prepare(
+            "SELECT vector FROM embeddings WHERE photo_id=?1 AND model=?2 AND source=?3");
+        if (!stmt.valid()) return {};
+        stmt.bind(1, photoId);
+        stmt.bind(2, model);
+        stmt.bind(3, source);
+        if (stmt.step()) {
+            auto [data, size] = stmt.getBlob(0);
+            if (data && size > 0) {
+                int count = size / (int)sizeof(float);
+                vector<float> vec(count);
+                memcpy(vec.data(), data, size);
+                return vec;
+            }
+        }
+        return {};
+    }
+
+    bool hasEmbedding(const string& photoId, const string& model,
+                      const string& source = "image") {
+        auto stmt = db_.prepare(
+            "SELECT 1 FROM embeddings WHERE photo_id=?1 AND model=?2 AND source=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, photoId);
+        stmt.bind(2, model);
+        stmt.bind(3, source);
+        return stmt.step();
+    }
+
+    bool deleteEmbeddings(const string& photoId) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("DELETE FROM embeddings WHERE photo_id=?1");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, photoId);
+        return stmt.execute();
+    }
+
+    vector<string> getPhotosWithoutEmbedding(const string& model,
+                                              const string& source = "image") {
+        vector<string> result;
+        auto stmt = db_.prepare(
+            "SELECT p.id FROM photos p "
+            "LEFT JOIN embeddings e ON p.id = e.photo_id AND e.model = ?1 AND e.source = ?2 "
+            "WHERE e.photo_id IS NULL");
+        if (!stmt.valid()) return result;
+        stmt.bind(1, model);
+        stmt.bind(2, source);
+        while (stmt.step()) {
+            result.push_back(stmt.getText(0));
+        }
+        return result;
+    }
+
     // --- JSON migration ---
 
     bool migrateFromJson(const string& jsonPath) {
@@ -379,6 +465,18 @@ public:
 
 private:
     Database db_;
+
+    bool createEmbeddingsTable() {
+        return db_.exec(
+            "CREATE TABLE IF NOT EXISTS embeddings ("
+            "  photo_id   TEXT NOT NULL,"
+            "  model      TEXT NOT NULL,"
+            "  source     TEXT NOT NULL,"
+            "  vector     BLOB NOT NULL,"
+            "  created_at INTEGER NOT NULL DEFAULT 0,"
+            "  PRIMARY KEY (photo_id, model, source)"
+            ")");
+    }
 
     static void bindEntry(Database::Statement& stmt, const PhotoEntry& e) {
         stmt.bind(1, e.id);

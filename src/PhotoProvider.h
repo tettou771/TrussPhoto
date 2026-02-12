@@ -26,6 +26,7 @@ namespace fs = std::filesystem;
 #include "PhotoEntry.h"
 #include "PhotoDatabase.h"
 #include "SmartPreview.h"
+#include "ClipEmbedder.h"
 
 // Photo provider - manages local + server photos
 class PhotoProvider {
@@ -726,7 +727,8 @@ public:
                 try { fs::remove(photo.localSmartPreviewPath); } catch (...) {}
             }
 
-            // Delete from DB and memory
+            // Delete embeddings, DB entry, and memory
+            db_.deleteEmbeddings(id);
             db_.deletePhoto(id);
             photos_.erase(it);
             deleted++;
@@ -853,6 +855,61 @@ public:
         lock_guard<mutex> lock(spMutex_);
         return (int)pendingSPGenerations_.size();
     }
+
+    // --- CLIP Embedding ---
+
+    // Initialize CLIP embedder in background (downloads model if needed)
+    void initEmbedder(const string& modelsDir) {
+        clipEmbedder_.loadAsync(modelsDir);
+    }
+
+    bool isEmbedderReady() const { return clipEmbedder_.isReady(); }
+    bool isEmbedderInitializing() const { return clipEmbedder_.isInitializing(); }
+    bool isEmbedderDownloading() const { return clipEmbedder_.isDownloading(); }
+    float getEmbedderDownloadProgress() { return clipEmbedder_.getDownloadProgress(); }
+    const string& getEmbedderStatus() const { return clipEmbedder_.getStatusText(); }
+
+    // Queue all photos that don't have embeddings yet
+    int queueAllMissingEmbeddings() {
+        if (!clipEmbedder_.isReady()) return 0;
+        auto ids = db_.getPhotosWithoutEmbedding(ClipEmbedder::MODEL_NAME);
+        if (ids.empty()) return 0;
+
+        lock_guard<mutex> lock(embMutex_);
+        for (const auto& id : ids) {
+            pendingEmbeddings_.push_back(id);
+        }
+        startEmbeddingThread();
+        return (int)ids.size();
+    }
+
+    // Queue specific photos for embedding
+    void queueEmbeddings(const vector<string>& ids) {
+        if (!clipEmbedder_.isReady() || ids.empty()) return;
+        lock_guard<mutex> lock(embMutex_);
+        for (const auto& id : ids) {
+            if (!db_.hasEmbedding(id, ClipEmbedder::MODEL_NAME)) {
+                pendingEmbeddings_.push_back(id);
+            }
+        }
+        startEmbeddingThread();
+    }
+
+    // Process completed embeddings (call from main thread)
+    int processEmbeddingResults() {
+        lock_guard<mutex> lock(embMutex_);
+        int count = (int)completedEmbeddings_.size();
+        for (const auto& result : completedEmbeddings_) {
+            db_.insertEmbedding(result.photoId, ClipEmbedder::MODEL_NAME,
+                                "image", result.embedding);
+        }
+        completedEmbeddings_.clear();
+        return count;
+    }
+
+    bool isEmbeddingRunning() const { return embThreadRunning_; }
+    int getEmbeddingTotalCount() const { return embTotalCount_; }
+    int getEmbeddingCompletedCount() const { return embCompletedCount_; }
 
     // Process completed file copies (call from main thread in update)
     void processCopyResults() {
@@ -1109,6 +1166,77 @@ private:
     vector<SPResult> completedSPGenerations_;
     atomic<bool> spThreadRunning_{false};
     thread spThread_;
+
+    // CLIP embedding
+    ClipEmbedder clipEmbedder_;
+
+    struct EmbeddingResult {
+        string photoId;
+        vector<float> embedding;
+    };
+
+    mutable mutex embMutex_;
+    vector<string> pendingEmbeddings_;
+    vector<EmbeddingResult> completedEmbeddings_;
+    atomic<bool> embThreadRunning_{false};
+    atomic<int> embCompletedCount_{0};
+    atomic<int> embTotalCount_{0};
+    thread embThread_;
+
+    void startEmbeddingThread() {
+        // Called with embMutex_ already held
+        if (pendingEmbeddings_.empty() || embThreadRunning_) return;
+
+        embThreadRunning_ = true;
+        embCompletedCount_ = 0;
+        if (embThread_.joinable()) embThread_.join();
+
+        vector<string> ids = std::move(pendingEmbeddings_);
+        pendingEmbeddings_.clear();
+        embTotalCount_ = (int)ids.size();
+
+        embThread_ = thread([this, ids = std::move(ids)]() {
+            logNotice() << "[CLIP] Generating embeddings for " << ids.size() << " photos";
+            int done = 0;
+            for (const auto& id : ids) {
+                // Get thumbnail path for this photo
+                auto it = photos_.find(id);
+                if (it == photos_.end()) continue;
+                auto& photo = it->second;
+
+                // Load thumbnail pixels (U8, small — ideal for CLIP)
+                Pixels thumbPixels;
+                string thumbPath = photo.localThumbnailPath;
+                bool loaded = false;
+
+                if (!thumbPath.empty() && fs::exists(thumbPath)) {
+                    loaded = thumbPixels.load(thumbPath);
+                }
+
+                // Fallback: try to generate thumbnail on the fly
+                if (!loaded) {
+                    loaded = getThumbnail(id, thumbPixels);
+                }
+
+                if (!loaded) {
+                    logWarning() << "[CLIP] No thumbnail for: " << id;
+                    continue;
+                }
+
+                auto embedding = clipEmbedder_.embed(thumbPixels);
+                if (embedding.empty()) continue;
+
+                {
+                    lock_guard<mutex> lock(embMutex_);
+                    completedEmbeddings_.push_back({id, std::move(embedding)});
+                }
+                embCompletedCount_ = ++done;
+            }
+            logNotice() << "[CLIP] Embedding done: " << done << "/" << ids.size();
+            embThreadRunning_ = false;
+        });
+        embThread_.detach();
+    }
 
     void startSPGenerationThread() {
         // Called with spMutex_ already held

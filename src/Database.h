@@ -97,6 +97,9 @@ public:
         void bind(int idx, double val) {
             if (stmt_) sqlite3_bind_double(stmt_, idx, val);
         }
+        void bindBlob(int idx, const void* data, int size) {
+            if (stmt_) sqlite3_bind_blob(stmt_, idx, data, size, SQLITE_TRANSIENT);
+        }
 
         // Step: returns true if there's a row (SQLITE_ROW)
         bool step() {
@@ -125,6 +128,12 @@ public:
         }
         double getDouble(int col) {
             return stmt_ ? sqlite3_column_double(stmt_, col) : 0.0;
+        }
+        pair<const void*, int> getBlob(int col) {
+            if (!stmt_) return {nullptr, 0};
+            const void* data = sqlite3_column_blob(stmt_, col);
+            int size = sqlite3_column_bytes(stmt_, col);
+            return {data, size};
         }
 
         void reset() {

@@ -22,6 +22,14 @@ if(NOT EMSCRIPTEN)
     target_link_directories(${PROJECT_NAME} PRIVATE ${JXL_LIBRARY_DIRS})
     target_link_libraries(${PROJECT_NAME} PRIVATE ${JXL_LIBRARIES})
     message(STATUS "[${PROJECT_NAME}] Found libjxl: ${JXL_VERSION}")
+
+    # onnxruntime - CLIP embedding inference
+    # brew install onnxruntime
+    pkg_check_modules(ORT REQUIRED libonnxruntime)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${ORT_INCLUDE_DIRS})
+    target_link_directories(${PROJECT_NAME} PRIVATE ${ORT_LIBRARY_DIRS})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${ORT_LIBRARIES})
+    message(STATUS "[${PROJECT_NAME}] Found onnxruntime: ${ORT_VERSION}")
 endif()
 
 # SQLite amalgamation - embedded database for photo library

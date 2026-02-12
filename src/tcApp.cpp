@@ -266,6 +266,18 @@ void tcApp::setup() {
             };
         });
 
+    mcp::tool("generate_embeddings", "Generate CLIP embeddings for all photos without one")
+        .bind([this]() {
+            if (!provider_.isEmbedderReady()) {
+                return json{{"status", "error"}, {"message", "Embedder not ready"}};
+            }
+            int queued = provider_.queueAllMissingEmbeddings();
+            return json{
+                {"status", "ok"},
+                {"queued", queued}
+            };
+        });
+
     mcp::tool("generate_smart_previews", "Generate smart previews for all photos without one")
         .bind([this]() {
             int queued = provider_.queueAllMissingSP();
@@ -291,21 +303,24 @@ void tcApp::setup() {
             };
         });
 
-    // 9. Camera profile manager
+    // 9. CLIP embedder (async: downloads model in background if needed)
+    provider_.initEmbedder(AppPaths::modelsDir());
+
+    // 10. Camera profile manager
     string home = getenv("HOME") ? getenv("HOME") : ".";
     profileManager_.setProfileDir(home + "/.trussc/profiles");
 
-    // 10. Fonts
+    // 11. Fonts
     loadJapaneseFont(font_, 14);
     loadJapaneseFont(fontSmall_, 12);
 
-    // 11. LUT shader
+    // 12. LUT shader
     lutShader_.load();
 
-    // 12. Lens correction database
+    // 13. Lens correction database
     lensCorrector_.loadDatabase(getDataPath("lensfun"));
 
-    // 13. Setup event driven mode
+    // 14. Setup event driven mode
     setIndependentFps(VSYNC, 0);
 
     logNotice() << "TrussPhoto ready - Catalog: " << catalogPath_;
@@ -373,6 +388,23 @@ void tcApp::update() {
 
     // Process smart preview generation results
     provider_.processSPResults();
+
+    // Process embedding generation results
+    provider_.processEmbeddingResults();
+
+    // When embedder becomes ready, queue missing embeddings
+    if (provider_.isEmbedderReady() && !embeddingsQueued_) {
+        embeddingsQueued_ = true;
+        int queued = provider_.queueAllMissingEmbeddings();
+        if (queued > 0) {
+            logNotice() << "[CLIP] Queued " << queued << " photos for embedding";
+        }
+    }
+
+    // Redraw during model download (progress bar)
+    if (provider_.isEmbedderInitializing()) {
+        redraw();
+    }
 
     // Process consolidation results
     provider_.processConsolidateResults();
@@ -459,6 +491,43 @@ void tcApp::draw() {
         }
     }
 
+    // Model download / loading progress
+    if (provider_.isEmbedderInitializing()) {
+        float leftW = leftPaneWidth_;
+        float rightW = rightPaneWidth_;
+        float contentW = getWindowWidth() - leftW - rightW;
+        float centerX = leftW + contentW * 0.5f;
+        float centerY = getWindowHeight() * 0.5f;
+
+        // Status text
+        setColor(0.6f, 0.6f, 0.65f);
+        fontSmall_.drawString(provider_.getEmbedderStatus(),
+            centerX, centerY - 20, Direction::Center, Direction::Center);
+
+        // Progress bar (only during download)
+        if (provider_.isEmbedderDownloading()) {
+            float barW = 300;
+            float barH = 6;
+            float barX = centerX - barW / 2;
+            float barY2 = centerY;
+            float progress = provider_.getEmbedderDownloadProgress();
+
+            // Background
+            setColor(0.15f, 0.15f, 0.18f);
+            fill();
+            drawRect(barX, barY2, barW, barH);
+
+            // Fill
+            setColor(0.3f, 0.55f, 0.9f);
+            drawRect(barX, barY2, barW * progress, barH);
+
+            // Percentage
+            setColor(0.5f, 0.5f, 0.55f);
+            fontSmall_.drawString(format("{:.0f}%", progress * 100),
+                centerX, barY2 + 20, Direction::Center, Direction::Center);
+        }
+    }
+
     // Status bar background
     float barHeight = 24;
     float barY = getWindowHeight() - barHeight;
@@ -496,8 +565,15 @@ void tcApp::draw() {
         consolidateStatus = format("  Consolidate: {}/{}",
             provider_.getConsolidateProgress(), provider_.getConsolidateTotal());
     }
-    fontSmall_.drawString(format("{}  Photos: {}{}{}  FPS: {:.0f}",
-        serverLabel, provider_.getCount(), uploadStatus, consolidateStatus, getFrameRate()),
+    string embeddingStatus;
+    if (provider_.isEmbeddingRunning()) {
+        embeddingStatus = format("  Embedding: {}/{}",
+            provider_.getEmbeddingCompletedCount(),
+            provider_.getEmbeddingTotalCount());
+    }
+    fontSmall_.drawString(format("{}  Photos: {}{}{}{}  FPS: {:.0f}",
+        serverLabel, provider_.getCount(), uploadStatus, consolidateStatus,
+        embeddingStatus, getFrameRate()),
         textX, textY, Direction::Left, Direction::Center);
 }
 
@@ -729,6 +805,9 @@ void tcApp::filesDropped(const vector<string>& files) {
 
         // Queue smart preview generation for new photos
         provider_.queueAllMissingSP();
+
+        // Queue embedding generation for new photos
+        provider_.queueAllMissingEmbeddings();
     }
 }
 
