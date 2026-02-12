@@ -257,13 +257,17 @@ void tcApp::setup() {
     string home = getenv("HOME") ? getenv("HOME") : ".";
     profileManager_.setProfileDir(home + "/.trussc/profiles");
 
-    // 10. LUT shader
+    // 10. Fonts
+    loadJapaneseFont(font_, 14);
+    loadJapaneseFont(fontSmall_, 12);
+
+    // 11. LUT shader
     lutShader_.load();
 
-    // 11. Lens correction database
+    // 12. Lens correction database
     lensCorrector_.loadDatabase(getDataPath("lensfun"));
 
-    // 12. Setup event driven mode
+    // 13. Setup event driven mode
     setIndependentFps(VSYNC, 0);
 
     logNotice() << "TrussPhoto ready - Catalog: " << catalogPath_;
@@ -378,9 +382,8 @@ void tcApp::draw() {
         if (provider_.getCount() == 0) {
             setColor(0.5f, 0.5f, 0.55f);
             string hint = "Drop a folder containing images";
-            float x = getWindowWidth() / 2 - hint.length() * 4;
-            float y = getWindowHeight() / 2;
-            drawBitmapString(hint, x, y);
+            font_.drawString(hint, getWindowWidth() / 2.0f, getWindowHeight() / 2.0f,
+                Direction::Center, Direction::Center);
         }
     }
 
@@ -412,9 +415,9 @@ void tcApp::draw() {
         consolidateStatus = format("  Consolidate: {}/{}",
             provider_.getConsolidateProgress(), provider_.getConsolidateTotal());
     }
-    drawBitmapString(format("{}  Photos: {}{}{}  FPS: {:.0f}",
+    fontSmall_.drawString(format("{}  Photos: {}{}{}  FPS: {:.0f}",
         serverLabel, provider_.getCount(), uploadStatus, consolidateStatus, getFrameRate()),
-        dotX + 14, barY + 7);
+        dotX + 14, barY + barHeight / 2, Direction::Left, Direction::Center);
 }
 
 void tcApp::keyPressed(int key) {
@@ -1018,11 +1021,30 @@ void tcApp::drawSingleView() {
         const string& photoId = grid_->getPhotoId(selectedIndex_);
         auto* entry = provider_.getPhoto(photoId);
         if (entry) {
+            // Helper: draw text with background highlight
+            auto drawHighlight = [this](const string& text, float tx, float ty, const Color& bg) {
+                float tw = fontSmall_.getWidth(text);
+                float th = 16.0f;
+                float pad = 3.0f;
+                pushStyle();
+                setColor(bg);
+                fill();
+                drawRect(tx - pad, ty - th / 2 - pad, tw + pad * 2, th + pad * 2);
+                popStyle();
+                fontSmall_.drawString(text, tx, ty, Direction::Left, Direction::Center);
+            };
+
+            float lineH = 20.0f;
+            float infoY = 20.0f;
+
             setColor(0.8f, 0.8f, 0.85f);
             string typeStr = isSmartPreview_ ? " [Smart Preview]" : (entry->isRaw ? " [RAW]" : "");
-            drawBitmapStringHighlight(entry->filename + typeStr, 10, 20, Color(0, 0.3));
-            drawBitmapStringHighlight(format("{}x{}  Zoom: {:.0f}%",
-                (int)imgW, (int)imgH, zoomLevel_ * 100), 10, 40, Color(0, 0.3));
+            drawHighlight(entry->filename + typeStr, 10, infoY, Color(0, 0.3f));
+            infoY += lineH;
+
+            drawHighlight(format("{}x{}  Zoom: {:.0f}%",
+                (int)imgW, (int)imgH, zoomLevel_ * 100), 10, infoY, Color(0, 0.3f));
+            infoY += lineH;
 
             // Camera / Lens / Shooting info
             string metaLine;
@@ -1047,19 +1069,19 @@ void tcApp::drawSingleView() {
             }
             if (!metaLine.empty()) {
                 setColor(0.7f, 0.7f, 0.75f);
-                drawBitmapStringHighlight(metaLine, 10, 60, Color(0, 0.3));
+                drawHighlight(metaLine, 10, infoY, Color(0, 0.3f));
+                infoY += lineH;
             }
 
             // Rating display
-            float infoY = 80.0f;
             if (entry->rating > 0) {
                 string stars = "Rating: ";
                 for (int i = 0; i < 5; i++) {
                     stars += (i < entry->rating) ? '*' : '.';
                 }
                 setColor(1.0f, 0.85f, 0.2f);
-                drawBitmapStringHighlight(stars, 10, infoY, Color(0, 0.3));
-                infoY += 20.0f;
+                drawHighlight(stars, 10, infoY, Color(0, 0.3f));
+                infoY += lineH;
             }
 
             // Profile status
@@ -1067,15 +1089,15 @@ void tcApp::drawSingleView() {
                 string profileStatus = format("Profile: {} {:.0f}%",
                     profileEnabled_ ? "ON" : "OFF", profileBlend_ * 100);
                 setColor(0.5f, 0.75f, 0.5f);
-                drawBitmapStringHighlight(profileStatus, 10, infoY, Color(0, 0.3));
-                infoY += 20.0f;
+                drawHighlight(profileStatus, 10, infoY, Color(0, 0.3f));
+                infoY += lineH;
             }
 
             // Help line
             setColor(0.5f, 0.5f, 0.55f);
             string helpStr = "ESC: Back  Left/Right: Navigate  Scroll: Zoom  Drag: Pan  Z: Reset  0-5: Rating  L: Lens";
             if (hasProfileLut_) helpStr += "  P: Profile  [/]: Blend";
-            drawBitmapStringHighlight(helpStr, 10, infoY, Color(0, 0.3));
+            drawHighlight(helpStr, 10, infoY, Color(0, 0.3f));
         }
     }
 }

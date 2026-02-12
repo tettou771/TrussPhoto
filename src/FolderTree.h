@@ -9,6 +9,19 @@
 using namespace std;
 using namespace tc;
 
+// Japanese font path with fallback
+inline bool loadJapaneseFont(Font& font, int size) {
+#if defined(__APPLE__)
+    const char* jpFont = "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc";
+#elif defined(_WIN32)
+    const char* jpFont = "C:/Windows/Fonts/meiryo.ttc";
+#else
+    const char* jpFont = nullptr;
+#endif
+    if (jpFont && font.load(jpFont, size)) return true;
+    return font.load(TC_FONT_SANS, size);
+}
+
 // =============================================================================
 // FolderRow - Individual row in the folder tree (self-contained RectNode)
 // =============================================================================
@@ -26,6 +39,9 @@ public:
     bool isHeader = false;
     bool selected = false;
 
+    Font* font = nullptr;       // set by FolderTree
+    Font* fontSmall = nullptr;  // for count display
+
     function<void()> onClick;
     function<void()> onToggle;
 
@@ -39,19 +55,22 @@ public:
 
     void draw() override {
         float w = getWidth();
+        float h = getHeight();
 
         if (isHeader) {
             if (selected) {
                 setColor(0.2f, 0.25f, 0.35f);
                 fill();
-                drawRect(0, 0, w, getHeight());
+                drawRect(0, 0, w, h);
             }
             setColor(selected ? Color(0.9f, 0.9f, 0.95f) : Color(0.65f, 0.65f, 0.7f));
-            drawBitmapString("All Photos", 14, 10);
+            if (font) font->drawString("All Photos", 14, h * 0.5f, Direction::Left, Direction::Center);
 
-            setColor(0.45f, 0.45f, 0.5f);
-            string cnt = to_string(totalCount);
-            drawBitmapString(cnt, w - (float)cnt.length() * 8 - 20, 10);
+            if (fontSmall) {
+                setColor(0.45f, 0.45f, 0.5f);
+                string cnt = to_string(totalCount);
+                fontSmall->drawString(cnt, w - 16, h * 0.5f, Direction::Right, Direction::Center);
+            }
             return;
         }
 
@@ -61,13 +80,22 @@ public:
         if (selected) {
             setColor(0.2f, 0.25f, 0.35f);
             fill();
-            drawRect(0, 0, w, getHeight());
+            drawRect(0, 0, w, h);
         }
 
-        // Toggle icon
+        // Toggle triangle
         if (hasChildren) {
-            setColor(0.5f, 0.5f, 0.55f);
-            drawBitmapString(expanded ? "v" : ">", indent - 12, 7);
+            setColor(0.6f, 0.6f, 0.65f);
+            fill();
+            float cx = indent - 8;
+            float cy = h * 0.5f;
+            if (expanded) {
+                // Down triangle
+                drawTriangle(cx - 3, cy - 1.5f, cx + 3, cy - 1.5f, cx, cy + 3);
+            } else {
+                // Right triangle
+                drawTriangle(cx - 1.5f, cy - 3, cx + 3, cy, cx - 1.5f, cy + 3);
+            }
         }
 
         // Folder name
@@ -79,19 +107,24 @@ public:
             setColor(0.7f, 0.7f, 0.75f);
         }
 
-        string name = displayName;
-        float maxNameW = w - indent - 50;
-        if ((float)name.length() * 8 > maxNameW && name.length() > 10) {
-            int maxChars = max(5, (int)(maxNameW / 8));
-            name = name.substr(0, maxChars - 3) + "...";
+        if (font) {
+            // Truncate name if too wide
+            string name = displayName;
+            float maxNameW = w - indent - 50;
+            if (font->getWidth(name) > maxNameW && name.length() > 5) {
+                while (name.length() > 3 && font->getWidth(name + "...") > maxNameW) {
+                    name.pop_back();
+                }
+                name += "...";
+            }
+            font->drawString(name, indent, h * 0.5f, Direction::Left, Direction::Center);
         }
-        drawBitmapString(name, indent, 7);
 
         // Photo count
-        if (totalCount > 0) {
+        if (totalCount > 0 && fontSmall) {
             setColor(0.45f, 0.45f, 0.5f);
             string cnt = to_string(totalCount);
-            drawBitmapString(cnt, w - (float)cnt.length() * 8 - 20, 7);
+            fontSmall->drawString(cnt, w - 16, h * 0.5f, Direction::Right, Direction::Center);
         }
     }
 
@@ -142,6 +175,9 @@ public:
 
         scrollBar_ = make_shared<ScrollBar>(scrollContainer_.get(), ScrollBar::Vertical);
         scrollContainer_->addChild(scrollBar_);
+
+        loadJapaneseFont(font_, 14);
+        loadJapaneseFont(fontSmall_, 12);
     }
 
     void setup() override {
@@ -231,6 +267,9 @@ private:
     RectNode::Ptr content_;
     ScrollBar::Ptr scrollBar_;
     vector<FolderRow::Ptr> rows_;
+
+    Font font_;
+    Font fontSmall_;
 
     vector<FolderNode> nodes_;
     vector<FolderNode*> rootNodes_;
@@ -322,6 +361,8 @@ private:
         header->isHeader = true;
         header->totalCount = totalPhotoCount_;
         header->selected = selectedPath_.empty();
+        header->font = &font_;
+        header->fontSmall = &fontSmall_;
         header->setRect(0, y, w, headerHeight_);
         header->onClick = [this]() {
             selectedPath_.clear();
@@ -345,6 +386,8 @@ private:
             row->exists = node.exists;
             row->hasChildren = !node.children.empty();
             row->selected = (selectedPath_ == node.path);
+            row->font = &font_;
+            row->fontSmall = &fontSmall_;
             row->setRect(0, y, w, rowHeight_);
 
             FolderNode* nodePtr = &node;

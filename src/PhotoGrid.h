@@ -8,6 +8,7 @@
 #include "PhotoProvider.h"
 #include "PhotoItem.h"
 #include "AsyncImageLoader.h"
+#include "FolderTree.h"  // for loadJapaneseFont
 using namespace std;
 using namespace tc;
 
@@ -39,6 +40,9 @@ public:
 
         scrollBar_ = make_shared<ScrollBar>(scrollContainer_.get(), ScrollBar::Vertical);
         scrollContainer_->addChild(scrollBar_);  // OK: same reason
+
+        // Font for labels
+        loadJapaneseFont(labelFont_, 12);
 
         // Start async loader
         loader_.start();
@@ -110,6 +114,7 @@ public:
             // Label: stem of filename
             string stem = fs::path(photo->filename).stem().string();
             item->setLabelText(stem);
+            item->getLabel()->font = &labelFont_;
             item->setSyncState(photo->syncState);
 
             // Connect click event
@@ -266,6 +271,7 @@ private:
     string filterPath_;
 
     AsyncImageLoader loader_;
+    Font labelFont_;
 
     float itemSize_ = 140;
     float spacing_ = 10;

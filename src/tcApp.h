@@ -102,6 +102,10 @@ private:
     bool cmdDown_ = false;
     bool shiftDown_ = false;
 
+    // Fonts
+    Font font_;
+    Font fontSmall_;
+
     void showFullImage(int index);
     void deleteSelectedPhotos();
     void reprocessImage();   // re-apply lens correction from rawPixels_ cache

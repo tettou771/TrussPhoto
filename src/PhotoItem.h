@@ -106,6 +106,7 @@ public:
 
     string text;
     Color textColor = Color(0.8f, 0.8f, 0.85f);
+    Font* font = nullptr;  // set by PhotoGrid
 
     LabelNode() {
         setSize(100, 20);
@@ -118,11 +119,16 @@ public:
         drawRect(0, 0, getWidth(), getHeight());
 
         if (!text.empty()) {
-            pushStyle();
             setColor(textColor);
-            setTextAlign(Direction::Center, Direction::Center);
-            drawBitmapString(text, getWidth() / 2, getHeight() / 2);
-            popStyle();
+            if (font) {
+                font->drawString(text, getWidth() / 2, getHeight() / 2,
+                    Direction::Center, Direction::Center);
+            } else {
+                pushStyle();
+                setTextAlign(Direction::Center, Direction::Center);
+                drawBitmapString(text, getWidth() / 2, getHeight() / 2);
+                popStyle();
+            }
         }
     }
 };
