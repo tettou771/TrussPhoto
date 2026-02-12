@@ -100,28 +100,59 @@ void tcApp::setup() {
         redraw();
     };
 
+    // 5c. Create metadata panel (right sidebar)
+    metadataPanel_ = make_shared<MetadataPanel>();
+    addChild(metadataPanel_);
+
+    // 5d. Create pane toggle buttons
+    leftToggle_ = make_shared<PaneToggle>();
+    addChild(leftToggle_);
+    leftToggle_->onClick = [this]() {
+        showSidebar_ = !showSidebar_;
+        updateLayout();
+        redraw();
+    };
+
+    rightToggle_ = make_shared<PaneToggle>();
+    addChild(rightToggle_);
+    rightToggle_->onClick = [this]() {
+        showMetadata_ = !showMetadata_;
+        updateLayout();
+        redraw();
+    };
+
     updateLayout();
 
     grid_->onItemClick = [this](int index) {
+        auto now = chrono::steady_clock::now();
+        bool isDoubleClick = (index == lastClickIndex_ &&
+            chrono::duration_cast<chrono::milliseconds>(now - lastClickTime_).count() < 400);
+        lastClickTime_ = now;
+        lastClickIndex_ = index;
+
         if (cmdDown_ && shiftDown_) {
             // Shift+Cmd+click: range select/deselect from anchor
             int anchor = grid_->getSelectionAnchor();
             if (anchor >= 0) {
-                // If clicked item is already selected, deselect the range
                 bool select = !grid_->isSelected(index);
                 grid_->selectRange(anchor, index, select);
             } else {
                 grid_->toggleSelection(index);
             }
+            updateMetadataPanel();
         } else if (cmdDown_) {
             // Cmd+click: toggle single
             grid_->toggleSelection(index);
-        } else {
-            // Normal click: clear selection and open full view
-            if (grid_->hasSelection()) {
-                grid_->clearSelection();
-            }
+            updateMetadataPanel();
+        } else if (isDoubleClick) {
+            // Double click: open full view
+            grid_->clearSelection();
             showFullImage(index);
+        } else {
+            // Single click: select item
+            grid_->clearSelection();
+            grid_->toggleSelection(index);
+            updateMetadataPanel();
         }
     };
 
@@ -337,6 +368,12 @@ void tcApp::update() {
                     provider_.generateSmartPreview(spId, rawPixels_);
                 }
 
+                // Update metadata panel view info
+                if (metadataPanel_) {
+                    metadataPanel_->setViewInfo(zoomLevel_, profileEnabled_, profileBlend_,
+                        hasProfileLut_, lensEnabled_, isSmartPreview_);
+                }
+
                 redraw();
             }
         } else {
@@ -380,9 +417,14 @@ void tcApp::draw() {
     } else {
         // Show hint if no images
         if (provider_.getCount() == 0) {
+            float leftW = (showSidebar_ && folderTree_) ? sidebarWidth_ : 0;
+            float rightW = (showMetadata_ && metadataPanel_) ? metadataWidth_ : 0;
+            float contentW = getWindowWidth() - leftW - rightW;
+            float centerX = leftW + contentW * 0.5f;
+
             setColor(0.5f, 0.5f, 0.55f);
             string hint = "Drop a folder containing images";
-            font_.drawString(hint, getWindowWidth() / 2.0f, (getWindowHeight() - statusBarHeight_) / 2.0f,
+            font_.drawString(hint, centerX, (getWindowHeight() - statusBarHeight_) / 2.0f,
                 Direction::Center, Direction::Center);
         }
     }
@@ -495,6 +537,15 @@ void tcApp::keyPressed(int key) {
                 reprocessImage();
             }
         }
+
+        // Update metadata panel with current state
+        if (metadataPanel_ && selectedIndex_ >= 0 && selectedIndex_ < (int)grid_->getPhotoIdCount()) {
+            const string& pid = grid_->getPhotoId(selectedIndex_);
+            auto* e = provider_.getPhoto(pid);
+            if (e) metadataPanel_->setPhoto(e);
+            metadataPanel_->setViewInfo(zoomLevel_, profileEnabled_, profileBlend_,
+                hasProfileLut_, lensEnabled_, isSmartPreview_);
+        }
     } else {
         // Grid mode keys
         if (key == SAPP_KEYCODE_BACKSPACE || key == SAPP_KEYCODE_DELETE) {
@@ -502,6 +553,7 @@ void tcApp::keyPressed(int key) {
         } else if (key == SAPP_KEYCODE_ESCAPE) {
             if (grid_ && grid_->hasSelection()) {
                 grid_->clearSelection();
+                updateMetadataPanel();
             }
         } else if (key == 'A' || key == 'a') {
             if (cmdDown_ && grid_) {
@@ -510,6 +562,7 @@ void tcApp::keyPressed(int key) {
                 } else {
                     grid_->selectAll();
                 }
+                updateMetadataPanel();
             }
         } else if (key == 'R' || key == 'r') {
             repairLibrary();
@@ -589,7 +642,8 @@ void tcApp::mouseScrolled(Vec2 delta) {
         Texture* rawTex = hasFullRaw ? &fullTexture_ : &previewTexture_;
         float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
         float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
-        float winW = getWindowWidth();
+        float rightW = (showMetadata_ && metadataPanel_) ? metadataWidth_ : 0;
+        float winW = getWindowWidth() - rightW;
         float winH = getWindowHeight() - statusBarHeight_;
 
         float minZoom = 1.0f;
@@ -921,6 +975,13 @@ void tcApp::showFullImage(int index) {
         grid_->setActive(false);
         updateLayout();
         loadProfileForEntry(*entry);
+
+        // Update metadata panel
+        if (metadataPanel_) {
+            metadataPanel_->setPhoto(entry);
+            metadataPanel_->setViewInfo(zoomLevel_, profileEnabled_, profileBlend_,
+                hasProfileLut_, lensEnabled_, isSmartPreview_);
+        }
     } else {
         logWarning() << "Failed to load: " << entry->localPath;
     }
@@ -966,6 +1027,13 @@ void tcApp::exitFullImage() {
     currentProfilePath_.clear();
 
     grid_->setActive(true);
+
+    // Clear view info, update with grid selection
+    if (metadataPanel_) {
+        metadataPanel_->clearViewInfo();
+        updateMetadataPanel();
+    }
+
     updateLayout();
     redraw();
 }
@@ -980,7 +1048,8 @@ void tcApp::drawSingleView() {
     Texture* rawTex = hasFullRaw ? &fullTexture_ : &previewTexture_;
     float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
     float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
-    float winW = getWindowWidth();
+    float rightW = (showMetadata_ && metadataPanel_) ? metadataWidth_ : 0;
+    float winW = getWindowWidth() - rightW;
     float winH = getWindowHeight() - statusBarHeight_;
 
     float fitScale = min(winW / imgW, winH / imgH);
@@ -1024,104 +1093,64 @@ void tcApp::drawSingleView() {
     } else {
         fullImage_.draw(x, y, drawW, drawH);
     }
-
-    // Info overlay
-    if (selectedIndex_ >= 0 && selectedIndex_ < (int)grid_->getPhotoIdCount()) {
-        const string& photoId = grid_->getPhotoId(selectedIndex_);
-        auto* entry = provider_.getPhoto(photoId);
-        if (entry) {
-            // Helper: draw text with background highlight
-            auto drawHighlight = [this](const string& text, float tx, float ty, const Color& bg) {
-                float tw = fontSmall_.getWidth(text);
-                float th = 16.0f;
-                float pad = 3.0f;
-                pushStyle();
-                setColor(bg);
-                fill();
-                drawRect(tx - pad, ty - th / 2 - pad, tw + pad * 2, th + pad * 2);
-                popStyle();
-                fontSmall_.drawString(text, tx, ty, Direction::Left, Direction::Center);
-            };
-
-            float lineH = 20.0f;
-            float infoY = 20.0f;
-
-            setColor(0.8f, 0.8f, 0.85f);
-            string typeStr = isSmartPreview_ ? " [Smart Preview]" : (entry->isRaw ? " [RAW]" : "");
-            drawHighlight(entry->filename + typeStr, 10, infoY, Color(0, 0.3f));
-            infoY += lineH;
-
-            drawHighlight(format("{}x{}  Zoom: {:.0f}%",
-                (int)imgW, (int)imgH, zoomLevel_ * 100), 10, infoY, Color(0, 0.3f));
-            infoY += lineH;
-
-            // Camera / Lens / Shooting info
-            string metaLine;
-            if (!entry->camera.empty()) {
-                metaLine = entry->camera;
-            }
-            if (!entry->lens.empty()) {
-                if (!metaLine.empty()) metaLine += " | ";
-                metaLine += entry->lens;
-                if (entry->focalLength > 0) {
-                    metaLine += format(" @{:.0f}mm", entry->focalLength);
-                }
-            }
-            if (entry->aperture > 0) {
-                metaLine += format(" f/{:.1f}", entry->aperture);
-            }
-            if (entry->iso > 0) {
-                metaLine += format(" ISO{:.0f}", entry->iso);
-            }
-            if (!entry->creativeStyle.empty()) {
-                metaLine += " | " + entry->creativeStyle;
-            }
-            if (!metaLine.empty()) {
-                setColor(0.7f, 0.7f, 0.75f);
-                drawHighlight(metaLine, 10, infoY, Color(0, 0.3f));
-                infoY += lineH;
-            }
-
-            // Rating display
-            if (entry->rating > 0) {
-                string stars = "Rating: ";
-                for (int i = 0; i < 5; i++) {
-                    stars += (i < entry->rating) ? '*' : '.';
-                }
-                setColor(1.0f, 0.85f, 0.2f);
-                drawHighlight(stars, 10, infoY, Color(0, 0.3f));
-                infoY += lineH;
-            }
-
-            // Profile status
-            if (hasProfileLut_) {
-                string profileStatus = format("Profile: {} {:.0f}%",
-                    profileEnabled_ ? "ON" : "OFF", profileBlend_ * 100);
-                setColor(0.5f, 0.75f, 0.5f);
-                drawHighlight(profileStatus, 10, infoY, Color(0, 0.3f));
-                infoY += lineH;
-            }
-
-            // Help line
-            setColor(0.5f, 0.5f, 0.55f);
-            string helpStr = "ESC: Back  Left/Right: Navigate  Scroll: Zoom  Drag: Pan  Z: Reset  0-5: Rating  L: Lens";
-            if (hasProfileLut_) helpStr += "  P: Profile  [/]: Blend";
-            drawHighlight(helpStr, 10, infoY, Color(0, 0.3f));
-        }
-    }
 }
 
 void tcApp::updateLayout() {
     float w = getWindowWidth();
     float h = getWindowHeight() - statusBarHeight_;
 
-    if (showSidebar_ && viewMode_ == ViewMode::Grid && folderTree_) {
-        folderTree_->setActive(true);
-        folderTree_->setRect(0, 0, sidebarWidth_, h);
-        if (grid_) grid_->setRect(sidebarWidth_, 0, w - sidebarWidth_, h);
-    } else {
-        if (folderTree_) folderTree_->setActive(false);
-        if (grid_) grid_->setRect(0, 0, w, h);
+    // Left pane (grid mode only)
+    bool leftVisible = showSidebar_ && viewMode_ == ViewMode::Grid && folderTree_;
+    float leftW = leftVisible ? sidebarWidth_ : 0;
+
+    // Right pane (both modes)
+    float rightW = showMetadata_ ? metadataWidth_ : 0;
+
+    // Center content
+    float contentX = leftW;
+    float contentW = w - leftW - rightW;
+
+    // FolderTree
+    if (folderTree_) {
+        folderTree_->setActive(leftVisible);
+        if (leftVisible) folderTree_->setRect(0, 0, sidebarWidth_, h);
+    }
+
+    // Grid
+    if (grid_) grid_->setRect(contentX, 0, contentW, h);
+
+    // MetadataPanel
+    if (metadataPanel_) {
+        metadataPanel_->setActive(showMetadata_);
+        if (showMetadata_) metadataPanel_->setRect(w - rightW, 0, rightW, h);
+    }
+
+    // Left toggle
+    if (leftToggle_) {
+        if (viewMode_ == ViewMode::Grid) {
+            leftToggle_->setActive(true);
+            if (showSidebar_) {
+                leftToggle_->direction = PaneToggle::Left;
+                leftToggle_->setRect(sidebarWidth_ - 12, h / 2 - 15, 12, 30);
+            } else {
+                leftToggle_->direction = PaneToggle::Right;
+                leftToggle_->setRect(0, h / 2 - 15, 12, 30);
+            }
+        } else {
+            leftToggle_->setActive(false);
+        }
+    }
+
+    // Right toggle
+    if (rightToggle_) {
+        rightToggle_->setActive(true);
+        if (showMetadata_) {
+            rightToggle_->direction = PaneToggle::Right;
+            rightToggle_->setRect(w - rightW, h / 2 - 15, 12, 30);
+        } else {
+            rightToggle_->direction = PaneToggle::Left;
+            rightToggle_->setRect(w - 12, h / 2 - 15, 12, 30);
+        }
     }
 }
 
@@ -1129,4 +1158,24 @@ void tcApp::rebuildFolderTree() {
     if (!folderTree_) return;
     auto folders = provider_.buildFolderList();
     folderTree_->buildTree(folders, provider_.getRawStoragePath());
+}
+
+void tcApp::updateMetadataPanel() {
+    if (!metadataPanel_) return;
+
+    if (viewMode_ == ViewMode::Single && selectedIndex_ >= 0 &&
+        selectedIndex_ < (int)grid_->getPhotoIdCount()) {
+        const string& pid = grid_->getPhotoId(selectedIndex_);
+        auto* e = provider_.getPhoto(pid);
+        metadataPanel_->setPhoto(e);
+    } else if (viewMode_ == ViewMode::Grid && grid_ && grid_->hasSelection()) {
+        // Show first selected photo's metadata
+        auto ids = grid_->getSelectedIds();
+        if (!ids.empty()) {
+            auto* e = provider_.getPhoto(ids[0]);
+            metadataPanel_->setPhoto(e);
+        }
+    } else {
+        metadataPanel_->setPhoto(nullptr);
+    }
 }

@@ -4,6 +4,7 @@
 #include <tcLut.h>
 #include "LensCorrector.h"
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include "AppConfig.h"
 #include "AppPaths.h"
@@ -11,6 +12,8 @@
 #include "PhotoProvider.h"
 #include "PhotoGrid.h"
 #include "FolderTree.h"
+#include "MetadataPanel.h"
+#include "PaneToggle.h"
 #include "UploadQueue.h"
 #include "CameraProfileManager.h"
 #include "ServerConfig.h"
@@ -52,6 +55,11 @@ private:
     FolderTree::Ptr folderTree_;
     bool showSidebar_ = true;
     float sidebarWidth_ = 220;
+    bool showMetadata_ = true;
+    float metadataWidth_ = 260;
+    MetadataPanel::Ptr metadataPanel_;
+    PaneToggle::Ptr leftToggle_;
+    PaneToggle::Ptr rightToggle_;
     UploadQueue uploadQueue_;
     ViewMode viewMode_ = ViewMode::Grid;
     bool needsServerSync_ = false;
@@ -105,6 +113,10 @@ private:
     bool cmdDown_ = false;
     bool shiftDown_ = false;
 
+    // Double-click detection
+    chrono::steady_clock::time_point lastClickTime_;
+    int lastClickIndex_ = -1;
+
     // Fonts
     Font font_;
     Font fontSmall_;
@@ -122,4 +134,5 @@ private:
     void consolidateLibrary();
     void updateLayout();
     void rebuildFolderTree();
+    void updateMetadataPanel();
 };
