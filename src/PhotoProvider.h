@@ -34,6 +34,22 @@ public:
 
     // --- Configuration ---
 
+    // Set all paths from a single catalog directory
+    void setCatalogDir(const string& catalogPath) {
+        thumbnailCacheDir_ = catalogPath + "/thumbnail_cache";
+        smartPreviewDir_   = catalogPath + "/smart_preview";
+        databasePath_      = catalogPath + "/library.db";
+        pendingDir_        = catalogPath + "/pending";
+        fs::create_directories(thumbnailCacheDir_);
+        fs::create_directories(smartPreviewDir_);
+        fs::create_directories(pendingDir_);
+    }
+
+    void setRawStoragePath(const string& path) {
+        rawStoragePath_ = path;
+        if (!path.empty()) fs::create_directories(path);
+    }
+
     void setServerUrl(const string& url) {
         client_.setBaseUrl(url);
         serverChecked_ = false;
@@ -61,15 +77,7 @@ public:
         jsonMigrationPath_ = path;
     }
 
-    // Kept for backward compatibility but unused with SQLite
-    void setLibraryPath(const string& path) {
-        (void)path;
-    }
-
-    void setLibraryFolder(const string& folder) {
-        libraryFolder_ = folder;
-        fs::create_directories(folder);
-    }
+    const string& getRawStoragePath() const { return rawStoragePath_; }
 
     // --- Server connectivity ---
 
@@ -150,13 +158,74 @@ public:
         return changedCount;
     }
 
+    // Relink a single photo to a new file path
+    bool relinkPhoto(const string& id, const string& newPath) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+
+        it->second.localPath = newPath;
+        db_.updateLocalPath(id, newPath);
+
+        if (it->second.syncState == SyncState::Missing) {
+            it->second.syncState = SyncState::LocalOnly;
+            db_.updateSyncState(id, SyncState::LocalOnly);
+        }
+
+        logNotice() << "[Relink] " << it->second.filename << " -> " << newPath;
+        return true;
+    }
+
+    // Relink missing photos by scanning a folder for matching files (by filename+filesize ID)
+    int relinkFromFolder(const string& folderPath) {
+        fs::path folder(folderPath);
+        if (!fs::exists(folder) || !fs::is_directory(folder)) return 0;
+
+        // Build a set of missing photo IDs for fast lookup
+        unordered_map<string, string*> missingById;  // id -> pointer to localPath
+        for (auto& [id, photo] : photos_) {
+            if (photo.localPath.empty() || !fs::exists(photo.localPath)) {
+                missingById[id] = &photo.localPath;
+            }
+        }
+        if (missingById.empty()) return 0;
+
+        int relinked = 0;
+        for (const auto& entry : fs::recursive_directory_iterator(folder)) {
+            if (!entry.is_regular_file()) continue;
+            if (!isSupportedImage(entry.path())) continue;
+
+            string fname = entry.path().filename().string();
+            uintmax_t fsize = entry.file_size();
+            string id = fname + "_" + to_string(fsize);
+
+            auto it = missingById.find(id);
+            if (it == missingById.end()) continue;
+
+            string newPath = entry.path().string();
+            *(it->second) = newPath;
+            db_.updateLocalPath(id, newPath);
+
+            // Restore sync state from Missing to LocalOnly
+            auto photoIt = photos_.find(id);
+            if (photoIt != photos_.end() && photoIt->second.syncState == SyncState::Missing) {
+                photoIt->second.syncState = SyncState::LocalOnly;
+                db_.updateSyncState(id, SyncState::LocalOnly);
+            }
+
+            missingById.erase(it);
+            relinked++;
+            logNotice() << "[Relink] " << fname << " -> " << newPath;
+        }
+        return relinked;
+    }
+
     // Scan library folder for unregistered files, returns count of added
     int scanLibraryFolder() {
-        if (libraryFolder_.empty() || !fs::exists(libraryFolder_)) return 0;
+        if (rawStoragePath_.empty() || !fs::exists(rawStoragePath_)) return 0;
 
         int addedCount = 0;
         vector<PhotoEntry> newEntries;
-        for (const auto& entry : fs::recursive_directory_iterator(libraryFolder_)) {
+        for (const auto& entry : fs::recursive_directory_iterator(rawStoragePath_)) {
             if (!entry.is_regular_file()) continue;
             if (!isSupportedImage(entry.path())) continue;
 
@@ -221,8 +290,8 @@ public:
             added++;
 
             // Queue file copy if library folder configured and source is outside it
-            if (!libraryFolder_.empty()) {
-                fs::path libPath = fs::canonical(fs::path(libraryFolder_));
+            if (!rawStoragePath_.empty()) {
+                fs::path libPath = fs::canonical(fs::path(rawStoragePath_));
                 fs::path srcCanonical = fs::canonical(p);
                 string srcStr = srcCanonical.string();
                 string libStr = libPath.string();
@@ -292,8 +361,8 @@ public:
             added++;
 
             // Queue file copy if library folder is configured and source is outside it
-            if (!libraryFolder_.empty()) {
-                fs::path libPath = fs::canonical(fs::path(libraryFolder_));
+            if (!rawStoragePath_.empty()) {
+                fs::path libPath = fs::canonical(fs::path(rawStoragePath_));
                 fs::path srcCanonical = fs::canonical(fs::path(path));
                 string srcStr = srcCanonical.string();
                 string libStr = libPath.string();
@@ -751,14 +820,14 @@ public:
             logWarning() << "[Consolidate] Already running";
             return;
         }
-        if (libraryFolder_.empty()) {
+        if (rawStoragePath_.empty()) {
             logWarning() << "[Consolidate] No library folder configured";
             return;
         }
 
         // Build task list on main thread
         vector<ConsolidateTask> tasks;
-        fs::path libPath = fs::path(libraryFolder_);
+        fs::path libPath = fs::path(rawStoragePath_);
 
         for (auto& [id, photo] : photos_) {
             if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
@@ -934,8 +1003,9 @@ private:
     string thumbnailCacheDir_;
     string databasePath_;
     string jsonMigrationPath_;
-    string libraryFolder_;
+    string rawStoragePath_;
     string smartPreviewDir_;
+    string pendingDir_;
     bool serverReachable_ = false;
     bool serverChecked_ = false;
 

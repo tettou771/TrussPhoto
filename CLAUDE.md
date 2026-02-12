@@ -22,14 +22,17 @@ cmake --build build-macos
 ## 起動モード
 
 ```bash
-# GUI モード（デフォルト）
+# GUI モード（デフォルト）— 初回はカタログフォルダ選択ダイアログが出る
 ./bin/TrussPhoto.app/Contents/MacOS/TrussPhoto
 
+# カタログ指定
+./bin/TrussPhoto.app/Contents/MacOS/TrussPhoto --catalog /path/to/MyCatalog
+
 # サーバモード（ヘッドレス）
-./bin/TrussPhoto.app/Contents/MacOS/TrussPhoto --server
+./bin/TrussPhoto.app/Contents/MacOS/TrussPhoto --server --catalog /path/to/MyCatalog
 
 # サーバモード + オプション
-./bin/TrussPhoto.app/Contents/MacOS/TrussPhoto --server --port 8080 --library-dir /path/to/photos
+./bin/TrussPhoto.app/Contents/MacOS/TrussPhoto --server --catalog /path/to/catalog --port 8080 --raw-dir /path/to/photos
 ```
 
 ### コマンドライン引数
@@ -37,28 +40,31 @@ cmake --build build-macos
 |--------|------|-----------|
 | `--server` | ヘッドレスサーバモード | GUI モード |
 | `--port N` | サーバポート | 18730 |
-| `--library-dir PATH` | ライブラリフォルダ上書き | settings.json の値 |
+| `--catalog PATH` | カタログフォルダ指定 | 前回のカタログ or ダイアログ |
+| `--raw-dir PATH` | RAW保管先の上書き | catalog.json の値 or カタログ内 `originals/` |
+
+`--library-dir` は `--raw-dir` のエイリアスとして後方互換で残っている。
 
 ## アーキテクチャ
 
 ### ソース構成
 ```
 src/
-├── main.cpp           # エントリポイント（GUI / --server 分岐）
-├── tcApp.h/cpp        # メインアプリ（起動フロー、イベント処理、モード分岐）
-├── AppConfig.h        # コマンドライン引数パース（--server, --port, --library-dir）
-├── AppPaths.h         # OS標準パス定義 + bin/data/ からの自動マイグレーション
-├── Settings.h         # 設定永続化（settings.json → tpDataPath）
-├── ServerConfig.h     # APIキー生成・永続化（サーバモード用）
-├── PhotoServer.h      # Crow HTTPサーバ（PhotoProvider をREST公開）
-├── PhotoEntry.h       # PhotoEntry構造体 + JSON シリアライズ
-├── Database.h         # SQLite3 薄い RAII ラッパー
-├── PhotoDatabase.h    # photos テーブル CRUD、スキーマ管理、JSON マイグレーション
-├── PhotoProvider.h    # 写真管理の中核（ローカル + サーバ抽象化、SQLite永続化）
-├── PhotoGrid.h        # スクロール可能なサムネイルグリッドUI
-├── PhotoItem.h        # 個々の写真アイテム（サムネ + ラベル）
-├── AsyncImageLoader.h # バックグラウンドサムネイルローダー
-└── UploadQueue.h      # バックグラウンドアップロード（リトライ付き）
+├── main.cpp            # エントリポイント（GUI / --server 分岐）
+├── tcApp.h/cpp         # メインアプリ（起動フロー、イベント処理、モード分岐）
+├── AppConfig.h         # コマンドライン引数パース（--server, --port, --catalog, --raw-dir）
+├── AppPaths.h          # カタログパス管理 + レガシーからの自動マイグレーション
+├── CatalogSettings.h   # カタログ設定（catalog.json） + AppBootstrap（app_config.json）
+├── ServerConfig.h      # APIキー生成・永続化（サーバモード用）
+├── PhotoServer.h       # Crow HTTPサーバ（PhotoProvider をREST公開）
+├── PhotoEntry.h        # PhotoEntry構造体 + JSON シリアライズ
+├── Database.h          # SQLite3 薄い RAII ラッパー
+├── PhotoDatabase.h     # photos テーブル CRUD、スキーマ管理、JSON マイグレーション
+├── PhotoProvider.h     # 写真管理の中核（ローカル + サーバ抽象化、SQLite永続化）
+├── PhotoGrid.h         # スクロール可能なサムネイルグリッドUI
+├── PhotoItem.h         # 個々の写真アイテム（サムネ + ラベル）
+├── AsyncImageLoader.h  # バックグラウンドサムネイルローダー
+└── UploadQueue.h       # バックグラウンドアップロード（リトライ付き）
 ```
 
 ### データフロー
@@ -67,23 +73,23 @@ src/
 3. 自動アップロード → `UploadQueue` → `POST /api/import` → リトライ最大3回
 
 ### ローカル運用モード
-**サーバなしでも完全に動作する。** `settings.json` の `serverUrl` が空なら：
+**サーバなしでも完全に動作する。** `catalog.json` の `serverUrl` が空なら：
 - UploadQueue スレッドは起動しない
 - 定期sync は走らない
 - 全写真は `LocalOnly` 状態のまま
 - サムネイルはローカルRAWからデコード → キャッシュ
 
-サーバURLを後から設定すれば（MCPの `set_server` ツールまたは settings.json 編集）、
+サーバURLを後から設定すれば（MCPの `set_server` ツールまたは catalog.json 編集）、
 UploadQueue が起動し、sync + 自動アップロードが始まる。
 
 ### サーバ移行
-**ローカルのRAWファイルとlibrary.jsonがあれば、サーバは完全に再構築できる。**
+**ローカルのRAWファイルとlibrary.dbがあれば、サーバは完全に再構築できる。**
 
 サーバ固有のデータ（`importedAt`, サーバ側サムネ, ファイルパス）は全てRAWから再生成可能。
 
 移行手順：
 1. 新サーバを起動（空の状態）
-2. `settings.json` の `serverUrl` を新サーバに変更（またはMCP `set_server`）
+2. `catalog.json` の `serverUrl` を新サーバに変更（またはMCP `set_server`）
 3. アプリ起動 → `syncWithServer()` → 新サーバにない `Synced` 写真が自動的に `LocalOnly` に戻る
 4. `enqueueLocalOnlyPhotos()` → 全写真が自動で新サーバにアップロードされる
 
@@ -99,32 +105,40 @@ UploadQueue が起動し、sync + 自動アップロードが始まる。
 写真IDは `filename_filesize` 形式で統一（サーバ・クライアント共通）。
 例: `DSC00001.ARW_42991616`
 
-### 永続化ファイル
+### 永続化ファイル（カタログ方式）
 
 ```
-tpDataPath/                          ← ~/Library/Application Support/TrussPhoto/ (macOS)
-├── settings.json                    # サーバURL、ライブラリフォルダ
-├── library.db                       # SQLite - 全写真エントリ（即時書き込み）
-└── server_config.json               # APIキー、ポート（サーバモード用）
+MyCatalog/                          ← カタログフォルダ（ユーザーが選ぶ）
+├── library.db                      # SQLite - 全写真エントリ（即時書き込み）
+├── catalog.json                    # カタログ設定（rawStoragePath, serverUrl, apiKey）
+├── server_config.json              # APIキー、ポート（サーバモード用）
+├── thumbnail_cache/                # サムネイル JPEG キャッシュ
+│   └── YYYY/MM/DD/
+├── smart_preview/                  # スマートプレビュー JPEG XL
+│   └── YYYY/MM/DD/
+├── originals/                      # デフォルトRAW保管先（rawStoragePath未設定時）
+│   └── YYYY/MM/DD/
+│       └── DSC00001.ARW
+└── pending/                        # アップロード待ちRAW（サーバモード用）
+    └── YYYY/MM/DD/
 
-tpCachePath/                         ← ~/Library/Caches/TrussPhoto/ (macOS)
-└── thumbnail_cache/                 # サムネイル JPEG キャッシュ
-
-bin/data/                            ← バンドルリソース（読み取り専用）
-└── lensfun/                         # レンズ補正データベース
-
-libraryFolder                        ← ユーザ設定（例: ~/Pictures/TrussPhoto/）
-└── 2026/01/15/                      # RAW オリジナル（日付別）
-    └── DSC00001.ARW
+bin/data/                           ← バンドルリソース（読み取り専用）
+└── lensfun/                        # レンズ補正データベース
 ```
 
-| OS | tpDataPath | tpCachePath |
-|----|-----------|-------------|
-| macOS | `~/Library/Application Support/TrussPhoto/` | `~/Library/Caches/TrussPhoto/` |
-| Linux | `~/.local/share/TrussPhoto/` | `~/.cache/TrussPhoto/` |
-| Windows | `%APPDATA%/TrussPhoto/` | `%LOCALAPPDATA%/TrussPhoto/` |
+**ブートストラップ**: OS標準パスには最小限の設定のみ残す
+```
+~/Library/Application Support/TrussPhoto/    ← appConfigDir (macOS)
+└── app_config.json                          # {"lastCatalogPath": "/path/to/MyCatalog"}
+```
 
-**bin/data/ からの自動マイグレーション**: 起動時に tpDataPath に library.db がなく bin/data/ にある場合、自動コピー。settings.json、thumbnail_cache も同様。元ファイルは安全のため残す。
+| OS | appConfigDir |
+|----|-------------|
+| macOS | `~/Library/Application Support/TrussPhoto/` |
+| Linux | `~/.local/share/TrussPhoto/` |
+| Windows | `%APPDATA%/TrussPhoto/` |
+
+**レガシーからの自動マイグレーション**: 初回起動時に旧 tpDataPath/tpCachePath が存在する場合、library.db, settings.json→catalog.json, thumbnail_cache/, smart_preview/, server_config.json をカタログフォルダにコピー。元ファイルは安全のため残す。
 
 ## サーバAPI
 
@@ -181,9 +195,9 @@ TrussC/                    ← TrussC 本体 (git repo)
 ## 開発時の注意点・失敗談
 
 ### ポート番号の食い違い
-サーバは8080で動いているのにクライアントのSettings.hデフォルトが18080だった。
-settings.jsonに古い値がキャッシュされ、アプリ再起動しても直らなかった。
-→ **Settings.hのデフォルト値とsettings.jsonの両方を確認すること**
+サーバは8080で動いているのにクライアントのデフォルトが18080だった。
+catalog.jsonに古い値がキャッシュされ、アプリ再起動しても直らなかった。
+→ **CatalogSettings.hのデフォルト値とcatalog.jsonの両方を確認すること**
 
 ### fs::copy_file によるビーチボール
 `scanFolder()` でメインスレッド上で `fs::copy_file()` を呼んでいたため、
@@ -386,4 +400,4 @@ Profile: ON 100%
 - MCP初期化シーケンスの調査と自動テスト
 - マルチパートファイルアップロード（ネットワーク越しの同期対応）
 - EXIF dateTimeOriginal をIDに含める
-- サーバURL設定のGUI（現在はsettings.json手動編集 or MCP `set_server`）
+- サーバURL設定のGUI（現在はcatalog.json手動編集 or MCP `set_server`）

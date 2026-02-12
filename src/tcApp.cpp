@@ -2,82 +2,84 @@
 #include <tcxLibRaw.h>
 
 void tcApp::setup() {
-    // 0. Ensure OS-standard paths exist + migrate from bin/data/
-    AppPaths::ensureDirectories();
-    AppPaths::migrateFromBinData();
+    // 0. Ensure OS bootstrap directory exists
+    AppPaths::ensureAppConfigDir();
 
-    // 1. Load settings (from tpDataPath)
-    settings_.load();
+    // 1. Determine catalog path
+    // Priority: --catalog arg > bootstrap lastCatalogPath > GUI dialog
+    bootstrap_.load(AppPaths::appConfigPath());
 
-    if (AppConfig::serverMode) {
-        // === Server mode: headless ===
-        // Only override libraryFolder, don't touch serverUrl/apiKey
-        bool needsSave = false;
-        if (!AppConfig::libraryDir.empty()) {
-            settings_.libraryFolder = AppConfig::libraryDir;
-            needsSave = true;
-        }
-        if (settings_.libraryFolder.empty()) {
-            string home = getenv("HOME") ? getenv("HOME") : ".";
-            settings_.libraryFolder = home + "/Pictures/TrussPhoto";
-            needsSave = true;
-        }
-        fs::create_directories(settings_.libraryFolder);
-        if (needsSave) settings_.save();
+    if (!AppConfig::catalogDir.empty()) {
+        catalogPath_ = AppConfig::catalogDir;
+    } else if (!AppConfig::chooseCatalog &&
+               !bootstrap_.lastCatalogPath.empty() &&
+               fs::exists(bootstrap_.lastCatalogPath)) {
+        catalogPath_ = bootstrap_.lastCatalogPath;
+    } else if (AppConfig::serverMode) {
+        // Server mode without catalog: use default
+        string home = getenv("HOME") ? getenv("HOME") : ".";
+        catalogPath_ = home + "/Pictures/TrussPhoto";
     } else {
-        // === GUI mode: ask for library folder if needed ===
-        bool needsFolder = settings_.isFirstRun();
-        if (!needsFolder && !settings_.libraryFolder.empty()) {
-            if (!fs::exists(settings_.libraryFolder)) {
-                logWarning() << "Library folder not accessible: " << settings_.libraryFolder
-                             << " (re-select to grant access)";
-                needsFolder = true;
-            }
-        }
+        // GUI: ask user to select or create catalog folder
+        auto result = loadDialog(
+            "Select Catalog Folder",
+            "Choose where to store your TrussPhoto catalog",
+            "", true);
 
-        if (needsFolder) {
-            auto result = loadDialog(
-                "Select Library Folder",
-                "Choose where to store your photo library",
-                "", true);
-
-            if (result.success) {
-                settings_.libraryFolder = result.filePath;
-            } else {
-                string home = getenv("HOME") ? getenv("HOME") : ".";
-                settings_.libraryFolder = home + "/Pictures/TrussPhoto";
-            }
-            fs::create_directories(settings_.libraryFolder);
-            settings_.save();
+        if (result.success) {
+            catalogPath_ = result.filePath;
+        } else {
+            string home = getenv("HOME") ? getenv("HOME") : ".";
+            catalogPath_ = home + "/Pictures/TrussPhoto";
         }
     }
 
-    // 3. Configure provider (paths use tpDataPath / tpCachePath)
-    provider_.setThumbnailCacheDir(AppPaths::cachePath() + "/thumbnail_cache");
-    provider_.setDatabasePath(AppPaths::dataPath() + "/library.db");
-    provider_.setJsonMigrationPath(AppPaths::dataPath() + "/library.json");
-    provider_.setLibraryFolder(settings_.libraryFolder);
-    provider_.setSmartPreviewDir(AppPaths::dataPath() + "/smart_preview");
-    provider_.setServerUrl(settings_.serverUrl);
-    provider_.setApiKey(settings_.apiKey);
+    // 2. Ensure catalog directories exist + migrate from legacy paths
+    AppPaths::ensureCatalogDirectories(catalogPath_);
+    AppPaths::migrateFromLegacy(catalogPath_);
 
-    // 4. Load library (instant display from previous session)
+    // 3. Load catalog settings
+    catalogSettings_.load(catalogPath_ + "/catalog.json");
+
+    // 4. Determine RAW storage path
+    string rawStorage = catalogSettings_.rawStoragePath;
+    if (!AppConfig::rawDir.empty()) {
+        rawStorage = AppConfig::rawDir;
+    }
+    if (rawStorage.empty()) {
+        rawStorage = catalogPath_ + "/originals";
+    }
+    fs::create_directories(rawStorage);
+
+    // 5. Configure provider
+    provider_.setCatalogDir(catalogPath_);
+    provider_.setRawStoragePath(rawStorage);
+    provider_.setJsonMigrationPath(catalogPath_ + "/library.json");
+    provider_.setServerUrl(catalogSettings_.serverUrl);
+    provider_.setApiKey(catalogSettings_.apiKey);
+
+    // 6. Load library (instant display from previous session)
     bool hasLibrary = provider_.loadLibrary();
+
+    // 7. Save bootstrap (remember catalog path for next launch)
+    bootstrap_.lastCatalogPath = catalogPath_;
+    bootstrap_.save(AppPaths::appConfigPath());
 
     if (AppConfig::serverMode) {
         // === Server mode setup ===
-        serverConfig_.load(AppPaths::dataPath() + "/server_config.json");
+        serverConfig_.load(catalogPath_ + "/server_config.json");
         serverConfig_.generateKeyIfMissing();
         serverConfig_.save();
 
         int port = AppConfig::serverPort;
-        server_.setup(provider_, AppPaths::cachePath() + "/thumbnail_cache");
+        server_.setup(provider_, catalogPath_ + "/thumbnail_cache");
         server_.start(port, serverConfig_.apiKey);
 
         logNotice() << "=== TrussPhoto Server ===";
         logNotice() << "Port: " << port;
         logNotice() << "API Key: " << serverConfig_.apiKey;
-        logNotice() << "Library: " << settings_.libraryFolder;
+        logNotice() << "Catalog: " << catalogPath_;
+        logNotice() << "RAW Storage: " << rawStorage;
         logNotice() << "Photos: " << provider_.getCount();
         return;
     }
@@ -118,9 +120,9 @@ void tcApp::setup() {
     }
 
     // 6. Start upload queue (only if server configured)
-    if (settings_.hasServer()) {
-        uploadQueue_.setServerUrl(settings_.serverUrl);
-        uploadQueue_.setApiKey(settings_.apiKey);
+    if (catalogSettings_.hasServer()) {
+        uploadQueue_.setServerUrl(catalogSettings_.serverUrl);
+        uploadQueue_.setApiKey(catalogSettings_.apiKey);
         uploadQueue_.start();
         // 7. Trigger server sync on next frame
         needsServerSync_ = true;
@@ -154,7 +156,7 @@ void tcApp::setup() {
             if (missing > 0 || added > 0) {
                 grid_->populate(provider_);
             }
-            if (settings_.hasServer() && !syncInProgress_) {
+            if (catalogSettings_.hasServer() && !syncInProgress_) {
                 needsServerSync_ = true;
             }
             return json{
@@ -222,6 +224,21 @@ void tcApp::setup() {
             };
         });
 
+    mcp::tool("relink_photos", "Find and relink missing photos from a folder")
+        .arg<string>("folder", "Folder path to search for missing files")
+        .bind([this](const string& folder) {
+            int missing = provider_.validateLibrary();
+            int relinked = provider_.relinkFromFolder(folder);
+            if (relinked > 0 && grid_) {
+                grid_->populate(provider_);
+            }
+            return json{
+                {"status", "ok"},
+                {"missing", missing},
+                {"relinked", relinked}
+            };
+        });
+
     // 9. Camera profile manager
     string home = getenv("HOME") ? getenv("HOME") : ".";
     profileManager_.setProfileDir(home + "/.trussc/profiles");
@@ -235,7 +252,7 @@ void tcApp::setup() {
     // 12. Setup event driven mode
     setIndependentFps(VSYNC, 0);
 
-    logNotice() << "TrussPhoto ready - Library: " << settings_.libraryFolder;
+    logNotice() << "TrussPhoto ready - Catalog: " << catalogPath_;
 }
 
 void tcApp::update() {
@@ -327,7 +344,7 @@ void tcApp::update() {
 
     // Periodic server sync (every ~30 seconds at 60fps, only if server configured)
     static int syncCounter = 0;
-    if (settings_.hasServer() && ++syncCounter % 1800 == 0 && !syncInProgress_) {
+    if (catalogSettings_.hasServer() && ++syncCounter % 1800 == 0 && !syncInProgress_) {
         needsServerSync_ = true;
     }
 
@@ -474,6 +491,11 @@ void tcApp::keyPressed(int key) {
         }
     }
 
+    // Mode-independent keys
+    if (key == 'F' || key == 'f') {
+        relinkMissingPhotos();
+    }
+
     // Track modifier key state
     if (key == SAPP_KEYCODE_LEFT_SUPER || key == SAPP_KEYCODE_RIGHT_SUPER) {
         cmdDown_ = true;
@@ -612,7 +634,7 @@ void tcApp::exit() {
 }
 
 void tcApp::enqueueLocalOnlyPhotos() {
-    if (!settings_.hasServer()) return;
+    if (!catalogSettings_.hasServer()) return;
 
     auto localPhotos = provider_.getLocalOnlyPhotos();
     for (const auto& [id, path] : localPhotos) {
@@ -624,20 +646,20 @@ void tcApp::enqueueLocalOnlyPhotos() {
 }
 
 void tcApp::configureServer(const string& url, const string& key) {
-    settings_.serverUrl = url;
+    catalogSettings_.serverUrl = url;
     if (!key.empty()) {
-        settings_.apiKey = key;
+        catalogSettings_.apiKey = key;
     }
-    settings_.save();
+    catalogSettings_.save();
 
     provider_.setServerUrl(url);
-    provider_.setApiKey(settings_.apiKey);
+    provider_.setApiKey(catalogSettings_.apiKey);
     provider_.resetServerCheck();
 
-    if (settings_.hasServer()) {
+    if (catalogSettings_.hasServer()) {
         // Start upload queue if not running
         uploadQueue_.setServerUrl(url);
-        uploadQueue_.setApiKey(settings_.apiKey);
+        uploadQueue_.setApiKey(catalogSettings_.apiKey);
         uploadQueue_.start();
         // Trigger sync
         needsServerSync_ = true;
@@ -657,8 +679,56 @@ void tcApp::repairLibrary() {
         redraw();
     }
     // Trigger server sync to resolve Missing vs ServerOnly
-    if (settings_.hasServer() && !syncInProgress_) {
+    if (catalogSettings_.hasServer() && !syncInProgress_) {
         needsServerSync_ = true;
+    }
+}
+
+void tcApp::relinkMissingPhotos() {
+    if (viewMode_ == ViewMode::Single && selectedIndex_ >= 0) {
+        // Single view: relink current photo via file dialog
+        const string& photoId = grid_->getPhotoId(selectedIndex_);
+        auto* photo = provider_.getPhoto(photoId);
+        if (!photo) return;
+
+        auto result = loadDialog(
+            "Find " + photo->filename,
+            "Locate: " + photo->filename);
+
+        if (!result.success) return;
+
+        // Verify the file matches by filename + filesize
+        fs::path p(result.filePath);
+        string fname = p.filename().string();
+        uintmax_t fsize = fs::file_size(p);
+        string newId = fname + "_" + to_string(fsize);
+
+        if (newId != photoId) {
+            logWarning() << "[Relink] Mismatch: expected " << photoId << ", got " << newId;
+            return;
+        }
+
+        provider_.relinkPhoto(photoId, result.filePath);
+        // Reload the image with updated path
+        showFullImage(selectedIndex_);
+    } else {
+        // Grid mode: folder-based bulk relink
+        provider_.validateLibrary();
+
+        auto result = loadDialog(
+            "Find Missing Photos",
+            "Select folder to search for missing files",
+            "", true);
+
+        if (!result.success) return;
+
+        int relinked = provider_.relinkFromFolder(result.filePath);
+        logNotice() << "[Relink] Relinked " << relinked << " photos";
+
+        if (relinked > 0) {
+            grid_->populate(provider_);
+            redraw();
+        }
     }
 }
 

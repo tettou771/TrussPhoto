@@ -7,7 +7,7 @@
 #include <thread>
 #include "AppConfig.h"
 #include "AppPaths.h"
-#include "Settings.h"
+#include "CatalogSettings.h"
 #include "PhotoProvider.h"
 #include "PhotoGrid.h"
 #include "UploadQueue.h"
@@ -43,7 +43,9 @@ public:
     void exit() override;
 
 private:
-    Settings settings_;
+    CatalogSettings catalogSettings_;
+    AppBootstrap bootstrap_;
+    string catalogPath_;
     PhotoProvider provider_;
     PhotoGrid::Ptr grid_;
     UploadQueue uploadQueue_;
@@ -105,5 +107,6 @@ private:
     void configureServer(const string& url, const string& key = "");
     void loadProfileForEntry(const PhotoEntry& entry);
     void repairLibrary();
+    void relinkMissingPhotos();
     void consolidateLibrary();
 };
