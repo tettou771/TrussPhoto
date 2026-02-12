@@ -108,6 +108,11 @@ private:
 
     // Layout
     float statusBarHeight_ = 24.0f;
+    Tween<float> leftTween_;
+    Tween<float> rightTween_;
+    float leftPaneWidth_ = 220;   // current animated width
+    float rightPaneWidth_ = 260;  // current animated width
+    double lastTime_ = 0;
 
     // Modifier key tracking
     bool cmdDown_ = false;

@@ -109,17 +109,24 @@ void tcApp::setup() {
     addChild(leftToggle_);
     leftToggle_->onClick = [this]() {
         showSidebar_ = !showSidebar_;
-        updateLayout();
-        redraw();
+        float from = leftPaneWidth_;
+        float to = showSidebar_ ? sidebarWidth_ : 0;
+        leftTween_.from(from).to(to).duration(0.2f).ease(EaseType::Cubic, EaseMode::Out).start();
     };
 
     rightToggle_ = make_shared<PaneToggle>();
     addChild(rightToggle_);
     rightToggle_->onClick = [this]() {
         showMetadata_ = !showMetadata_;
-        updateLayout();
-        redraw();
+        float from = rightPaneWidth_;
+        float to = showMetadata_ ? metadataWidth_ : 0;
+        rightTween_.from(from).to(to).duration(0.2f).ease(EaseType::Cubic, EaseMode::Out).start();
     };
+
+    // Initialize tween state
+    lastTime_ = getElapsedTime();
+    leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
+    rightPaneWidth_ = showMetadata_ ? metadataWidth_ : 0;
 
     updateLayout();
 
@@ -311,6 +318,29 @@ void tcApp::update() {
         return;
     }
 
+    // Animate pane tweens
+    {
+        double now = getElapsedTime();
+        float dt = (float)(now - lastTime_);
+        lastTime_ = now;
+
+        bool animating = false;
+        if (leftTween_.isPlaying()) {
+            leftTween_.update(dt);
+            leftPaneWidth_ = leftTween_.getValue();
+            animating = true;
+        }
+        if (rightTween_.isPlaying()) {
+            rightTween_.update(dt);
+            rightPaneWidth_ = rightTween_.getValue();
+            animating = true;
+        }
+        if (animating) {
+            updateLayout();
+            redraw();
+        }
+    }
+
     // Launch server sync in background thread (non-blocking)
     if (needsServerSync_ && !syncInProgress_) {
         needsServerSync_ = false;
@@ -417,8 +447,8 @@ void tcApp::draw() {
     } else {
         // Show hint if no images
         if (provider_.getCount() == 0) {
-            float leftW = (showSidebar_ && folderTree_) ? sidebarWidth_ : 0;
-            float rightW = (showMetadata_ && metadataPanel_) ? metadataWidth_ : 0;
+            float leftW = leftPaneWidth_;
+            float rightW = rightPaneWidth_;
             float contentW = getWindowWidth() - leftW - rightW;
             float centerX = leftW + contentW * 0.5f;
 
@@ -577,7 +607,9 @@ void tcApp::keyPressed(int key) {
     }
     if (key == 'T' || key == 't') {
         showSidebar_ = !showSidebar_;
-        updateLayout();
+        float from = leftPaneWidth_;
+        float to = showSidebar_ ? sidebarWidth_ : 0;
+        leftTween_.from(from).to(to).duration(0.2f).ease(EaseType::Cubic, EaseMode::Out).start();
     }
 
     // Track modifier key state
@@ -642,7 +674,7 @@ void tcApp::mouseScrolled(Vec2 delta) {
         Texture* rawTex = hasFullRaw ? &fullTexture_ : &previewTexture_;
         float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
         float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
-        float rightW = (showMetadata_ && metadataPanel_) ? metadataWidth_ : 0;
+        float rightW = rightPaneWidth_;
         float winW = getWindowWidth() - rightW;
         float winH = getWindowHeight() - statusBarHeight_;
 
@@ -973,6 +1005,8 @@ void tcApp::showFullImage(int index) {
         zoomLevel_ = 1.0f;
         panOffset_ = {0, 0};
         grid_->setActive(false);
+        leftPaneWidth_ = 0;  // hide left pane in single view (no animation)
+        leftTween_.finish();
         updateLayout();
         loadProfileForEntry(*entry);
 
@@ -1028,6 +1062,10 @@ void tcApp::exitFullImage() {
 
     grid_->setActive(true);
 
+    // Restore left pane width (no animation)
+    leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
+    leftTween_.finish();
+
     // Clear view info, update with grid selection
     if (metadataPanel_) {
         metadataPanel_->clearViewInfo();
@@ -1048,7 +1086,7 @@ void tcApp::drawSingleView() {
     Texture* rawTex = hasFullRaw ? &fullTexture_ : &previewTexture_;
     float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
     float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
-    float rightW = (showMetadata_ && metadataPanel_) ? metadataWidth_ : 0;
+    float rightW = rightPaneWidth_;
     float winW = getWindowWidth() - rightW;
     float winH = getWindowHeight() - statusBarHeight_;
 
@@ -1099,43 +1137,44 @@ void tcApp::updateLayout() {
     float w = getWindowWidth();
     float h = getWindowHeight() - statusBarHeight_;
 
-    // Left pane (grid mode only)
-    bool leftVisible = showSidebar_ && viewMode_ == ViewMode::Grid && folderTree_;
-    float leftW = leftVisible ? sidebarWidth_ : 0;
-
-    // Right pane (both modes)
-    float rightW = showMetadata_ ? metadataWidth_ : 0;
+    // Animated pane widths (slide in/out)
+    bool leftInGrid = viewMode_ == ViewMode::Grid && folderTree_;
+    float leftW = leftInGrid ? leftPaneWidth_ : 0;
+    float rightW = rightPaneWidth_;
 
     // Center content
     float contentX = leftW;
     float contentW = w - leftW - rightW;
 
-    // FolderTree
+    // FolderTree — always full width, slide via X position
     if (folderTree_) {
-        folderTree_->setActive(leftVisible);
-        if (leftVisible) folderTree_->setRect(0, 0, sidebarWidth_, h);
+        bool leftActive = leftInGrid && leftPaneWidth_ > 0;
+        folderTree_->setActive(leftActive);
+        if (leftActive) {
+            folderTree_->setRect(leftW - sidebarWidth_, 0, sidebarWidth_, h);
+        }
     }
 
     // Grid
     if (grid_) grid_->setRect(contentX, 0, contentW, h);
 
-    // MetadataPanel
+    // MetadataPanel — always full width, slide via X position
     if (metadataPanel_) {
-        metadataPanel_->setActive(showMetadata_);
-        if (showMetadata_) metadataPanel_->setRect(w - rightW, 0, rightW, h);
+        bool rightActive = rightPaneWidth_ > 0;
+        metadataPanel_->setActive(rightActive);
+        if (rightActive) {
+            metadataPanel_->setRect(w - rightW, 0, metadataWidth_, h);
+        }
     }
 
     // Left toggle
     if (leftToggle_) {
         if (viewMode_ == ViewMode::Grid) {
             leftToggle_->setActive(true);
-            if (showSidebar_) {
-                leftToggle_->direction = PaneToggle::Left;
-                leftToggle_->setRect(sidebarWidth_ - 12, h / 2 - 15, 12, 30);
-            } else {
-                leftToggle_->direction = PaneToggle::Right;
-                leftToggle_->setRect(0, h / 2 - 15, 12, 30);
-            }
+            leftToggle_->direction = showSidebar_ ? PaneToggle::Left : PaneToggle::Right;
+            leftToggle_->setRect(leftW - 12, h / 2 - 15, 12, 30);
+            // Clamp to screen edge when collapsed
+            if (leftToggle_->getX() < 0) leftToggle_->setPos(0, leftToggle_->getY());
         } else {
             leftToggle_->setActive(false);
         }
@@ -1144,13 +1183,10 @@ void tcApp::updateLayout() {
     // Right toggle
     if (rightToggle_) {
         rightToggle_->setActive(true);
-        if (showMetadata_) {
-            rightToggle_->direction = PaneToggle::Right;
-            rightToggle_->setRect(w - rightW, h / 2 - 15, 12, 30);
-        } else {
-            rightToggle_->direction = PaneToggle::Left;
-            rightToggle_->setRect(w - 12, h / 2 - 15, 12, 30);
-        }
+        rightToggle_->direction = showMetadata_ ? PaneToggle::Right : PaneToggle::Left;
+        float toggleX = w - rightW;
+        if (toggleX > w - 12) toggleX = w - 12;
+        rightToggle_->setRect(toggleX, h / 2 - 15, 12, 30);
     }
 }
 
