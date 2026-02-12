@@ -88,8 +88,19 @@ void tcApp::setup() {
 
     // 5. Create grid
     grid_ = make_shared<PhotoGrid>();
-    grid_->setRect(0, 0, getWindowWidth(), getWindowHeight());
     addChild(grid_);
+
+    // 5b. Create folder tree sidebar
+    folderTree_ = make_shared<FolderTree>();
+    addChild(folderTree_);
+
+    folderTree_->onFolderSelected = [this](const string& path) {
+        grid_->setFilterPath(path);
+        grid_->populate(provider_);
+        redraw();
+    };
+
+    updateLayout();
 
     grid_->onItemClick = [this](int index) {
         if (cmdDown_ && shiftDown_) {
@@ -117,6 +128,7 @@ void tcApp::setup() {
     // Display previous library immediately
     if (hasLibrary && provider_.getCount() > 0) {
         grid_->populate(provider_);
+        rebuildFolderTree();
     }
 
     // 6. Start upload queue (only if server configured)
@@ -155,6 +167,7 @@ void tcApp::setup() {
             int added = provider_.scanLibraryFolder();
             if (missing > 0 || added > 0) {
                 grid_->populate(provider_);
+                rebuildFolderTree();
             }
             if (catalogSettings_.hasServer() && !syncInProgress_) {
                 needsServerSync_ = true;
@@ -231,6 +244,7 @@ void tcApp::setup() {
             int relinked = provider_.relinkFromFolder(folder);
             if (relinked > 0 && grid_) {
                 grid_->populate(provider_);
+                rebuildFolderTree();
             }
             return json{
                 {"status", "ok"},
@@ -284,6 +298,7 @@ void tcApp::update() {
 
         if (provider_.getCount() > 0 && grid_->getItemCount() != provider_.getCount()) {
             grid_->populate(provider_);
+            rebuildFolderTree();
             redraw();
         }
     }
@@ -495,6 +510,10 @@ void tcApp::keyPressed(int key) {
     if (key == 'F' || key == 'f') {
         relinkMissingPhotos();
     }
+    if (key == 'T' || key == 't') {
+        showSidebar_ = !showSidebar_;
+        updateLayout();
+    }
 
     // Track modifier key state
     if (key == SAPP_KEYCODE_LEFT_SUPER || key == SAPP_KEYCODE_RIGHT_SUPER) {
@@ -579,9 +598,8 @@ void tcApp::mouseScrolled(Vec2 delta) {
 }
 
 void tcApp::windowResized(int width, int height) {
-    if (grid_) {
-        grid_->setSize(width, height);
-    }
+    (void)width; (void)height;
+    updateLayout();
     redraw();
 }
 
@@ -607,6 +625,7 @@ void tcApp::filesDropped(const vector<string>& files) {
 
     if (added) {
         grid_->populate(provider_);
+        rebuildFolderTree();
         redraw();
         enqueueLocalOnlyPhotos();
 
@@ -676,6 +695,7 @@ void tcApp::repairLibrary() {
     logNotice() << "[Repair] Missing: " << missing << ", Added: " << added;
     if (missing > 0 || added > 0) {
         grid_->populate(provider_);
+        rebuildFolderTree();
         redraw();
     }
     // Trigger server sync to resolve Missing vs ServerOnly
@@ -727,6 +747,7 @@ void tcApp::relinkMissingPhotos() {
 
         if (relinked > 0) {
             grid_->populate(provider_);
+            rebuildFolderTree();
             redraw();
         }
     }
@@ -761,6 +782,7 @@ void tcApp::deleteSelectedPhotos() {
     logNotice() << "[Delete] Removed " << deleted << " photos";
 
     grid_->populate(provider_);
+    rebuildFolderTree();
     redraw();
 }
 
@@ -885,6 +907,7 @@ void tcApp::showFullImage(int index) {
         zoomLevel_ = 1.0f;
         panOffset_ = {0, 0};
         grid_->setActive(false);
+        updateLayout();
         loadProfileForEntry(*entry);
     } else {
         logWarning() << "Failed to load: " << entry->localPath;
@@ -931,6 +954,7 @@ void tcApp::exitFullImage() {
     currentProfilePath_.clear();
 
     grid_->setActive(true);
+    updateLayout();
     redraw();
 }
 
@@ -1054,4 +1078,24 @@ void tcApp::drawSingleView() {
             drawBitmapStringHighlight(helpStr, 10, infoY, Color(0, 0.3));
         }
     }
+}
+
+void tcApp::updateLayout() {
+    float w = getWindowWidth();
+    float h = getWindowHeight();
+
+    if (showSidebar_ && viewMode_ == ViewMode::Grid && folderTree_) {
+        folderTree_->setActive(true);
+        folderTree_->setRect(0, 0, sidebarWidth_, h);
+        if (grid_) grid_->setRect(sidebarWidth_, 0, w - sidebarWidth_, h);
+    } else {
+        if (folderTree_) folderTree_->setActive(false);
+        if (grid_) grid_->setRect(0, 0, w, h);
+    }
+}
+
+void tcApp::rebuildFolderTree() {
+    if (!folderTree_) return;
+    auto folders = provider_.buildFolderList();
+    folderTree_->buildTree(folders, provider_.getRawStoragePath());
 }

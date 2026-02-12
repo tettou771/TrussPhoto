@@ -57,6 +57,13 @@ public:
         updateGridLayout();
     }
 
+    // Set folder filter path (empty = show all)
+    void setFilterPath(const string& path) {
+        filterPath_ = path;
+    }
+
+    const string& getFilterPath() const { return filterPath_; }
+
     // Populate grid from PhotoProvider
     void populate(PhotoProvider& provider) {
         provider_ = &provider;
@@ -78,18 +85,25 @@ public:
             auto* photo = provider.getPhoto(ids[i]);
             if (!photo) continue;
 
+            // Filter by folder path
+            if (!filterPath_.empty()) {
+                string dir = fs::path(photo->localPath).parent_path().string();
+                if (dir.substr(0, filterPath_.size()) != filterPath_) continue;
+            }
+
+            int gridIndex = (int)photoIds_.size();
             photoIds_.push_back(ids[i]);
 
-            auto item = make_shared<PhotoItem>(i, itemSize_);
+            auto item = make_shared<PhotoItem>(gridIndex, itemSize_);
             // Label: stem of filename
             string stem = fs::path(photo->filename).stem().string();
             item->setLabelText(stem);
             item->setSyncState(photo->syncState);
 
             // Connect click event
-            item->onClick = [this, i]() {
+            item->onClick = [this, gridIndex]() {
                 if (onItemClick) {
-                    onItemClick((int)i);
+                    onItemClick(gridIndex);
                 }
             };
 
@@ -237,6 +251,7 @@ private:
     vector<PhotoItem::Ptr> items_;
     PhotoProvider* provider_ = nullptr;
     vector<string> photoIds_;
+    string filterPath_;
 
     AsyncImageLoader loader_;
 

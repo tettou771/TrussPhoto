@@ -10,6 +10,7 @@
 #include "CatalogSettings.h"
 #include "PhotoProvider.h"
 #include "PhotoGrid.h"
+#include "FolderTree.h"
 #include "UploadQueue.h"
 #include "CameraProfileManager.h"
 #include "ServerConfig.h"
@@ -48,6 +49,9 @@ private:
     string catalogPath_;
     PhotoProvider provider_;
     PhotoGrid::Ptr grid_;
+    FolderTree::Ptr folderTree_;
+    bool showSidebar_ = true;
+    float sidebarWidth_ = 220;
     UploadQueue uploadQueue_;
     ViewMode viewMode_ = ViewMode::Grid;
     bool needsServerSync_ = false;
@@ -109,4 +113,6 @@ private:
     void repairLibrary();
     void relinkMissingPhotos();
     void consolidateLibrary();
+    void updateLayout();
+    void rebuildFolderTree();
 };

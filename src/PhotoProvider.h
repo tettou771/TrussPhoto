@@ -605,6 +605,66 @@ public:
         return true;
     }
 
+    // --- Folder tree ---
+
+    // Folder info for tree display
+    struct FolderInfo {
+        string path;           // absolute path
+        string displayName;    // directory name (leaf)
+        int photoCount = 0;    // photos in this exact folder
+        bool exists = true;    // folder exists on disk
+    };
+
+    // Build folder list from DB entries' localPath
+    // Includes intermediate directories so the tree hierarchy is complete
+    vector<FolderInfo> buildFolderList() const {
+        unordered_map<string, FolderInfo> folders;
+
+        // Collect direct parent directories of all photos
+        for (const auto& [id, photo] : photos_) {
+            if (photo.localPath.empty()) continue;
+            string dir = fs::path(photo.localPath).parent_path().string();
+            auto& info = folders[dir];
+            info.path = dir;
+            info.displayName = fs::path(dir).filename().string();
+            info.photoCount++;
+        }
+
+        // Add intermediate directories between leaf folders and rawStoragePath
+        // so the tree hierarchy can be properly built
+        vector<string> leafPaths;
+        for (const auto& [path, _] : folders) {
+            leafPaths.push_back(path);
+        }
+        for (const auto& leafPath : leafPaths) {
+            fs::path p = fs::path(leafPath).parent_path();
+            while (!p.empty() && p.string() != "/" && p != p.root_path()) {
+                string pstr = p.string();
+                // Stop above rawStoragePath
+                if (!rawStoragePath_.empty() && pstr.size() < rawStoragePath_.size()) break;
+                // Already exists — ancestors above also exist
+                if (folders.count(pstr)) break;
+                auto& info = folders[pstr];
+                info.path = pstr;
+                info.displayName = p.filename().string();
+                info.photoCount = 0;
+                p = p.parent_path();
+            }
+        }
+
+        // Check existence
+        for (auto& [path, info] : folders) {
+            info.exists = fs::exists(path);
+        }
+        // Sort by path
+        vector<FolderInfo> result;
+        for (auto& [_, info] : folders) result.push_back(std::move(info));
+        sort(result.begin(), result.end(), [](const FolderInfo& a, const FolderInfo& b) {
+            return a.path < b.path;
+        });
+        return result;
+    }
+
     // --- Accessors ---
 
     void setSyncState(const string& id, SyncState state) {
