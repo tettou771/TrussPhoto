@@ -382,7 +382,7 @@ void tcApp::draw() {
         if (provider_.getCount() == 0) {
             setColor(0.5f, 0.5f, 0.55f);
             string hint = "Drop a folder containing images";
-            font_.drawString(hint, getWindowWidth() / 2.0f, getWindowHeight() / 2.0f,
+            font_.drawString(hint, getWindowWidth() / 2.0f, (getWindowHeight() - statusBarHeight_) / 2.0f,
                 Direction::Center, Direction::Center);
         }
     }
@@ -390,24 +390,33 @@ void tcApp::draw() {
     // Status bar background
     float barHeight = 24;
     float barY = getWindowHeight() - barHeight;
-    setColor(0.1f, 0.1f, 0.12f, 0.9f);
+    setColor(0.1f, 0.1f, 0.12f);
     fill();
     drawRect(0, barY, getWindowWidth(), barHeight);
 
     // Server status indicator
-    float dotX = 10;
-    float dotY = barY + barHeight / 2;
-    fill();
-    if (provider_.isServerConnected()) {
-        setColor(0.3f, 0.8f, 0.4f);  // green
+    float textX = 10;
+    float textY = barY + barHeight / 2;
+    string serverLabel;
+
+    if (catalogSettings_.hasServer()) {
+        // Show dot badge only when server is configured
+        fill();
+        if (provider_.isServerConnected()) {
+            setColor(0.3f, 0.8f, 0.4f);  // green
+            serverLabel = "Server";
+        } else {
+            setColor(0.6f, 0.35f, 0.35f);  // dim red
+            serverLabel = "Offline";
+        }
+        drawCircle(textX + 4, textY, 4);
+        textX += 14;
     } else {
-        setColor(0.6f, 0.35f, 0.35f);  // dim red
+        serverLabel = "Local";
     }
-    drawCircle(dotX + 4, dotY, 4);
 
     // Status text
     setColor(0.55f, 0.55f, 0.6f);
-    string serverLabel = provider_.isServerConnected() ? "Server" : "Offline";
     size_t pending = uploadQueue_.getPendingCount();
     string uploadStatus = pending > 0 ? format("  Upload: {}", pending) : "";
     string consolidateStatus;
@@ -417,7 +426,7 @@ void tcApp::draw() {
     }
     fontSmall_.drawString(format("{}  Photos: {}{}{}  FPS: {:.0f}",
         serverLabel, provider_.getCount(), uploadStatus, consolidateStatus, getFrameRate()),
-        dotX + 14, barY + barHeight / 2, Direction::Left, Direction::Center);
+        textX, textY, Direction::Left, Direction::Center);
 }
 
 void tcApp::keyPressed(int key) {
@@ -581,7 +590,7 @@ void tcApp::mouseScrolled(Vec2 delta) {
         float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
         float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
         float winW = getWindowWidth();
-        float winH = getWindowHeight();
+        float winH = getWindowHeight() - statusBarHeight_;
 
         float minZoom = 1.0f;
         float maxZoom = 10.0f;
@@ -972,7 +981,7 @@ void tcApp::drawSingleView() {
     float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
     float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
     float winW = getWindowWidth();
-    float winH = getWindowHeight();
+    float winH = getWindowHeight() - statusBarHeight_;
 
     float fitScale = min(winW / imgW, winH / imgH);
     float scale = fitScale * zoomLevel_;
@@ -1104,13 +1113,12 @@ void tcApp::drawSingleView() {
 
 void tcApp::updateLayout() {
     float w = getWindowWidth();
-    float h = getWindowHeight();
+    float h = getWindowHeight() - statusBarHeight_;
 
     if (showSidebar_ && viewMode_ == ViewMode::Grid && folderTree_) {
         folderTree_->setActive(true);
         folderTree_->setRect(0, 0, sidebarWidth_, h);
         if (grid_) grid_->setRect(sidebarWidth_, 0, w - sidebarWidth_, h);
-        
     } else {
         if (folderTree_) folderTree_->setActive(false);
         if (grid_) grid_->setRect(0, 0, w, h);

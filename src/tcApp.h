@@ -98,6 +98,9 @@ private:
     PhotoServer server_;
     ServerConfig serverConfig_;
 
+    // Layout
+    float statusBarHeight_ = 24.0f;
+
     // Modifier key tracking
     bool cmdDown_ = false;
     bool shiftDown_ = false;
