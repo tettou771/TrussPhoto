@@ -61,6 +61,7 @@ private:
     Texture fullTexture_;
     Texture previewTexture_; // half-size preview (shown while full loads)
     bool isRawImage_ = false;
+    bool isSmartPreview_ = false;  // viewing smart preview (RAW unavailable)
     Vec2 panOffset_ = {0, 0};
     float zoomLevel_ = 1.0f;
     bool isDragging_ = false;

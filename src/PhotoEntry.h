@@ -21,6 +21,7 @@ struct PhotoEntry {
     // Paths
     string localPath;            // Local file path (RAW or standard)
     string localThumbnailPath;   // Cached thumbnail path
+    string localSmartPreviewPath; // Smart preview JPEG XL path (tpDataPath/smart_preview/)
 
     // Metadata
     string cameraMake;
@@ -35,6 +36,20 @@ struct PhotoEntry {
     float aperture = 0;
     float iso = 0;
 
+    // User-editable metadata
+    int rating = 0;              // 0-5 (0=unrated)
+    string colorLabel;           // "", "Red", "Yellow", "Green", "Blue", "Purple"
+    int flag = 0;                // 0=none, 1=pick, -1=reject
+    string memo;                 // Markdown freetext
+    string tags;                 // JSON array string: '["travel","sunrise"]'
+
+    // Field-level updatedAt (ms since epoch, 0=never)
+    int64_t ratingUpdatedAt = 0;
+    int64_t colorLabelUpdatedAt = 0;
+    int64_t flagUpdatedAt = 0;
+    int64_t memoUpdatedAt = 0;
+    int64_t tagsUpdatedAt = 0;
+
     // State
     SyncState syncState = SyncState::LocalOnly;
 };
@@ -48,6 +63,7 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"dateTimeOriginal", e.dateTimeOriginal},
         {"localPath", e.localPath},
         {"localThumbnailPath", e.localThumbnailPath},
+        {"localSmartPreviewPath", e.localSmartPreviewPath},
         {"cameraMake", e.cameraMake},
         {"camera", e.camera},
         {"lens", e.lens},
@@ -59,7 +75,17 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"focalLength", e.focalLength},
         {"aperture", e.aperture},
         {"iso", e.iso},
-        {"syncState", static_cast<int>(e.syncState)}
+        {"syncState", static_cast<int>(e.syncState)},
+        {"rating", e.rating},
+        {"colorLabel", e.colorLabel},
+        {"flag", e.flag},
+        {"memo", e.memo},
+        {"tags", e.tags},
+        {"ratingUpdatedAt", e.ratingUpdatedAt},
+        {"colorLabelUpdatedAt", e.colorLabelUpdatedAt},
+        {"flagUpdatedAt", e.flagUpdatedAt},
+        {"memoUpdatedAt", e.memoUpdatedAt},
+        {"tagsUpdatedAt", e.tagsUpdatedAt}
     };
 }
 
@@ -70,6 +96,7 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.dateTimeOriginal = j.value("dateTimeOriginal", string(""));
     e.localPath = j.value("localPath", string(""));
     e.localThumbnailPath = j.value("localThumbnailPath", string(""));
+    e.localSmartPreviewPath = j.value("localSmartPreviewPath", string(""));
     e.cameraMake = j.value("cameraMake", string(""));
     e.camera = j.value("camera", string(""));
     e.lens = j.value("lens", string(""));
@@ -81,6 +108,17 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.focalLength = j.value("focalLength", 0.0f);
     e.aperture = j.value("aperture", 0.0f);
     e.iso = j.value("iso", 0.0f);
+
+    e.rating = j.value("rating", 0);
+    e.colorLabel = j.value("colorLabel", string(""));
+    e.flag = j.value("flag", 0);
+    e.memo = j.value("memo", string(""));
+    e.tags = j.value("tags", string(""));
+    e.ratingUpdatedAt = j.value("ratingUpdatedAt", (int64_t)0);
+    e.colorLabelUpdatedAt = j.value("colorLabelUpdatedAt", (int64_t)0);
+    e.flagUpdatedAt = j.value("flagUpdatedAt", (int64_t)0);
+    e.memoUpdatedAt = j.value("memoUpdatedAt", (int64_t)0);
+    e.tagsUpdatedAt = j.value("tagsUpdatedAt", (int64_t)0);
 
     int state = j.value("syncState", 0);
     e.syncState = static_cast<SyncState>(state);

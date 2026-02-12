@@ -134,6 +134,7 @@ libraryFolder                        ← ユーザ設定（例: ~/Pictures/Truss
 | GET | /api/photos | 写真一覧（id, filename, fileSize, camera, width, height） |
 | GET | /api/photos/:id | 写真詳細 |
 | GET | /api/photos/:id/thumbnail | サムネイルJPEG取得 |
+| PATCH | /api/photos/:id/metadata | メタデータ更新（rating, colorLabel, flag, memo, tags） |
 | POST | /api/import | RAWインポート `{"path": "/path/to/file.ARW"}` |
 | DELETE | /api/photos/:id | 写真削除 |
 
@@ -212,6 +213,13 @@ PhotoEntry にフィールドを追加した場合:
 2. `PhotoDatabase.h` の CREATE TABLE、bindEntry()、loadAll() に追加
 3. `PhotoDatabase::SCHEMA_VERSION` をインクリメントし、ALTER TABLE マイグレーションを追加
 4. 開発中は `library.db` を削除して再作成するのが手っ取り早い
+
+### リッチメタデータ（v2 スキーマ）
+- `rating` (0-5), `colorLabel`, `flag` (-1/0/1), `memo`, `tags` (JSON配列文字列)
+- 各フィールドに `xxxUpdatedAt` (ms epoch) を持つ（フィールド単位の同期用）
+- setter は `PhotoProvider::setRating()` 等 → メモリ + DB + XMP サイドカー一括更新
+- XMP サイドカー: インポート時に `.xmp` を読み、メタデータ変更時に書き出し
+- サイドカー形式: Lightroom 互換（`DSC00001.xmp`）、darktable 形式（`.ARW.xmp`）も読み込み対応
 
 ### UploadQueue の sleep() デッドロック
 `UploadQueue::threadedFunction()` 内で `lock_guard<mutex>` のスコープ内に POSIX `sleep(1000)` を書いてしまい、
@@ -319,7 +327,8 @@ if (grid_ && grid_->updateSyncStates(provider_)) {
 | ←→ | 前後の写真 |
 | スクロール | ズーム |
 | ドラッグ | パン |
-| 0 | ズームリセット |
+| Z | ズームリセット |
+| 0-5 | レーティング設定（0=解除, 1-5=★） |
 | P | カメラプロファイル ON/OFF |
 | [ / ] | プロファイルブレンド量 ±10% |
 | L | レンズ補正 ON/OFF（画像再読み込み） |

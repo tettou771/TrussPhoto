@@ -57,6 +57,7 @@ void tcApp::setup() {
     provider_.setDatabasePath(AppPaths::dataPath() + "/library.db");
     provider_.setJsonMigrationPath(AppPaths::dataPath() + "/library.json");
     provider_.setLibraryFolder(settings_.libraryFolder);
+    provider_.setSmartPreviewDir(AppPaths::dataPath() + "/smart_preview");
     provider_.setServerUrl(settings_.serverUrl);
     provider_.setApiKey(settings_.apiKey);
 
@@ -164,6 +165,42 @@ void tcApp::setup() {
             };
         });
 
+    mcp::tool("set_rating", "Set rating for a photo (0-5)")
+        .arg<string>("id", "Photo ID")
+        .arg<int>("rating", "Rating value 0-5")
+        .bind([this](const json& args) {
+            string id = args.at("id").get<string>();
+            int rating = args.at("rating").get<int>();
+            if (!provider_.setRating(id, rating)) {
+                return json{{"status", "error"}, {"message", "Photo not found"}};
+            }
+            return json{{"status", "ok"}, {"id", id}, {"rating", rating}};
+        });
+
+    mcp::tool("set_memo", "Set memo/description for a photo")
+        .arg<string>("id", "Photo ID")
+        .arg<string>("memo", "Memo text (markdown)")
+        .bind([this](const json& args) {
+            string id = args.at("id").get<string>();
+            string memo = args.at("memo").get<string>();
+            if (!provider_.setMemo(id, memo)) {
+                return json{{"status", "error"}, {"message", "Photo not found"}};
+            }
+            return json{{"status", "ok"}, {"id", id}};
+        });
+
+    mcp::tool("set_tags", "Set tags for a photo")
+        .arg<string>("id", "Photo ID")
+        .arg<string>("tags", "JSON array of tag strings")
+        .bind([this](const json& args) {
+            string id = args.at("id").get<string>();
+            string tags = args.at("tags").get<string>();
+            if (!provider_.setTags(id, tags)) {
+                return json{{"status", "error"}, {"message", "Photo not found"}};
+            }
+            return json{{"status", "ok"}, {"id", id}};
+        });
+
     mcp::tool("consolidate_library", "Reorganize library into date-based directory structure")
         .bind([this]() {
             if (provider_.isConsolidateRunning()) {
@@ -173,6 +210,15 @@ void tcApp::setup() {
             return json{
                 {"status", "ok"},
                 {"total", provider_.getConsolidateTotal()}
+            };
+        });
+
+    mcp::tool("generate_smart_previews", "Generate smart previews for all photos without one")
+        .bind([this]() {
+            int queued = provider_.queueAllMissingSP();
+            return json{
+                {"status", "ok"},
+                {"queued", queued}
             };
         });
 
@@ -228,6 +274,9 @@ void tcApp::update() {
     // Process background file copies
     provider_.processCopyResults();
 
+    // Process smart preview generation results
+    provider_.processSPResults();
+
     // Process consolidation results
     provider_.processConsolidateResults();
 
@@ -245,6 +294,13 @@ void tcApp::update() {
                 fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
                 previewTexture_.clear();
                 logNotice() << "Full-size RAW loaded: " << rawPixels_.getWidth() << "x" << rawPixels_.getHeight();
+
+                // Generate smart preview if not yet done (uses decoded rawPixels_)
+                const string& spId = grid_->getPhotoId(selectedIndex_);
+                if (!provider_.hasSmartPreview(spId)) {
+                    provider_.generateSmartPreview(spId, rawPixels_);
+                }
+
                 redraw();
             }
         } else {
@@ -337,9 +393,6 @@ void tcApp::keyPressed(int key) {
             showFullImage(selectedIndex_ - 1);
         } else if (key == SAPP_KEYCODE_RIGHT && selectedIndex_ < (int)grid_->getPhotoIdCount() - 1) {
             showFullImage(selectedIndex_ + 1);
-        } else if (key == '0') {
-            zoomLevel_ = 1.0f;
-            panOffset_ = {0, 0};
         } else if (key == 'P' || key == 'p') {
             // Toggle camera profile LUT
             if (hasProfileLut_) {
@@ -357,6 +410,38 @@ void tcApp::keyPressed(int key) {
             if (hasProfileLut_) {
                 profileBlend_ = clamp(profileBlend_ + 0.1f, 0.0f, 1.0f);
                 logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
+            }
+        } else if (key >= '0' && key <= '5') {
+            // Rating shortcut: 0=unrated, 1-5=★
+            if (selectedIndex_ >= 0 && selectedIndex_ < (int)grid_->getPhotoIdCount()) {
+                const string& photoId = grid_->getPhotoId(selectedIndex_);
+                int rating = key - '0';
+                provider_.setRating(photoId, rating);
+                logNotice() << "[Rating] " << photoId << " -> " << rating;
+            }
+        } else if (key == 'Z' || key == 'z') {
+            zoomLevel_ = 1.0f;
+            panOffset_ = {0, 0};
+        } else if (key == 'S' || key == 's') {
+            // Debug: force load smart preview (even if RAW available)
+            if (selectedIndex_ >= 0 && selectedIndex_ < (int)grid_->getPhotoIdCount()) {
+                const string& photoId = grid_->getPhotoId(selectedIndex_);
+                auto* spEntry = provider_.getPhoto(photoId);
+                Pixels spPixels;
+                if (spEntry && provider_.loadSmartPreview(photoId, spPixels)) {
+                    rawPixels_ = std::move(spPixels);
+                    if (spEntry->focalLength > 0 && spEntry->aperture > 0) {
+                        lensCorrector_.setup(spEntry->cameraMake, spEntry->camera, spEntry->lens,
+                            spEntry->focalLength, spEntry->aperture,
+                            rawPixels_.getWidth(), rawPixels_.getHeight());
+                    }
+                    reprocessImage();
+                    previewTexture_.clear();
+                    isSmartPreview_ = true;
+                    logNotice() << "[Debug] Forced smart preview: " << photoId;
+                } else {
+                    logNotice() << "[Debug] No smart preview for: " << photoId;
+                }
             }
         } else if (key == 'L' || key == 'l') {
             lensEnabled_ = !lensEnabled_;
@@ -502,6 +587,9 @@ void tcApp::filesDropped(const vector<string>& files) {
         grid_->populate(provider_);
         redraw();
         enqueueLocalOnlyPhotos();
+
+        // Queue smart preview generation for new photos
+        provider_.queueAllMissingSP();
     }
 }
 
@@ -643,6 +731,7 @@ void tcApp::showFullImage(int index) {
     }
 
     bool loaded = false;
+    isSmartPreview_ = false;
 
     if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
         if (entry->isRaw) {
@@ -699,6 +788,27 @@ void tcApp::showFullImage(int index) {
         redraw();
     }
 
+    // Fallback: try smart preview if RAW/file not available
+    if (!loaded && provider_.hasSmartPreview(photoId)) {
+        Pixels spPixels;
+        if (provider_.loadSmartPreview(photoId, spPixels)) {
+            rawPixels_ = std::move(spPixels);
+            // Setup lens corrector for this photo
+            if (entry->focalLength > 0 && entry->aperture > 0) {
+                lensCorrector_.setup(entry->cameraMake, entry->camera, entry->lens,
+                    entry->focalLength, entry->aperture,
+                    rawPixels_.getWidth(), rawPixels_.getHeight());
+            }
+            reprocessImage();  // applies lens correction → fullTexture_
+            previewTexture_.clear();
+            isRawImage_ = true;
+            isSmartPreview_ = true;
+            loaded = true;
+            logNotice() << "Loaded smart preview for: " << entry->filename;
+            redraw();
+        }
+    }
+
     if (loaded) {
         selectedIndex_ = index;
         viewMode_ = ViewMode::Single;
@@ -742,6 +852,7 @@ void tcApp::exitFullImage() {
         fullImage_ = Image();
     }
     isRawImage_ = false;
+    isSmartPreview_ = false;
     selectedIndex_ = -1;
 
     // Clear profile LUT
@@ -814,7 +925,7 @@ void tcApp::drawSingleView() {
         auto* entry = provider_.getPhoto(photoId);
         if (entry) {
             setColor(0.8f, 0.8f, 0.85f);
-            string typeStr = entry->isRaw ? " [RAW]" : "";
+            string typeStr = isSmartPreview_ ? " [Smart Preview]" : (entry->isRaw ? " [RAW]" : "");
             drawBitmapStringHighlight(entry->filename + typeStr, 10, 20, Color(0, 0.3));
             drawBitmapStringHighlight(format("{}x{}  Zoom: {:.0f}%",
                 (int)imgW, (int)imgH, zoomLevel_ * 100), 10, 40, Color(0, 0.3));
@@ -845,19 +956,32 @@ void tcApp::drawSingleView() {
                 drawBitmapStringHighlight(metaLine, 10, 60, Color(0, 0.3));
             }
 
+            // Rating display
+            float infoY = 80.0f;
+            if (entry->rating > 0) {
+                string stars = "Rating: ";
+                for (int i = 0; i < 5; i++) {
+                    stars += (i < entry->rating) ? '*' : '.';
+                }
+                setColor(1.0f, 0.85f, 0.2f);
+                drawBitmapStringHighlight(stars, 10, infoY, Color(0, 0.3));
+                infoY += 20.0f;
+            }
+
             // Profile status
             if (hasProfileLut_) {
                 string profileStatus = format("Profile: {} {:.0f}%",
                     profileEnabled_ ? "ON" : "OFF", profileBlend_ * 100);
                 setColor(0.5f, 0.75f, 0.5f);
-                drawBitmapStringHighlight(profileStatus, 10, 80, Color(0, 0.3));
+                drawBitmapStringHighlight(profileStatus, 10, infoY, Color(0, 0.3));
+                infoY += 20.0f;
             }
+
+            // Help line
+            setColor(0.5f, 0.5f, 0.55f);
+            string helpStr = "ESC: Back  Left/Right: Navigate  Scroll: Zoom  Drag: Pan  Z: Reset  0-5: Rating  L: Lens";
+            if (hasProfileLut_) helpStr += "  P: Profile  [/]: Blend";
+            drawBitmapStringHighlight(helpStr, 10, infoY, Color(0, 0.3));
         }
     }
-
-    float helpY = hasProfileLut_ ? 100.0f : 80.0f;
-    setColor(0.5f, 0.5f, 0.55f);
-    string helpStr = "ESC: Back  Left/Right: Navigate  Scroll: Zoom  Drag: Pan  L: Lens";
-    if (hasProfileLut_) helpStr += "  P: Profile  [/]: Blend";
-    drawBitmapStringHighlight(helpStr, 10, helpY, Color(0, 0.3));
 }

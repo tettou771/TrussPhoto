@@ -137,6 +137,39 @@ public:
             }, 201);
         });
 
+        // --- Update metadata ---
+        CROW_ROUTE(app_, "/api/photos/<string>/metadata").methods("PATCH"_method)
+        ([this](const crow::request& req, const string& id) {
+            if (!authorize(req)) return tcx::errorResponse("Unauthorized", 401);
+
+            auto* photo = provider_->getPhoto(id);
+            if (!photo) return tcx::errorResponse("Photo not found", 404);
+
+            auto data = tcx::fromJson(req.body);
+
+            if (data.contains("rating")) {
+                provider_->setRating(id, data["rating"].get<int>());
+            }
+            if (data.contains("colorLabel")) {
+                provider_->setColorLabel(id, data["colorLabel"].get<string>());
+            }
+            if (data.contains("flag")) {
+                provider_->setFlag(id, data["flag"].get<int>());
+            }
+            if (data.contains("memo")) {
+                provider_->setMemo(id, data["memo"].get<string>());
+            }
+            if (data.contains("tags")) {
+                provider_->setTags(id, data["tags"].get<string>());
+            }
+
+            // Return updated entry
+            photo = provider_->getPhoto(id);
+            nlohmann::json j;
+            to_json(j, *photo);
+            return tcx::jsonResponse(j);
+        });
+
         // --- Delete photo ---
         CROW_ROUTE(app_, "/api/photos/<string>").methods("DELETE"_method)
         ([this](const crow::request& req, const string& id) {

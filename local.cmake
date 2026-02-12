@@ -14,6 +14,14 @@ if(NOT EMSCRIPTEN)
     target_link_directories(${PROJECT_NAME} PRIVATE ${EXIV2_LIBRARY_DIRS})
     target_link_libraries(${PROJECT_NAME} PRIVATE ${EXIV2_LIBRARIES})
     message(STATUS "[${PROJECT_NAME}] Found exiv2: ${EXIV2_VERSION}")
+
+    # libjxl - JPEG XL smart preview encode/decode
+    # brew install jpeg-xl
+    pkg_check_modules(JXL REQUIRED libjxl libjxl_threads)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${JXL_INCLUDE_DIRS})
+    target_link_directories(${PROJECT_NAME} PRIVATE ${JXL_LIBRARY_DIRS})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${JXL_LIBRARIES})
+    message(STATUS "[${PROJECT_NAME}] Found libjxl: ${JXL_VERSION}")
 endif()
 
 # SQLite amalgamation - embedded database for photo library

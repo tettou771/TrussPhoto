@@ -51,6 +51,7 @@ inline string cachePath() {
 inline void ensureDirectories() {
     fs::create_directories(dataPath());
     fs::create_directories(cachePath());
+    fs::create_directories(dataPath() + "/smart_preview");
     fs::create_directories(cachePath() + "/thumbnail_cache");
     logNotice() << "[AppPaths] Data: " << dataPath();
     logNotice() << "[AppPaths] Cache: " << cachePath();

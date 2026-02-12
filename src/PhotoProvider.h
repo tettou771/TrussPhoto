@@ -25,6 +25,7 @@ namespace fs = std::filesystem;
 
 #include "PhotoEntry.h"
 #include "PhotoDatabase.h"
+#include "SmartPreview.h"
 
 // Photo provider - manages local + server photos
 class PhotoProvider {
@@ -44,6 +45,11 @@ public:
 
     void setThumbnailCacheDir(const string& dir) {
         thumbnailCacheDir_ = dir;
+        fs::create_directories(dir);
+    }
+
+    void setSmartPreviewDir(const string& dir) {
+        smartPreviewDir_ = dir;
         fs::create_directories(dir);
     }
 
@@ -168,6 +174,7 @@ public:
             photo.isRaw = RawLoader::isRawFile(entry.path());
             photo.syncState = SyncState::LocalOnly;
             extractExifMetadata(photo.localPath, photo);
+            extractXmpMetadata(photo.localPath, photo);
             photos_[id] = photo;
             newEntries.push_back(photo);
             addedCount++;
@@ -207,6 +214,7 @@ public:
             photo.isRaw = RawLoader::isRawFile(p);
             photo.syncState = SyncState::LocalOnly;
             extractExifMetadata(filePath, photo);
+            extractXmpMetadata(filePath, photo);
 
             photos_[id] = photo;
             newEntries.push_back(photo);
@@ -275,8 +283,9 @@ public:
             photo.isRaw = RawLoader::isRawFile(entry.path());
             photo.syncState = SyncState::LocalOnly;
 
-            // Extract metadata via exiv2
+            // Extract metadata via exiv2 + XMP sidecar
             extractExifMetadata(path, photo);
+            extractXmpMetadata(path, photo);
 
             photos_[id] = photo;
             newEntries.push_back(photo);
@@ -463,6 +472,70 @@ public:
         return false;
     }
 
+    // --- Rich metadata setters ---
+
+    static int64_t nowMs() {
+        return chrono::duration_cast<chrono::milliseconds>(
+            chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    bool setRating(const string& id, int rating) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        rating = clamp(rating, 0, 5);
+        auto ts = nowMs();
+        it->second.rating = rating;
+        it->second.ratingUpdatedAt = ts;
+        db_.updateRating(id, rating, ts);
+        writeXmpSidecarIfLocal(it->second);
+        return true;
+    }
+
+    bool setColorLabel(const string& id, const string& label) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        auto ts = nowMs();
+        it->second.colorLabel = label;
+        it->second.colorLabelUpdatedAt = ts;
+        db_.updateColorLabel(id, label, ts);
+        writeXmpSidecarIfLocal(it->second);
+        return true;
+    }
+
+    bool setFlag(const string& id, int flag) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        flag = clamp(flag, -1, 1);
+        auto ts = nowMs();
+        it->second.flag = flag;
+        it->second.flagUpdatedAt = ts;
+        db_.updateFlag(id, flag, ts);
+        writeXmpSidecarIfLocal(it->second);
+        return true;
+    }
+
+    bool setMemo(const string& id, const string& memo) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        auto ts = nowMs();
+        it->second.memo = memo;
+        it->second.memoUpdatedAt = ts;
+        db_.updateMemo(id, memo, ts);
+        writeXmpSidecarIfLocal(it->second);
+        return true;
+    }
+
+    bool setTags(const string& id, const string& tags) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        auto ts = nowMs();
+        it->second.tags = tags;
+        it->second.tagsUpdatedAt = ts;
+        db_.updateTags(id, tags, ts);
+        writeXmpSidecarIfLocal(it->second);
+        return true;
+    }
+
     // --- Accessors ---
 
     void setSyncState(const string& id, SyncState state) {
@@ -499,8 +572,13 @@ public:
 
             auto& photo = it->second;
 
-            // Delete local RAW/image file
+            // Delete local RAW/image file + XMP sidecar
             if (!photo.localPath.empty() && fs::exists(photo.localPath)) {
+                // Delete XMP sidecar
+                string xmpPath = xmpWritePath(photo.localPath);
+                if (!xmpPath.empty() && fs::exists(xmpPath)) {
+                    try { fs::remove(xmpPath); } catch (...) {}
+                }
                 try {
                     fs::remove(photo.localPath);
                     logNotice() << "[Delete] Removed file: " << photo.localPath;
@@ -512,6 +590,11 @@ public:
             // Delete thumbnail cache
             if (!photo.localThumbnailPath.empty() && fs::exists(photo.localThumbnailPath)) {
                 try { fs::remove(photo.localThumbnailPath); } catch (...) {}
+            }
+
+            // Delete smart preview
+            if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) {
+                try { fs::remove(photo.localSmartPreviewPath); } catch (...) {}
             }
 
             // Delete from DB and memory
@@ -544,6 +627,102 @@ public:
             }
         }
         return result;
+    }
+
+    // --- Smart Preview ---
+
+    // Compute smart preview path for a photo
+    string smartPreviewPath(const PhotoEntry& photo) const {
+        if (smartPreviewDir_.empty()) return "";
+        string subdir = dateToSubdir(photo.dateTimeOriginal, photo.localPath);
+        return smartPreviewDir_ + "/" + subdir + "/" + photo.id + ".jxl";
+    }
+
+    // Generate smart preview from F32 pixels (call after RAW decode)
+    bool generateSmartPreview(const string& id, const Pixels& rawPixelsF32) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        auto& photo = it->second;
+
+        string spPath = smartPreviewPath(photo);
+        if (spPath.empty()) return false;
+
+        if (SmartPreview::encode(rawPixelsF32, spPath)) {
+            photo.localSmartPreviewPath = spPath;
+            db_.updateSmartPreviewPath(id, spPath);
+            return true;
+        }
+        return false;
+    }
+
+    // Load smart preview to F32 pixels
+    bool loadSmartPreview(const string& id, Pixels& outF32) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        auto& photo = it->second;
+
+        if (photo.localSmartPreviewPath.empty() || !fs::exists(photo.localSmartPreviewPath)) {
+            return false;
+        }
+        return SmartPreview::decode(photo.localSmartPreviewPath, outF32);
+    }
+
+    // Check if photo has a smart preview
+    bool hasSmartPreview(const string& id) const {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        return !it->second.localSmartPreviewPath.empty() &&
+               fs::exists(it->second.localSmartPreviewPath);
+    }
+
+    // Queue photos for background SP generation (from RAW)
+    void queueSmartPreviewGeneration(const vector<string>& ids) {
+        lock_guard<mutex> lock(spMutex_);
+        for (const auto& id : ids) {
+            auto it = photos_.find(id);
+            if (it == photos_.end()) continue;
+            auto& photo = it->second;
+            // Only queue RAW files that don't already have SP
+            if (!photo.isRaw) continue;
+            if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) continue;
+            if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
+            pendingSPGenerations_.push_back(id);
+        }
+        startSPGenerationThread();
+    }
+
+    // Queue all photos without smart preview
+    int queueAllMissingSP() {
+        vector<string> ids;
+        for (const auto& [id, photo] : photos_) {
+            if (!photo.isRaw) continue;
+            if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) continue;
+            if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
+            ids.push_back(id);
+        }
+        if (!ids.empty()) {
+            queueSmartPreviewGeneration(ids);
+        }
+        return (int)ids.size();
+    }
+
+    // Process completed SP generation results (call from main thread)
+    void processSPResults() {
+        lock_guard<mutex> lock(spMutex_);
+        for (const auto& result : completedSPGenerations_) {
+            auto it = photos_.find(result.photoId);
+            if (it != photos_.end() && !result.spPath.empty()) {
+                it->second.localSmartPreviewPath = result.spPath;
+                db_.updateSmartPreviewPath(result.photoId, result.spPath);
+            }
+        }
+        completedSPGenerations_.clear();
+    }
+
+    bool isSPGenerationRunning() const { return spThreadRunning_; }
+    int getSPPendingCount() const {
+        lock_guard<mutex> lock(spMutex_);
+        return (int)pendingSPGenerations_.size();
     }
 
     // Process completed file copies (call from main thread in update)
@@ -661,7 +840,7 @@ public:
                 bool rawOk = true;
                 bool thumbOk = true;
 
-                // Move RAW file
+                // Move RAW file + XMP sidecar
                 if (!task.oldPath.empty() && !task.newPath.empty()) {
                     try {
                         fs::rename(task.oldPath, task.newPath);
@@ -672,6 +851,16 @@ public:
                         } catch (const exception& e) {
                             logWarning() << "[Consolidate] Failed: " << task.oldPath << " -> " << e.what();
                             rawOk = false;
+                        }
+                    }
+                    // Move XMP sidecar alongside RAW
+                    if (rawOk) {
+                        string oldXmp = xmpWritePath(task.oldPath);
+                        string newXmp = xmpWritePath(task.newPath);
+                        if (!oldXmp.empty() && fs::exists(oldXmp)) {
+                            try { fs::rename(oldXmp, newXmp); } catch (...) {
+                                try { fs::copy_file(oldXmp, newXmp); fs::remove(oldXmp); } catch (...) {}
+                            }
                         }
                     }
                 }
@@ -746,6 +935,7 @@ private:
     string databasePath_;
     string jsonMigrationPath_;
     string libraryFolder_;
+    string smartPreviewDir_;
     bool serverReachable_ = false;
     bool serverChecked_ = false;
 
@@ -778,6 +968,74 @@ private:
     atomic<int> consolidateProgress_{0};
     thread consolidateThread_;
 
+    // Background SP generation
+    struct SPResult {
+        string photoId;
+        string spPath;
+    };
+
+    mutable mutex spMutex_;
+    vector<string> pendingSPGenerations_;
+    vector<SPResult> completedSPGenerations_;
+    atomic<bool> spThreadRunning_{false};
+    thread spThread_;
+
+    void startSPGenerationThread() {
+        // Called with spMutex_ already held
+        if (pendingSPGenerations_.empty() || spThreadRunning_) return;
+
+        spThreadRunning_ = true;
+        if (spThread_.joinable()) spThread_.join();
+
+        vector<string> ids = std::move(pendingSPGenerations_);
+        pendingSPGenerations_.clear();
+
+        spThread_ = thread([this, ids = std::move(ids)]() {
+            logNotice() << "[SmartPreview] Starting generation for " << ids.size() << " photos";
+            int done = 0;
+            for (const auto& id : ids) {
+                // Check photo still exists and has a local path
+                PhotoEntry* photo = nullptr;
+                string localPath;
+                string spPath;
+                {
+                    auto it = photos_.find(id);
+                    if (it == photos_.end()) continue;
+                    photo = &it->second;
+                    localPath = photo->localPath;
+                    spPath = smartPreviewPath(*photo);
+                }
+                if (localPath.empty() || !fs::exists(localPath) || spPath.empty()) continue;
+
+                // Already exists?
+                if (fs::exists(spPath)) {
+                    lock_guard<mutex> lock(spMutex_);
+                    completedSPGenerations_.push_back({id, spPath});
+                    done++;
+                    continue;
+                }
+
+                // Load RAW to F32
+                Pixels rawF32;
+                bool loaded = RawLoader::loadFloat(localPath, rawF32);
+                if (!loaded) {
+                    logWarning() << "[SmartPreview] Failed to load RAW: " << localPath;
+                    continue;
+                }
+
+                // Encode
+                if (SmartPreview::encode(rawF32, spPath)) {
+                    lock_guard<mutex> lock(spMutex_);
+                    completedSPGenerations_.push_back({id, spPath});
+                    done++;
+                }
+            }
+            logNotice() << "[SmartPreview] Generation done: " << done << "/" << ids.size();
+            spThreadRunning_ = false;
+        });
+        spThread_.detach();
+    }
+
     void startCopyThread() {
         lock_guard<mutex> lock(copyMutex_);
         if (pendingCopies_.empty() || copyThreadRunning_) return;
@@ -801,6 +1059,14 @@ private:
 
                 try {
                     fs::copy_file(task.srcPath, task.destPath);
+                    // Copy XMP sidecar if exists
+                    string srcXmp = findXmpSidecar(task.srcPath);
+                    if (!srcXmp.empty()) {
+                        string destXmp = xmpWritePath(task.destPath);
+                        if (!destXmp.empty() && !fs::exists(destXmp)) {
+                            try { fs::copy_file(srcXmp, destXmp); } catch (...) {}
+                        }
+                    }
                     logNotice() << "[PhotoProvider] Copied: "
                                 << fs::path(task.srcPath).filename().string();
                     lock_guard<mutex> lock(copyMutex_);
@@ -990,5 +1256,162 @@ private:
         }
 
         src = std::move(dst);
+    }
+
+    // --- XMP sidecar ---
+
+    // Find XMP sidecar path for a given file (Lightroom: .xmp, darktable: .ARW.xmp)
+    static string findXmpSidecar(const string& localPath) {
+        if (localPath.empty()) return "";
+        fs::path p(localPath);
+        // Lightroom style: replace extension with .xmp
+        fs::path lr = p;
+        lr.replace_extension(".xmp");
+        if (fs::exists(lr)) return lr.string();
+        // darktable style: append .xmp
+        fs::path dt = p;
+        dt += ".xmp";
+        if (fs::exists(dt)) return dt.string();
+        return "";
+    }
+
+    // Get sidecar write path (Lightroom style: replace extension)
+    static string xmpWritePath(const string& localPath) {
+        if (localPath.empty()) return "";
+        fs::path p(localPath);
+        p.replace_extension(".xmp");
+        return p.string();
+    }
+
+    // Extract metadata from XMP sidecar (called after extractExifMetadata)
+    static void extractXmpMetadata(const string& localPath, PhotoEntry& photo) {
+        string xmpPath = findXmpSidecar(localPath);
+        if (xmpPath.empty()) return;
+
+        try {
+            auto image = Exiv2::ImageFactory::open(xmpPath);
+            image->readMetadata();
+            auto& xmp = image->xmpData();
+
+            // Rating
+            auto rIt = xmp.findKey(Exiv2::XmpKey("Xmp.xmp.Rating"));
+            if (rIt != xmp.end()) {
+                photo.rating = clamp((int)rIt->toInt64(), 0, 5);
+            }
+
+            // Color label
+            auto lIt = xmp.findKey(Exiv2::XmpKey("Xmp.xmp.Label"));
+            if (lIt != xmp.end()) {
+                photo.colorLabel = lIt->toString();
+            }
+
+            // Description -> memo (lang-alt, take first value)
+            auto dIt = xmp.findKey(Exiv2::XmpKey("Xmp.dc.description"));
+            if (dIt != xmp.end()) {
+                photo.memo = dIt->toString();
+            }
+
+            // Subject -> tags (bag of strings -> JSON array)
+            nlohmann::json tagArr = nlohmann::json::array();
+            for (auto it = xmp.begin(); it != xmp.end(); ++it) {
+                if (it->key().substr(0, 15) == "Xmp.dc.subject") {
+                    string val = it->toString();
+                    if (!val.empty()) tagArr.push_back(val);
+                }
+            }
+            if (!tagArr.empty()) {
+                photo.tags = tagArr.dump();
+            }
+
+            // Use sidecar mtime as updatedAt
+            struct stat st;
+            if (stat(xmpPath.c_str(), &st) == 0) {
+                int64_t mtime = (int64_t)st.st_mtime * 1000;
+                if (photo.rating != 0) photo.ratingUpdatedAt = mtime;
+                if (!photo.colorLabel.empty()) photo.colorLabelUpdatedAt = mtime;
+                if (!photo.memo.empty()) photo.memoUpdatedAt = mtime;
+                if (!tagArr.empty()) photo.tagsUpdatedAt = mtime;
+            }
+
+            logNotice() << "[XMP] Read sidecar: " << xmpPath
+                        << " rating=" << photo.rating;
+        } catch (const exception& e) {
+            logWarning() << "[XMP] Failed to read: " << xmpPath << " - " << e.what();
+        }
+    }
+
+    // Write XMP sidecar (Lightroom-compatible)
+    static void writeXmpSidecar(const string& localPath, const PhotoEntry& photo) {
+        string xmpPath = xmpWritePath(localPath);
+        if (xmpPath.empty()) return;
+
+        try {
+            Exiv2::XmpData xmp;
+
+            // If sidecar already exists, read it first to preserve other fields
+            if (fs::exists(xmpPath)) {
+                auto existing = Exiv2::ImageFactory::open(xmpPath);
+                existing->readMetadata();
+                xmp = existing->xmpData();
+            }
+
+            // Rating
+            xmp["Xmp.xmp.Rating"] = photo.rating;
+
+            // Color label
+            if (!photo.colorLabel.empty()) {
+                xmp["Xmp.xmp.Label"] = photo.colorLabel;
+            } else {
+                auto it = xmp.findKey(Exiv2::XmpKey("Xmp.xmp.Label"));
+                if (it != xmp.end()) xmp.erase(it);
+            }
+
+            // Description (lang-alt)
+            if (!photo.memo.empty()) {
+                xmp["Xmp.dc.description"] = photo.memo;
+            } else {
+                auto it = xmp.findKey(Exiv2::XmpKey("Xmp.dc.description"));
+                if (it != xmp.end()) xmp.erase(it);
+            }
+
+            // Subject (bag)
+            // Remove existing subjects first
+            while (true) {
+                auto it = xmp.findKey(Exiv2::XmpKey("Xmp.dc.subject"));
+                if (it == xmp.end()) break;
+                xmp.erase(it);
+            }
+            if (!photo.tags.empty()) {
+                try {
+                    auto tagArr = nlohmann::json::parse(photo.tags);
+                    if (tagArr.is_array()) {
+                        for (const auto& t : tagArr) {
+                            Exiv2::Value::UniquePtr val = Exiv2::Value::create(Exiv2::xmpBag);
+                            val->read(t.get<string>());
+                            xmp.add(Exiv2::XmpKey("Xmp.dc.subject"), val.get());
+                        }
+                    }
+                } catch (...) {}
+            }
+
+            // Write XMP file
+            string xmpPacket;
+            Exiv2::XmpParser::encode(xmpPacket, xmp);
+
+            ofstream out(xmpPath);
+            if (out) {
+                out << xmpPacket;
+                logNotice() << "[XMP] Wrote sidecar: " << xmpPath;
+            }
+        } catch (const exception& e) {
+            logWarning() << "[XMP] Failed to write: " << xmpPath << " - " << e.what();
+        }
+    }
+
+    // Write XMP only if photo has a local path
+    static void writeXmpSidecarIfLocal(const PhotoEntry& photo) {
+        if (!photo.localPath.empty() && fs::exists(photo.localPath)) {
+            writeXmpSidecar(photo.localPath, photo);
+        }
     }
 };

@@ -1,5 +1,9 @@
 # TrussPhoto クラウドアーキテクチャ設計
 
+> **Note (2026-02):** このドキュメントの Phase 1（サーバ基盤、基本API、JsonStorage）は実装済み。
+> Phase 2 以降の計画（縮小DNG、編集パラメータ同期、書き出し等）は一部方針変更あり。
+> 今後の方向性は [VISION.md](VISION.md) を参照。
+
 ## 次にやること (2026-02-03)
 
 1. **TrussPhoto Server プロジェクト作成**

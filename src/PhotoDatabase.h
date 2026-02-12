@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 1;
+    static constexpr int SCHEMA_VERSION = 3;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -40,6 +40,7 @@ public:
                 "  date_time_original   TEXT NOT NULL DEFAULT '',"
                 "  local_path           TEXT NOT NULL DEFAULT '',"
                 "  local_thumbnail_path TEXT NOT NULL DEFAULT '',"
+                "  smart_preview_path   TEXT NOT NULL DEFAULT '',"
                 "  camera_make          TEXT NOT NULL DEFAULT '',"
                 "  camera               TEXT NOT NULL DEFAULT '',"
                 "  lens                 TEXT NOT NULL DEFAULT '',"
@@ -51,7 +52,17 @@ public:
                 "  focal_length         REAL NOT NULL DEFAULT 0,"
                 "  aperture             REAL NOT NULL DEFAULT 0,"
                 "  iso                  REAL NOT NULL DEFAULT 0,"
-                "  sync_state           INTEGER NOT NULL DEFAULT 0"
+                "  sync_state           INTEGER NOT NULL DEFAULT 0,"
+                "  rating               INTEGER NOT NULL DEFAULT 0,"
+                "  color_label          TEXT NOT NULL DEFAULT '',"
+                "  flag                 INTEGER NOT NULL DEFAULT 0,"
+                "  memo                 TEXT NOT NULL DEFAULT '',"
+                "  tags                 TEXT NOT NULL DEFAULT '',"
+                "  rating_updated_at    INTEGER NOT NULL DEFAULT 0,"
+                "  color_label_updated_at INTEGER NOT NULL DEFAULT 0,"
+                "  flag_updated_at      INTEGER NOT NULL DEFAULT 0,"
+                "  memo_updated_at      INTEGER NOT NULL DEFAULT 0,"
+                "  tags_updated_at      INTEGER NOT NULL DEFAULT 0"
                 ")"
             );
             if (!ok) return false;
@@ -62,7 +73,40 @@ public:
             db_.setSchemaVersion(SCHEMA_VERSION);
             logNotice() << "[PhotoDatabase] Schema v" << SCHEMA_VERSION << " created";
         }
-        // Future: version upgrades (ALTER TABLE etc.) go here
+
+        // v1 -> v2: add rich metadata columns
+        if (version == 1) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN rating INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN color_label TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN flag INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN memo TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN tags TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN rating_updated_at INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN color_label_updated_at INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN flag_updated_at INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN memo_updated_at INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN tags_updated_at INTEGER NOT NULL DEFAULT 0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v1->v2 failed: " << sql;
+                    return false;
+                }
+            }
+            db_.setSchemaVersion(SCHEMA_VERSION);
+            logNotice() << "[PhotoDatabase] Migrated v1 -> v" << SCHEMA_VERSION;
+        }
+
+        // v2 -> v3: add smart preview path
+        if (version == 2) {
+            if (!db_.exec("ALTER TABLE photos ADD COLUMN smart_preview_path TEXT NOT NULL DEFAULT ''")) {
+                logError() << "[PhotoDatabase] Migration v2->v3 failed";
+                return false;
+            }
+            db_.setSchemaVersion(SCHEMA_VERSION);
+            logNotice() << "[PhotoDatabase] Migrated v2 -> v" << SCHEMA_VERSION;
+        }
 
         return true;
     }
@@ -74,9 +118,13 @@ public:
         auto stmt = db_.prepare(
             "INSERT OR REPLACE INTO photos "
             "(id, filename, file_size, date_time_original, local_path, local_thumbnail_path, "
+            "smart_preview_path, "
             "camera_make, camera, lens, lens_make, width, height, is_raw, creative_style, "
-            "focal_length, aperture, iso, sync_state) "
-            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"
+            "focal_length, aperture, iso, sync_state, "
+            "rating, color_label, flag, memo, tags, "
+            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at) "
+            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)"
         );
         if (!stmt.valid()) return false;
         bindEntry(stmt, e);
@@ -124,6 +172,65 @@ public:
         return stmt.execute();
     }
 
+    bool updateRating(const string& id, int rating, int64_t updatedAt) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET rating=?1, rating_updated_at=?2 WHERE id=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, rating);
+        stmt.bind(2, updatedAt);
+        stmt.bind(3, id);
+        return stmt.execute();
+    }
+
+    bool updateColorLabel(const string& id, const string& label, int64_t updatedAt) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET color_label=?1, color_label_updated_at=?2 WHERE id=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, label);
+        stmt.bind(2, updatedAt);
+        stmt.bind(3, id);
+        return stmt.execute();
+    }
+
+    bool updateFlag(const string& id, int flag, int64_t updatedAt) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET flag=?1, flag_updated_at=?2 WHERE id=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, flag);
+        stmt.bind(2, updatedAt);
+        stmt.bind(3, id);
+        return stmt.execute();
+    }
+
+    bool updateMemo(const string& id, const string& memo, int64_t updatedAt) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET memo=?1, memo_updated_at=?2 WHERE id=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, memo);
+        stmt.bind(2, updatedAt);
+        stmt.bind(3, id);
+        return stmt.execute();
+    }
+
+    bool updateTags(const string& id, const string& tags, int64_t updatedAt) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET tags=?1, tags_updated_at=?2 WHERE id=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, tags);
+        stmt.bind(2, updatedAt);
+        stmt.bind(3, id);
+        return stmt.execute();
+    }
+
+    bool updateSmartPreviewPath(const string& id, const string& path) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET smart_preview_path=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, path);
+        stmt.bind(2, id);
+        return stmt.execute();
+    }
+
     bool deletePhoto(const string& id) {
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare("DELETE FROM photos WHERE id=?1");
@@ -148,9 +255,13 @@ public:
         auto stmt = db_.prepare(
             "INSERT OR REPLACE INTO photos "
             "(id, filename, file_size, date_time_original, local_path, local_thumbnail_path, "
+            "smart_preview_path, "
             "camera_make, camera, lens, lens_make, width, height, is_raw, creative_style, "
-            "focal_length, aperture, iso, sync_state) "
-            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)"
+            "focal_length, aperture, iso, sync_state, "
+            "rating, color_label, flag, memo, tags, "
+            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at) "
+            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)"
         );
         if (!stmt.valid()) {
             db_.rollback();
@@ -176,8 +287,11 @@ public:
         vector<PhotoEntry> result;
         auto stmt = db_.prepare(
             "SELECT id, filename, file_size, date_time_original, local_path, "
-            "local_thumbnail_path, camera_make, camera, lens, lens_make, "
-            "width, height, is_raw, creative_style, focal_length, aperture, iso, sync_state "
+            "local_thumbnail_path, smart_preview_path, "
+            "camera_make, camera, lens, lens_make, "
+            "width, height, is_raw, creative_style, focal_length, aperture, iso, sync_state, "
+            "rating, color_label, flag, memo, tags, "
+            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -190,18 +304,29 @@ public:
             e.dateTimeOriginal   = stmt.getText(3);
             e.localPath          = stmt.getText(4);
             e.localThumbnailPath = stmt.getText(5);
-            e.cameraMake         = stmt.getText(6);
-            e.camera             = stmt.getText(7);
-            e.lens               = stmt.getText(8);
-            e.lensMake           = stmt.getText(9);
-            e.width              = stmt.getInt(10);
-            e.height             = stmt.getInt(11);
-            e.isRaw              = stmt.getInt(12) != 0;
-            e.creativeStyle      = stmt.getText(13);
-            e.focalLength        = (float)stmt.getDouble(14);
-            e.aperture           = (float)stmt.getDouble(15);
-            e.iso                = (float)stmt.getDouble(16);
-            e.syncState          = static_cast<SyncState>(stmt.getInt(17));
+            e.localSmartPreviewPath = stmt.getText(6);
+            e.cameraMake         = stmt.getText(7);
+            e.camera             = stmt.getText(8);
+            e.lens               = stmt.getText(9);
+            e.lensMake           = stmt.getText(10);
+            e.width              = stmt.getInt(11);
+            e.height             = stmt.getInt(12);
+            e.isRaw              = stmt.getInt(13) != 0;
+            e.creativeStyle      = stmt.getText(14);
+            e.focalLength        = (float)stmt.getDouble(15);
+            e.aperture           = (float)stmt.getDouble(16);
+            e.iso                = (float)stmt.getDouble(17);
+            e.syncState          = static_cast<SyncState>(stmt.getInt(18));
+            e.rating             = stmt.getInt(19);
+            e.colorLabel         = stmt.getText(20);
+            e.flag               = stmt.getInt(21);
+            e.memo               = stmt.getText(22);
+            e.tags               = stmt.getText(23);
+            e.ratingUpdatedAt    = stmt.getInt64(24);
+            e.colorLabelUpdatedAt = stmt.getInt64(25);
+            e.flagUpdatedAt      = stmt.getInt64(26);
+            e.memoUpdatedAt      = stmt.getInt64(27);
+            e.tagsUpdatedAt      = stmt.getInt64(28);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -262,17 +387,28 @@ private:
         stmt.bind(4, e.dateTimeOriginal);
         stmt.bind(5, e.localPath);
         stmt.bind(6, e.localThumbnailPath);
-        stmt.bind(7, e.cameraMake);
-        stmt.bind(8, e.camera);
-        stmt.bind(9, e.lens);
-        stmt.bind(10, e.lensMake);
-        stmt.bind(11, e.width);
-        stmt.bind(12, e.height);
-        stmt.bind(13, e.isRaw ? 1 : 0);
-        stmt.bind(14, e.creativeStyle);
-        stmt.bind(15, (double)e.focalLength);
-        stmt.bind(16, (double)e.aperture);
-        stmt.bind(17, (double)e.iso);
-        stmt.bind(18, static_cast<int>(e.syncState));
+        stmt.bind(7, e.localSmartPreviewPath);
+        stmt.bind(8, e.cameraMake);
+        stmt.bind(9, e.camera);
+        stmt.bind(10, e.lens);
+        stmt.bind(11, e.lensMake);
+        stmt.bind(12, e.width);
+        stmt.bind(13, e.height);
+        stmt.bind(14, e.isRaw ? 1 : 0);
+        stmt.bind(15, e.creativeStyle);
+        stmt.bind(16, (double)e.focalLength);
+        stmt.bind(17, (double)e.aperture);
+        stmt.bind(18, (double)e.iso);
+        stmt.bind(19, static_cast<int>(e.syncState));
+        stmt.bind(20, e.rating);
+        stmt.bind(21, e.colorLabel);
+        stmt.bind(22, e.flag);
+        stmt.bind(23, e.memo);
+        stmt.bind(24, e.tags);
+        stmt.bind(25, e.ratingUpdatedAt);
+        stmt.bind(26, e.colorLabelUpdatedAt);
+        stmt.bind(27, e.flagUpdatedAt);
+        stmt.bind(28, e.memoUpdatedAt);
+        stmt.bind(29, e.tagsUpdatedAt);
     }
 };

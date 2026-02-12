@@ -1,5 +1,10 @@
 # TrussPhoto アーキテクチャ設計書
 
+> **Note (2026-02):** これは初期の全体設計構想。WebDAV連携、JPEG XLプレビュー、
+> Lightroom連携、tcxRivet 等の構想を含むが、実装の過程で方針が変更された部分がある。
+> 現在の方向性は [VISION.md](VISION.md) を参照。
+> 実装済みのクライアント・サーバアーキテクチャは [ARCHITECTURE_CLOUD.md](ARCHITECTURE_CLOUD.md) を参照。
+
 ## 概要
 
 TrussPhotoは、TrussCフレームワーク上に構築する写真管理・RAW現像アプリケーション。

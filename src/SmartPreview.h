@@ -1,0 +1,236 @@
+#pragma once
+
+// =============================================================================
+// SmartPreview.h - JPEG XL 16-bit lossless encode/decode for smart previews
+// =============================================================================
+
+#include <TrussC.h>
+#include <jxl/encode.h>
+#include <jxl/decode.h>
+#include <jxl/thread_parallel_runner.h>
+#include <jxl/resizable_parallel_runner.h>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <filesystem>
+#include <algorithm>
+#include <cmath>
+
+using namespace std;
+using namespace tc;
+namespace fs = std::filesystem;
+
+class SmartPreview {
+public:
+    static constexpr int MAX_EDGE = 2560;
+    static constexpr int BIT_DEPTH = 16;
+
+    // Encode F32 Pixels to 16-bit lossless JPEG XL (resized to MAX_EDGE)
+    static bool encode(const Pixels& srcF32, const string& outPath) {
+        if (!srcF32.isAllocated() || srcF32.getFormat() != PixelFormat::F32) {
+            logWarning() << "[SmartPreview] encode: need F32 pixels";
+            return false;
+        }
+
+        int srcW = srcF32.getWidth();
+        int srcH = srcF32.getHeight();
+        int srcCh = srcF32.getChannels();
+
+        // Calculate target size (fit within MAX_EDGE)
+        int dstW = srcW, dstH = srcH;
+        if (srcW > MAX_EDGE || srcH > MAX_EDGE) {
+            float scale = (float)MAX_EDGE / max(srcW, srcH);
+            dstW = (int)(srcW * scale);
+            dstH = (int)(srcH * scale);
+        }
+
+        // Resize F32 to target size and convert to uint16 RGB (3ch)
+        vector<uint16_t> u16buf(dstW * dstH * 3);
+        const float* src = srcF32.getDataF32();
+
+        for (int y = 0; y < dstH; y++) {
+            float srcY = (float)y * srcH / dstH;
+            int y0 = min((int)srcY, srcH - 1);
+            int y1 = min(y0 + 1, srcH - 1);
+            float fy = srcY - y0;
+
+            for (int x = 0; x < dstW; x++) {
+                float srcX = (float)x * srcW / dstW;
+                int x0 = min((int)srcX, srcW - 1);
+                int x1 = min(x0 + 1, srcW - 1);
+                float fx = srcX - x0;
+
+                int dstIdx = (y * dstW + x) * 3;
+                for (int c = 0; c < 3; c++) {
+                    // Bilinear interpolation
+                    float v00 = src[(y0 * srcW + x0) * srcCh + c];
+                    float v10 = src[(y0 * srcW + x1) * srcCh + c];
+                    float v01 = src[(y1 * srcW + x0) * srcCh + c];
+                    float v11 = src[(y1 * srcW + x1) * srcCh + c];
+                    float v = v00 * (1-fx) * (1-fy) + v10 * fx * (1-fy)
+                            + v01 * (1-fx) * fy + v11 * fx * fy;
+                    v = clamp(v, 0.0f, 1.0f);
+                    u16buf[dstIdx + c] = (uint16_t)(v * 65535.0f + 0.5f);
+                }
+            }
+        }
+
+        // Create parallel runner
+        void* runner = JxlResizableParallelRunnerCreate(nullptr);
+        JxlResizableParallelRunnerSetThreads(runner,
+            JxlResizableParallelRunnerSuggestThreads(dstW, dstH));
+
+        // Create encoder
+        JxlEncoder* enc = JxlEncoderCreate(nullptr);
+        if (!enc) {
+            JxlResizableParallelRunnerDestroy(runner);
+            return false;
+        }
+        JxlEncoderSetParallelRunner(enc, JxlResizableParallelRunner, runner);
+
+        // Basic info
+        JxlBasicInfo info;
+        JxlEncoderInitBasicInfo(&info);
+        info.xsize = dstW;
+        info.ysize = dstH;
+        info.bits_per_sample = BIT_DEPTH;
+        info.exponent_bits_per_sample = 0; // integer
+        info.num_color_channels = 3;
+        info.num_extra_channels = 0;
+        info.alpha_bits = 0;
+        info.uses_original_profile = JXL_TRUE;
+
+        if (JxlEncoderSetBasicInfo(enc, &info) != JXL_ENC_SUCCESS) {
+            logWarning() << "[SmartPreview] Failed to set basic info";
+            JxlEncoderDestroy(enc);
+            JxlResizableParallelRunnerDestroy(runner);
+            return false;
+        }
+
+        // Frame settings: lossless
+        JxlEncoderFrameSettings* settings = JxlEncoderFrameSettingsCreate(enc, nullptr);
+        JxlEncoderSetFrameLossless(settings, JXL_TRUE);
+        JxlEncoderSetFrameDistance(settings, 0);
+
+        // Pixel format: UINT16, 3 channels, native endian
+        JxlPixelFormat pixfmt = {3, JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN, 0};
+
+        if (JxlEncoderAddImageFrame(settings, &pixfmt,
+                u16buf.data(), u16buf.size() * sizeof(uint16_t)) != JXL_ENC_SUCCESS) {
+            logWarning() << "[SmartPreview] Failed to add image frame";
+            JxlEncoderDestroy(enc);
+            JxlResizableParallelRunnerDestroy(runner);
+            return false;
+        }
+
+        JxlEncoderCloseInput(enc);
+
+        // Process output
+        vector<uint8_t> compressed(1024 * 1024); // 1MB initial
+        uint8_t* next = compressed.data();
+        size_t avail = compressed.size();
+
+        JxlEncoderStatus status;
+        while ((status = JxlEncoderProcessOutput(enc, &next, &avail)) == JXL_ENC_NEED_MORE_OUTPUT) {
+            size_t used = next - compressed.data();
+            compressed.resize(compressed.size() * 2);
+            next = compressed.data() + used;
+            avail = compressed.size() - used;
+        }
+
+        JxlEncoderDestroy(enc);
+        JxlResizableParallelRunnerDestroy(runner);
+
+        if (status != JXL_ENC_SUCCESS) {
+            logWarning() << "[SmartPreview] Encode failed";
+            return false;
+        }
+
+        size_t finalSize = next - compressed.data();
+
+        // Write to file
+        fs::create_directories(fs::path(outPath).parent_path());
+        ofstream out(outPath, ios::binary);
+        if (!out) {
+            logWarning() << "[SmartPreview] Failed to write: " << outPath;
+            return false;
+        }
+        out.write(reinterpret_cast<const char*>(compressed.data()), finalSize);
+        out.close();
+
+        logNotice() << "[SmartPreview] Encoded " << dstW << "x" << dstH
+                    << " -> " << (finalSize / 1024) << "KB: " << outPath;
+        return true;
+    }
+
+    // Decode JPEG XL file to F32 Pixels (RGBA)
+    static bool decode(const string& jxlPath, Pixels& outF32) {
+        // Read file
+        ifstream file(jxlPath, ios::binary | ios::ate);
+        if (!file) return false;
+        auto fileSize = file.tellg();
+        file.seekg(0, ios::beg);
+        vector<uint8_t> data(fileSize);
+        file.read(reinterpret_cast<char*>(data.data()), fileSize);
+        file.close();
+
+        // Create parallel runner
+        void* runner = JxlResizableParallelRunnerCreate(nullptr);
+
+        // Create decoder
+        JxlDecoder* dec = JxlDecoderCreate(nullptr);
+        if (!dec) {
+            JxlResizableParallelRunnerDestroy(runner);
+            return false;
+        }
+        JxlDecoderSetParallelRunner(dec, JxlResizableParallelRunner, runner);
+
+        int events = JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE;
+        JxlDecoderSubscribeEvents(dec, events);
+        JxlDecoderSetInput(dec, data.data(), data.size());
+        JxlDecoderCloseInput(dec);
+
+        // Output format: FLOAT32, RGBA
+        JxlPixelFormat pixfmt = {4, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
+        JxlBasicInfo info = {};
+        vector<float> pixelBuf;
+
+        JxlDecoderStatus status;
+        while ((status = JxlDecoderProcessInput(dec)) != JXL_DEC_SUCCESS) {
+            if (status == JXL_DEC_BASIC_INFO) {
+                JxlDecoderGetBasicInfo(dec, &info);
+                JxlResizableParallelRunnerSetThreads(runner,
+                    JxlResizableParallelRunnerSuggestThreads(info.xsize, info.ysize));
+                pixelBuf.resize(info.xsize * info.ysize * 4);
+            } else if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+                JxlDecoderSetImageOutBuffer(dec, &pixfmt,
+                    pixelBuf.data(), pixelBuf.size() * sizeof(float));
+            } else if (status == JXL_DEC_FULL_IMAGE) {
+                // Image decoded, will get JXL_DEC_SUCCESS next
+            } else {
+                logWarning() << "[SmartPreview] Decode error: status=" << (int)status;
+                JxlDecoderDestroy(dec);
+                JxlResizableParallelRunnerDestroy(runner);
+                return false;
+            }
+        }
+
+        JxlDecoderDestroy(dec);
+        JxlResizableParallelRunnerDestroy(runner);
+
+        if (info.xsize == 0 || info.ysize == 0) return false;
+
+        // Copy to Pixels F32
+        outF32.allocate(info.xsize, info.ysize, 4, PixelFormat::F32);
+        float* dst = outF32.getDataF32();
+
+        if (info.num_color_channels == 3 && info.alpha_bits == 0) {
+            // Input was 3ch, output is 4ch RGBA — libjxl fills alpha=1.0 for us
+        }
+        memcpy(dst, pixelBuf.data(), pixelBuf.size() * sizeof(float));
+
+        logNotice() << "[SmartPreview] Decoded " << info.xsize << "x" << info.ysize
+                    << " from: " << jxlPath;
+        return true;
+    }
+};
