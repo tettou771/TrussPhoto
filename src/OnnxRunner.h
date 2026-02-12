@@ -68,6 +68,45 @@ public:
         }
     }
 
+    // Run inference with two int64 inputs → single float output
+    // (for text encoders: input_ids + attention_mask → embeddings)
+    vector<float> runInt64x2(const vector<int64_t>& input1,
+                             const vector<int64_t>& input2,
+                             const vector<int64_t>& shape,
+                             const char* name1 = "input_ids",
+                             const char* name2 = "attention_mask",
+                             const char* outName = "text_embeds") {
+        if (!session_) return {};
+
+        try {
+            auto memInfo = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+            Ort::Value tensor1 = Ort::Value::CreateTensor<int64_t>(
+                memInfo, const_cast<int64_t*>(input1.data()), input1.size(),
+                shape.data(), shape.size());
+            Ort::Value tensor2 = Ort::Value::CreateTensor<int64_t>(
+                memInfo, const_cast<int64_t*>(input2.data()), input2.size(),
+                shape.data(), shape.size());
+
+            const char* inputNames[] = {name1, name2};
+            const char* outputNames[] = {outName};
+            Ort::Value inputs[] = {std::move(tensor1), std::move(tensor2)};
+
+            auto outputs = session_->Run(
+                Ort::RunOptions{nullptr},
+                inputNames, inputs, 2,
+                outputNames, 1);
+
+            float* outData = outputs[0].GetTensorMutableData<float>();
+            auto outInfo = outputs[0].GetTensorTypeAndShapeInfo();
+            size_t outSize = outInfo.GetElementCount();
+            return vector<float>(outData, outData + outSize);
+        } catch (const Ort::Exception& e) {
+            logError() << "[OnnxRunner] Int64 inference failed: " << e.what();
+            return {};
+        }
+    }
+
     // Query input/output names (for debugging)
     void printModelInfo() {
         if (!session_) return;

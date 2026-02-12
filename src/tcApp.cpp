@@ -95,11 +95,28 @@ void tcApp::setup() {
     addChild(searchBar_);
 
     searchBar_->onSearch = [this](const string& query) {
-        if (grid_) {
+        if (!grid_) return;
+
+        if (query.empty()) {
+            // Clear all filters
+            grid_->clearClipResults();
+            grid_->setTextFilter("");
+            grid_->populate(provider_);
+        } else if (provider_.isTextEncoderReady()) {
+            // CLIP semantic search
+            auto results = provider_.searchByText(query);
+            grid_->clearClipResults();
+            grid_->setTextFilter("");
+            grid_->setClipResults(results);
+            grid_->populate(provider_);
+            logNotice() << "[Search] query=\"" << query << "\" filter set, repopulating grid";
+        } else {
+            // Fallback to text field matching
+            grid_->clearClipResults();
             grid_->setTextFilter(query);
             grid_->populate(provider_);
-            redraw();
         }
+        redraw();
     };
 
     // 5b. Create folder tree sidebar
@@ -404,9 +421,10 @@ void tcApp::update() {
     // Process embedding generation results
     provider_.processEmbeddingResults();
 
-    // When embedder becomes ready, queue missing embeddings
+    // When embedder becomes ready, load cache and queue missing embeddings
     if (provider_.isEmbedderReady() && !embeddingsQueued_) {
         embeddingsQueued_ = true;
+        provider_.loadEmbeddingCache();
         int queued = provider_.queueAllMissingEmbeddings();
         if (queued > 0) {
             logNotice() << "[CLIP] Queued " << queued << " photos for embedding";
@@ -592,6 +610,8 @@ void tcApp::draw() {
 }
 
 void tcApp::keyPressed(int key) {
+    redraw(3);
+
     if (viewMode_ == ViewMode::Single) {
         if (key == SAPP_KEYCODE_ESCAPE) {
             exitFullImage();
@@ -683,6 +703,7 @@ void tcApp::keyPressed(int key) {
         } else if (key == SAPP_KEYCODE_ESCAPE) {
             if (searchBar_ && !searchBar_->getQuery().empty()) {
                 searchBar_->clear();
+                grid_->clearClipResults();
                 grid_->populate(provider_);
             } else if (grid_ && grid_->hasSelection()) {
                 grid_->clearSelection();

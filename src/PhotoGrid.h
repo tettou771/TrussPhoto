@@ -87,6 +87,13 @@ public:
 
     const string& getTextFilter() const { return textFilter_; }
 
+    // Set CLIP search results (sorted by relevance). Empty = show all.
+    void setClipResults(const vector<PhotoProvider::SearchResult>& results) {
+        clipResults_ = results;
+    }
+
+    void clearClipResults() { clipResults_.clear(); }
+
     // Populate grid from PhotoProvider
     void populate(PhotoProvider& provider) {
         provider_ = &provider;
@@ -101,8 +108,16 @@ public:
         items_.clear();
         photoIds_.clear();
 
-        // Get sorted photo IDs
-        auto ids = provider.getSortedIds();
+        // Build ordered ID list (CLIP results take priority if available)
+        vector<string> ids;
+        if (!clipResults_.empty()) {
+            // Use CLIP search order (already sorted by relevance)
+            for (const auto& r : clipResults_) {
+                ids.push_back(r.photoId);
+            }
+        } else {
+            ids = provider.getSortedIds();
+        }
 
         for (size_t i = 0; i < ids.size(); i++) {
             auto* photo = provider.getPhoto(ids[i]);
@@ -114,8 +129,9 @@ public:
                 if (dir.substr(0, filterPath_.size()) != filterPath_) continue;
             }
 
-            // Filter by text query
-            if (!textFilter_.empty() && !matchesTextFilter(*photo, textFilter_)) continue;
+            // Filter by text query (only when no CLIP results)
+            if (clipResults_.empty() && !textFilter_.empty()
+                && !matchesTextFilter(*photo, textFilter_)) continue;
 
             int gridIndex = (int)photoIds_.size();
             photoIds_.push_back(ids[i]);
@@ -280,6 +296,7 @@ private:
     vector<string> photoIds_;
     string filterPath_;
     string textFilter_;
+    vector<PhotoProvider::SearchResult> clipResults_;
 
     AsyncImageLoader loader_;
     Font labelFont_;

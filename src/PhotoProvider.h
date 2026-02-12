@@ -27,6 +27,7 @@ namespace fs = std::filesystem;
 #include "PhotoDatabase.h"
 #include "SmartPreview.h"
 #include "ClipEmbedder.h"
+#include "ClipTextEncoder.h"
 
 // Photo provider - manages local + server photos
 class PhotoProvider {
@@ -858,9 +859,10 @@ public:
 
     // --- CLIP Embedding ---
 
-    // Initialize CLIP embedder in background (downloads model if needed)
+    // Initialize CLIP embedder + text encoder in background
     void initEmbedder(const string& modelsDir) {
         clipEmbedder_.loadAsync(modelsDir);
+        textEncoder_.loadAsync(modelsDir);
     }
 
     bool isEmbedderReady() const { return clipEmbedder_.isReady(); }
@@ -868,6 +870,76 @@ public:
     bool isEmbedderDownloading() const { return clipEmbedder_.isDownloading(); }
     float getEmbedderDownloadProgress() { return clipEmbedder_.getDownloadProgress(); }
     const string& getEmbedderStatus() const { return clipEmbedder_.getStatusText(); }
+    bool isTextEncoderReady() const { return textEncoder_.isReady(); }
+
+    // Load all image embeddings from DB into memory cache
+    void loadEmbeddingCache() {
+        auto ids = getSortedIds();
+        int loaded = 0;
+        for (const auto& id : ids) {
+            auto vec = db_.getEmbedding(id, ClipEmbedder::MODEL_NAME);
+            if (!vec.empty()) {
+                embeddingCache_[id] = std::move(vec);
+                loaded++;
+            }
+        }
+        logNotice() << "[EmbeddingCache] Loaded " << loaded << " embeddings";
+    }
+
+    // Search result struct
+    struct SearchResult {
+        string photoId;
+        float score;  // cosine similarity
+    };
+
+    // Semantic search: text query → sorted results (descending by similarity)
+    // Uses dynamic threshold: keeps items within 15% of top score,
+    // but if spread is tiny (< 0.03) returns all sorted by relevance.
+    vector<SearchResult> searchByText(const string& query) {
+        if (!textEncoder_.isReady()) return {};
+
+        // Encode text query
+        auto textEmb = textEncoder_.encode(query);
+        if (textEmb.empty()) return {};
+
+        // Compare with all cached image embeddings
+        vector<SearchResult> all;
+        for (const auto& [id, imgEmb] : embeddingCache_) {
+            float score = cosineSimilarity(textEmb, imgEmb);
+            all.push_back({id, score});
+        }
+
+        if (all.empty()) return {};
+
+        // Sort by score descending
+        sort(all.begin(), all.end(),
+             [](const SearchResult& a, const SearchResult& b) {
+                 return a.score > b.score;
+             });
+
+        float topScore = all.front().score;
+        float botScore = all.back().score;
+        float spread = topScore - botScore;
+
+        // Dynamic filtering: if clear separation exists, cut low scorers
+        vector<SearchResult> results;
+        if (spread > 0.03f && topScore > 0.2f) {
+            // Keep items within 85% of top score
+            float cutoff = topScore * 0.85f;
+            for (const auto& r : all) {
+                if (r.score >= cutoff) results.push_back(r);
+            }
+        } else {
+            // Scores too clustered — return all, sorted by relevance
+            results = std::move(all);
+        }
+
+        logNotice() << "[Search] query=\"" << query
+                    << "\" results: " << results.size()
+                    << "/" << embeddingCache_.size()
+                    << " top=" << topScore << " spread=" << spread;
+        return results;
+    }
 
     // Queue all photos that don't have embeddings yet
     int queueAllMissingEmbeddings() {
@@ -902,6 +974,8 @@ public:
         for (const auto& result : completedEmbeddings_) {
             db_.insertEmbedding(result.photoId, ClipEmbedder::MODEL_NAME,
                                 "image", result.embedding);
+            // Update in-memory cache
+            embeddingCache_[result.photoId] = result.embedding;
         }
         completedEmbeddings_.clear();
         return count;
@@ -1169,6 +1243,16 @@ private:
 
     // CLIP embedding
     ClipEmbedder clipEmbedder_;
+    ClipTextEncoder textEncoder_;
+    unordered_map<string, vector<float>> embeddingCache_;
+
+    static float cosineSimilarity(const vector<float>& a, const vector<float>& b) {
+        if (a.size() != b.size() || a.empty()) return 0;
+        float dot = 0;
+        for (size_t i = 0; i < a.size(); i++) dot += a[i] * b[i];
+        // Both vectors are already L2-normalized, so dot product = cosine similarity
+        return dot;
+    }
 
     struct EmbeddingResult {
         string photoId;
