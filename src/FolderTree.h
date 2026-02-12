@@ -33,6 +33,10 @@ public:
         enableEvents();
     }
 
+    void setup() override {
+        setClipping(true);
+    }
+
     void draw() override {
         float w = getWidth();
 
@@ -109,6 +113,16 @@ protected:
     }
 };
 
+// ScrollContainer without default background/border (parent draws its own)
+#ifndef PLAIN_SCROLL_CONTAINER_DEFINED
+#define PLAIN_SCROLL_CONTAINER_DEFINED
+class PlainScrollContainer : public ScrollContainer {
+public:
+    using Ptr = shared_ptr<PlainScrollContainer>;
+    void draw() override {}
+};
+#endif
+
 // =============================================================================
 // FolderTree - Scrollable folder tree sidebar
 // =============================================================================
@@ -120,14 +134,18 @@ public:
     function<void(const string& folderPath)> onFolderSelected;
 
     FolderTree() {
-        scrollContainer_ = make_shared<ScrollContainer>();
-        addChild(scrollContainer_);
-
+        // Don't addChild(scrollContainer_) to this here —
+        // weak_from_this() returns empty in the constructor.
+        scrollContainer_ = make_shared<PlainScrollContainer>();
         content_ = make_shared<RectNode>();
         scrollContainer_->setContent(content_);
 
         scrollBar_ = make_shared<ScrollBar>(scrollContainer_.get(), ScrollBar::Vertical);
         scrollContainer_->addChild(scrollBar_);
+    }
+
+    void setup() override {
+        addChild(scrollContainer_);
     }
 
     void buildTree(const vector<PhotoProvider::FolderInfo>& folders, const string& rootPath) {

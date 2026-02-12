@@ -1,5 +1,5 @@
 # TrussC addons - one addon per line
-tcxCurl
 tcxCrow
+tcxCurl
 tcxLibRaw
 tcxLut

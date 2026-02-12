@@ -1088,6 +1088,7 @@ void tcApp::updateLayout() {
         folderTree_->setActive(true);
         folderTree_->setRect(0, 0, sidebarWidth_, h);
         if (grid_) grid_->setRect(sidebarWidth_, 0, w - sidebarWidth_, h);
+        
     } else {
         if (folderTree_) folderTree_->setActive(false);
         if (grid_) grid_->setRect(0, 0, w, h);

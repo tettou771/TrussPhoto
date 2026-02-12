@@ -11,6 +11,16 @@
 using namespace std;
 using namespace tc;
 
+// ScrollContainer without default background/border (parent draws its own)
+#ifndef PLAIN_SCROLL_CONTAINER_DEFINED
+#define PLAIN_SCROLL_CONTAINER_DEFINED
+class PlainScrollContainer : public ScrollContainer {
+public:
+    using Ptr = shared_ptr<PlainScrollContainer>;
+    void draw() override {}
+};
+#endif
+
 // PhotoGrid - displays photos in a scrollable grid
 class PhotoGrid : public RectNode {
 public:
@@ -21,20 +31,22 @@ public:
     function<void(vector<string>)> onDeleteRequest;  // delete selected photos
 
     PhotoGrid() {
-        // Create scroll container
-        scrollContainer_ = make_shared<ScrollContainer>();
-        addChild(scrollContainer_);
-
-        // Create content node for grid items
+        // Create child nodes — but don't addChild(scrollContainer_) to this here,
+        // because weak_from_this() returns empty in the constructor.
+        scrollContainer_ = make_shared<PlainScrollContainer>();
         content_ = make_shared<RectNode>();
-        scrollContainer_->setContent(content_);
+        scrollContainer_->setContent(content_);  // OK: scrollContainer_ is already a shared_ptr
 
-        // Create scroll bar
         scrollBar_ = make_shared<ScrollBar>(scrollContainer_.get(), ScrollBar::Vertical);
-        scrollContainer_->addChild(scrollBar_);
+        scrollContainer_->addChild(scrollBar_);  // OK: same reason
 
         // Start async loader
         loader_.start();
+    }
+
+    void setup() override {
+        // addChild here where weak_from_this() works
+        addChild(scrollContainer_);
     }
 
     ~PhotoGrid() {
