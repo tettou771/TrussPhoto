@@ -29,16 +29,47 @@ public:
     }
 
     // Set center photo and compute layout
-    void setCenter(const string& centerId, PhotoProvider& provider) {
+    void setCenter(const string& centerId, PhotoProvider& provider,
+                   bool pushToHistory = true) {
+        // --- Snapshot old layout before clearing ---
+        unordered_map<string, AnimSnapshot> oldSnapshots;
+        bool hasOldLayout = !centerId_.empty();
+        if (hasOldLayout) {
+            // Center
+            oldSnapshots[centerItem_.photoId] = {centerItem_.position, centerItem_.displaySize};
+            // Timeline
+            for (const auto& item : timelineItems_) {
+                oldSnapshots[item.photoId] = {item.position, item.displaySize};
+            }
+            // Related
+            for (const auto& item : relatedItems_) {
+                oldSnapshots[item.photoId] = {item.position, item.displaySize};
+            }
+            // History items
+            for (int i = 0; i < (int)history_.size(); i++) {
+                Vec2 hPos = {0, HISTORY_START_Y + i * HISTORY_SPACING};
+                // Reverse order: newest at top (index = history_.size()-1-i from bottom)
+                int drawIdx = (int)history_.size() - 1 - i;
+                hPos.y = HISTORY_START_Y + drawIdx * HISTORY_SPACING;
+                oldSnapshots[history_[i]] = {hPos, HISTORY_SIZE};
+            }
+
+            // Push old center to history
+            if (pushToHistory && !centerId_.empty()) {
+                history_.push_back(centerId_);
+                if ((int)history_.size() > MAX_HISTORY) {
+                    history_.erase(history_.begin());
+                }
+            }
+        }
+
+        // --- Clear and recompute layout ---
         centerId_ = centerId;
         provider_ = &provider;
         timelineItems_.clear();
         relatedItems_.clear();
         centerItem_ = {};
-        textures_.clear();
         pendingLoads_.clear();
-        panOffset_ = {0, 0};
-        zoom_ = 1.0f;
 
         auto* centerEntry = provider.getPhoto(centerId);
         if (!centerEntry) return;
@@ -61,12 +92,59 @@ public:
         // Layout related photos
         layoutRelated();
 
-        // Queue thumbnail loads
-        queueAllThumbnails();
+        // --- Smart texture management: keep textures still in use ---
+        unordered_set<string> neededIds;
+        neededIds.insert(centerItem_.photoId);
+        for (const auto& item : timelineItems_) neededIds.insert(item.photoId);
+        for (const auto& item : relatedItems_) neededIds.insert(item.photoId);
+        for (const auto& hid : history_) neededIds.insert(hid);
+
+        // Remove textures no longer needed
+        for (auto it = textures_.begin(); it != textures_.end(); ) {
+            if (neededIds.count(it->first) == 0) {
+                it = textures_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        // Queue loads only for items without textures
+        queueMissingThumbnails(neededIds);
+
+        // --- Set up morphing animation ---
+        if (hasOldLayout) {
+            animOldSnapshots_.clear();
+            // For each item in the new layout, check if it existed in old layout
+            auto checkAndAdd = [&](const string& id, Vec2 newPos, float newSize) {
+                auto it = oldSnapshots.find(id);
+                if (it != oldSnapshots.end()) {
+                    animOldSnapshots_[id] = it->second;
+                }
+            };
+            checkAndAdd(centerItem_.photoId, centerItem_.position, centerItem_.displaySize);
+            for (const auto& item : timelineItems_) {
+                checkAndAdd(item.photoId, item.position, item.displaySize);
+            }
+            for (const auto& item : relatedItems_) {
+                checkAndAdd(item.photoId, item.position, item.displaySize);
+            }
+            // History items
+            for (int i = 0; i < (int)history_.size(); i++) {
+                int drawIdx = (int)history_.size() - 1 - i;
+                Vec2 hPos = {0, HISTORY_START_Y + drawIdx * HISTORY_SPACING};
+                checkAndAdd(history_[i], hPos, HISTORY_SIZE);
+            }
+
+            // Start animation
+            animProgress_.from(0).to(1).duration(0.4f).ease(EaseType::Cubic, EaseMode::Out).start();
+            lastAnimTime_ = chrono::steady_clock::now();
+            animating_ = true;
+        }
 
         logNotice() << "[RelatedView] center=" << centerId
                     << " timeline=" << timelineItems_.size()
-                    << " related=" << relatedItems_.size();
+                    << " related=" << relatedItems_.size()
+                    << " history=" << history_.size();
     }
 
     void shutdown() {
@@ -74,6 +152,9 @@ public:
         pendingLoads_.clear();
         timelineItems_.clear();
         relatedItems_.clear();
+        history_.clear();
+        animOldSnapshots_.clear();
+        animating_ = false;
         if (loadThread_.joinable()) loadThread_.join();
     }
 
@@ -98,6 +179,19 @@ public:
         if (!pendingLoads_.empty() && !loadThreadRunning_) {
             startLoadThread();
         }
+
+        // Morphing animation update
+        if (animating_) {
+            auto now = chrono::steady_clock::now();
+            float dt = chrono::duration<float>(now - lastAnimTime_).count();
+            lastAnimTime_ = now;
+            animProgress_.update(dt);
+            if (onRedraw) onRedraw();
+            if (animProgress_.isComplete()) {
+                animating_ = false;
+                animOldSnapshots_.clear();
+            }
+        }
     }
 
     void draw() override {
@@ -111,10 +205,14 @@ public:
 
         setClipping(true);
 
+        // Animated center position
+        Vec2 centerAnimPos = getAnimatedPosition(centerItem_.photoId, centerItem_.position);
+        Vec2 centerScreen = worldToScreen(centerAnimPos);
+
         // Draw connection lines: center → related items
-        Vec2 centerScreen = worldToScreen({0, 0});
         for (const auto& item : relatedItems_) {
-            Vec2 to = worldToScreen(item.position);
+            Vec2 animPos = getAnimatedPosition(item.photoId, item.position);
+            Vec2 to = worldToScreen(animPos);
             float alpha = 0.15f + item.score * 0.2f;
             setColor(0.4f, 0.4f, 0.5f, alpha);
             noFill();
@@ -123,21 +221,48 @@ public:
 
         // Draw related items (far/low score first, near/high score on top)
         for (int i = (int)relatedItems_.size() - 1; i >= 0; i--) {
-            drawItem(relatedItems_[i], Color(0.25f, 0.25f, 0.3f));
+            auto& item = relatedItems_[i];
+            Vec2 animPos = getAnimatedPosition(item.photoId, item.position);
+            float animSize = getAnimatedSize(item.photoId, item.displaySize);
+            drawItemAt(item.photoId, worldToScreen(animPos), animSize * zoom_,
+                       Color(0.25f, 0.25f, 0.3f));
         }
 
         // Draw timeline items
         for (auto& item : timelineItems_) {
-            drawItem(item, Color(0.35f, 0.35f, 0.4f));
+            Vec2 animPos = getAnimatedPosition(item.photoId, item.position);
+            float animSize = getAnimatedSize(item.photoId, item.displaySize);
+            drawItemAt(item.photoId, worldToScreen(animPos), animSize * zoom_,
+                       Color(0.35f, 0.35f, 0.4f));
+        }
+
+        // Draw history chain (below center)
+        drawHistoryChain();
+
+        // Draw center → history connection line
+        if (!history_.empty()) {
+            int topIdx = (int)history_.size() - 1;
+            Vec2 hWorldPos = {0, HISTORY_START_Y};
+            Vec2 hAnimPos = getAnimatedPosition(history_[topIdx], hWorldPos);
+            Vec2 hScreen = worldToScreen(hAnimPos);
+            setColor(0.3f, 0.4f, 0.55f, 0.4f);
+            noFill();
+            drawLine(centerScreen.x, centerScreen.y, hScreen.x, hScreen.y);
         }
 
         // Draw center item (topmost)
-        drawItem(centerItem_, Color(0.3f, 0.5f, 0.7f));
+        {
+            float animSize = getAnimatedSize(centerItem_.photoId, centerItem_.displaySize);
+            drawItemAt(centerItem_.photoId, centerScreen, animSize * zoom_,
+                       Color(0.3f, 0.5f, 0.7f));
+        }
 
         // Score labels for related items
         for (const auto& item : relatedItems_) {
-            Vec2 sp = worldToScreen(item.position);
-            float sz = item.displaySize * zoom_;
+            Vec2 animPos = getAnimatedPosition(item.photoId, item.position);
+            float animSize = getAnimatedSize(item.photoId, item.displaySize);
+            Vec2 sp = worldToScreen(animPos);
+            float sz = animSize * zoom_;
             setColor(0.5f, 0.5f, 0.55f);
             string label = format("{:.0f}%", item.score * 100);
             fontSmall_.drawString(label, sp.x, sp.y + sz / 2 + 12,
@@ -149,14 +274,19 @@ public:
         // View mode label
         setColor(0.0f, 0.0f, 0.0f, 0.5f);
         fill();
-        drawRect(8, h - 28, 120, 20);
+        drawRect(8, h - 28, 160, 20);
         setColor(0.7f, 0.7f, 0.75f);
-        fontSmall_.drawString(format("Related  Zoom: {:.1f}", zoom_), 14, h - 18,
+        string modeLabel = format("Related  Zoom: {:.1f}", zoom_);
+        if (!history_.empty()) modeLabel += format("  History: {}", history_.size());
+        fontSmall_.drawString(modeLabel, 14, h - 18,
             Direction::Left, Direction::Center);
     }
 
     bool onMousePress(Vec2 pos, int button) override {
         if (button != 0) return false;
+
+        // Ignore clicks during animation
+        if (animating_) return true;
 
         // Check for click on any item
         string hitId = hitTest(pos);
@@ -167,13 +297,30 @@ public:
             lastClickTime_ = now;
             lastClickId_ = hitId;
 
+            // Handle history item clicks
+            if (hitId.starts_with("history:")) {
+                int histIdx = stoi(hitId.substr(8));
+                if (histIdx >= 0 && histIdx < (int)history_.size()) {
+                    string targetId = history_[histIdx];
+                    if (isDouble) {
+                        // Double-click history → undo to that point
+                        history_.resize(histIdx);  // truncate: remove this and newer
+                        setCenter(targetId, *provider_, false);  // don't push to history
+                        if (onRedraw) onRedraw();
+                    } else if (onPhotoClick) {
+                        onPhotoClick(targetId);
+                    }
+                }
+                return true;
+            }
+
             if (isDouble) {
                 if (hitId == centerId_) {
                     // Double-click center → open in single view
                     if (onCenterDoubleClick) onCenterDoubleClick(hitId);
                 } else {
                     // Double-click other → re-center on that photo
-                    if (onPhotoClick) onPhotoClick(hitId);  // update metadata panel
+                    if (onPhotoClick) onPhotoClick(hitId);
                     setCenter(hitId, *provider_);
                     if (onRedraw) onRedraw();
                 }
@@ -229,6 +376,18 @@ private:
     static constexpr int MAX_RELATED = 20;
     static constexpr int COLLISION_ITERATIONS = 8;
 
+    // History chain constants
+    static constexpr float HISTORY_SIZE = 80.0f;
+    static constexpr float HISTORY_SPACING = 120.0f;
+    static constexpr float HISTORY_START_Y = 200.0f;
+    static constexpr int MAX_HISTORY = 10;
+
+    // Animation snapshot for morphing transitions
+    struct AnimSnapshot {
+        Vec2 position;
+        float displaySize;
+    };
+
     struct RelatedItem {
         string photoId;
         float score;
@@ -270,9 +429,36 @@ private:
     chrono::steady_clock::time_point lastClickTime_;
     string lastClickId_;
 
+    // Morphing animation
+    Tween<float> animProgress_;
+    unordered_map<string, AnimSnapshot> animOldSnapshots_;
+    bool animating_ = false;
+    chrono::steady_clock::time_point lastAnimTime_;
+
+    // History chain (oldest first)
+    vector<string> history_;
+
     // Fonts
     Font font_;
     Font fontSmall_;
+
+    // --- Animation interpolation ---
+
+    Vec2 getAnimatedPosition(const string& photoId, Vec2 targetPos) const {
+        if (!animating_) return targetPos;
+        auto it = animOldSnapshots_.find(photoId);
+        if (it == animOldSnapshots_.end()) return targetPos;
+        float t = animProgress_.getValue();
+        return it->second.position.lerp(targetPos, t);
+    }
+
+    float getAnimatedSize(const string& photoId, float targetSize) const {
+        if (!animating_) return targetSize;
+        auto it = animOldSnapshots_.find(photoId);
+        if (it == animOldSnapshots_.end()) return targetSize;
+        float t = animProgress_.getValue();
+        return it->second.displaySize + (targetSize - it->second.displaySize) * t;
+    }
 
     // --- Coordinate transforms ---
 
@@ -291,8 +477,9 @@ private:
     string hitTest(Vec2 screenPos) const {
         // Check center first (topmost)
         {
-            Vec2 sp = worldToScreen(centerItem_.position);
-            float sz = centerItem_.displaySize * zoom_;
+            Vec2 animPos = getAnimatedPosition(centerItem_.photoId, centerItem_.position);
+            Vec2 sp = worldToScreen(animPos);
+            float sz = getAnimatedSize(centerItem_.photoId, centerItem_.displaySize) * zoom_;
             if (abs(screenPos.x - sp.x) < sz / 2 && abs(screenPos.y - sp.y) < sz / 2) {
                 return centerItem_.photoId;
             }
@@ -300,8 +487,9 @@ private:
 
         // Timeline
         for (const auto& item : timelineItems_) {
-            Vec2 sp = worldToScreen(item.position);
-            float sz = item.displaySize * zoom_;
+            Vec2 animPos = getAnimatedPosition(item.photoId, item.position);
+            Vec2 sp = worldToScreen(animPos);
+            float sz = getAnimatedSize(item.photoId, item.displaySize) * zoom_;
             if (abs(screenPos.x - sp.x) < sz / 2 && abs(screenPos.y - sp.y) < sz / 2) {
                 return item.photoId;
             }
@@ -309,10 +497,23 @@ private:
 
         // Related (front to back = high score first)
         for (const auto& item : relatedItems_) {
-            Vec2 sp = worldToScreen(item.position);
-            float sz = item.displaySize * zoom_;
+            Vec2 animPos = getAnimatedPosition(item.photoId, item.position);
+            Vec2 sp = worldToScreen(animPos);
+            float sz = getAnimatedSize(item.photoId, item.displaySize) * zoom_;
             if (abs(screenPos.x - sp.x) < sz / 2 && abs(screenPos.y - sp.y) < sz / 2) {
                 return item.photoId;
+            }
+        }
+
+        // History items
+        for (int i = 0; i < (int)history_.size(); i++) {
+            int drawIdx = (int)history_.size() - 1 - i;
+            Vec2 worldPos = {0, HISTORY_START_Y + drawIdx * HISTORY_SPACING};
+            Vec2 animPos = getAnimatedPosition(history_[i], worldPos);
+            Vec2 sp = worldToScreen(animPos);
+            float sz = getAnimatedSize(history_[i], HISTORY_SIZE) * zoom_;
+            if (abs(screenPos.x - sp.x) < sz / 2 && abs(screenPos.y - sp.y) < sz / 2) {
+                return "history:" + to_string(i);
             }
         }
 
@@ -321,36 +522,75 @@ private:
 
     // --- Drawing ---
 
-    void drawItem(const RelatedItem& item, Color borderColor) {
-        Vec2 sp = worldToScreen(item.position);
-        float sz = item.displaySize * zoom_;
-        float halfSz = sz / 2;
+    // Draw a photo item at a specific screen position and size
+    void drawItemAt(const string& photoId, Vec2 screenPos, float screenSize,
+                    Color borderColor) {
+        float halfSz = screenSize / 2;
 
         // Look up texture
-        auto texIt = textures_.find(item.photoId);
+        auto texIt = textures_.find(photoId);
         Texture* tex = (texIt != textures_.end() && texIt->second.isAllocated())
             ? &texIt->second : nullptr;
 
         // Border
         setColor(borderColor);
         fill();
-        drawRect(sp.x - halfSz - 2, sp.y - halfSz - 2, sz + 4, sz + 4);
+        drawRect(screenPos.x - halfSz - 2, screenPos.y - halfSz - 2,
+                 screenSize + 4, screenSize + 4);
 
         if (tex) {
             // Fit image into square area preserving aspect ratio
             float imgW = tex->getWidth();
             float imgH = tex->getHeight();
-            float fitScale = min(sz / imgW, sz / imgH);
+            float fitScale = min(screenSize / imgW, screenSize / imgH);
             float drawW = imgW * fitScale;
             float drawH = imgH * fitScale;
 
             setColor(1.0f, 1.0f, 1.0f);
-            tex->draw(sp.x - drawW / 2, sp.y - drawH / 2, drawW, drawH);
+            tex->draw(screenPos.x - drawW / 2, screenPos.y - drawH / 2, drawW, drawH);
         } else {
             // Placeholder
             setColor(0.15f, 0.15f, 0.18f);
             fill();
-            drawRect(sp.x - halfSz, sp.y - halfSz, sz, sz);
+            drawRect(screenPos.x - halfSz, screenPos.y - halfSz, screenSize, screenSize);
+        }
+    }
+
+    // Draw history chain below center
+    void drawHistoryChain() {
+        if (history_.empty()) return;
+
+        for (int i = 0; i < (int)history_.size(); i++) {
+            // Draw newest at top (closest to center), oldest at bottom
+            int drawIdx = (int)history_.size() - 1 - i;
+            Vec2 worldPos = {0, HISTORY_START_Y + drawIdx * HISTORY_SPACING};
+            Vec2 animPos = getAnimatedPosition(history_[i], worldPos);
+            Vec2 screenPos = worldToScreen(animPos);
+            float animSize = getAnimatedSize(history_[i], HISTORY_SIZE);
+            float sz = animSize * zoom_;
+
+            // Connection line to next history item
+            if (drawIdx > 0) {
+                int nextI = i - 1;  // The item drawn below this one
+                if (nextI >= 0) {
+                    int nextDrawIdx = (int)history_.size() - 1 - nextI;
+                    Vec2 nextWorldPos = {0, HISTORY_START_Y + nextDrawIdx * HISTORY_SPACING};
+                    Vec2 nextAnimPos = getAnimatedPosition(history_[nextI], nextWorldPos);
+                    Vec2 nextScreen = worldToScreen(nextAnimPos);
+                    setColor(0.25f, 0.3f, 0.4f, 0.3f);
+                    noFill();
+                    drawLine(screenPos.x, screenPos.y, nextScreen.x, nextScreen.y);
+                }
+            }
+
+            // Draw the history item
+            drawItemAt(history_[i], screenPos, sz, Color(0.2f, 0.25f, 0.35f));
+
+            // Label: #N (1-based, 1 = oldest)
+            setColor(0.45f, 0.45f, 0.55f);
+            string label = format("#{}", i + 1);
+            fontSmall_.drawString(label, screenPos.x, screenPos.y + sz / 2 + 10,
+                Direction::Center, Direction::Center);
         }
     }
 
@@ -577,6 +817,16 @@ private:
         pendingLoads_.push_back(centerItem_.photoId);
         for (auto& item : timelineItems_) pendingLoads_.push_back(item.photoId);
         for (auto& item : relatedItems_) pendingLoads_.push_back(item.photoId);
+    }
+
+    // Queue only IDs that don't have textures yet
+    void queueMissingThumbnails(const unordered_set<string>& neededIds) {
+        pendingLoads_.clear();
+        for (const auto& id : neededIds) {
+            if (textures_.count(id) == 0) {
+                pendingLoads_.push_back(id);
+            }
+        }
     }
 
     void startLoadThread() {
