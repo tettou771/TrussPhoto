@@ -33,7 +33,7 @@ public:
     string displayName;
     int totalCount = 0;
     int depth = 0;
-    bool expanded = true;
+    bool expanded = false;
     bool exists = true;
     bool hasChildren = false;
     bool isHeader = false;
@@ -257,7 +257,7 @@ private:
         int photoCount = 0;
         int totalCount = 0;
         int depth = 0;
-        bool expanded = true;
+        bool expanded = false;
         bool exists = true;
         FolderNode* parent = nullptr;
         vector<FolderNode*> children;

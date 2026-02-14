@@ -61,6 +61,16 @@ void tcApp::setup() {
     // 6. Load library (instant display from previous session)
     bool hasLibrary = provider_.loadLibrary();
 
+    // 6b. Import from Lightroom Classic catalog (if --import-lrcat specified)
+    if (!AppConfig::importLrcatPath.empty()) {
+        auto [entries, stats] = LrcatImporter::import(AppConfig::importLrcatPath);
+        int added = provider_.importReferences(entries);
+        if (added > 0) hasLibrary = true;
+        logNotice() << "[LrcatImport] imported=" << added
+                    << " total=" << stats.totalImages
+                    << " missing_files=" << stats.missingFile;
+    }
+
     // 7. Save bootstrap (remember catalog path for next launch)
     bootstrap_.lastCatalogPath = catalogPath_;
     bootstrap_.save(AppPaths::appConfigPath());

@@ -21,6 +21,7 @@
 #include "CameraProfileManager.h"
 #include "ServerConfig.h"
 #include "PhotoServer.h"
+#include "LrcatImporter.h"
 using namespace std;
 using namespace tc;
 

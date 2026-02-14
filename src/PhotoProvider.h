@@ -449,6 +449,7 @@ public:
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
         auto& photo = it->second;
+        if (photo.isVideo) return false;  // no thumbnail for video (yet)
 
         // 1. Check local thumbnail cache
         if (!photo.localThumbnailPath.empty() && fs::exists(photo.localThumbnailPath)) {
@@ -632,19 +633,35 @@ public:
             info.photoCount++;
         }
 
-        // Add intermediate directories between leaf folders and rawStoragePath
-        // so the tree hierarchy can be properly built
+        // Add intermediate directories between leaf folders and their root
+        // so the tree hierarchy can be properly built.
+        // For managed photos: stop at rawStoragePath parent.
+        // For external references: stop at volume/mount root.
         vector<string> leafPaths;
         for (const auto& [path, _] : folders) {
             leafPaths.push_back(path);
         }
+
+        // Detect stop boundary for each leaf path
+        auto shouldStop = [this](const string& leafPath, const string& pstr) -> bool {
+            // If leaf is under rawStoragePath, stop at rawStoragePath parent
+            if (!rawStoragePath_.empty() &&
+                leafPath.size() > rawStoragePath_.size() &&
+                leafPath.substr(0, rawStoragePath_.size()) == rawStoragePath_) {
+                fs::path rawParent = fs::path(rawStoragePath_).parent_path();
+                return pstr.size() < rawParent.string().size();
+            }
+            // External path: stop at depth 2 (/Volumes/X, /Users/X, /mnt/X)
+            int slashes = 0;
+            for (char c : pstr) { if (c == '/') slashes++; }
+            return slashes < 2;
+        };
+
         for (const auto& leafPath : leafPaths) {
             fs::path p = fs::path(leafPath).parent_path();
             while (!p.empty() && p.string() != "/" && p != p.root_path()) {
                 string pstr = p.string();
-                // Stop above rawStoragePath
-                if (!rawStoragePath_.empty() && pstr.size() < rawStoragePath_.size()) break;
-                // Already exists — ancestors above also exist
+                if (shouldStop(leafPath, pstr)) break;
                 if (folders.count(pstr)) break;
                 auto& info = folders[pstr];
                 info.path = pstr;
@@ -703,8 +720,8 @@ public:
 
             auto& photo = it->second;
 
-            // Delete local RAW/image file + XMP sidecar
-            if (!photo.localPath.empty() && fs::exists(photo.localPath)) {
+            // Delete local RAW/image file + XMP sidecar (only if managed)
+            if (photo.isManaged && !photo.localPath.empty() && fs::exists(photo.localPath)) {
                 // Delete XMP sidecar
                 string xmpPath = xmpWritePath(photo.localPath);
                 if (!xmpPath.empty() && fs::exists(xmpPath)) {
@@ -737,7 +754,7 @@ public:
         return deleted;
     }
 
-    // Get sorted photo list (by filename)
+    // Get sorted photo list (by dateTimeOriginal descending, newest first)
     vector<string> getSortedIds() const {
         vector<string> ids;
         ids.reserve(photos_.size());
@@ -745,6 +762,11 @@ public:
             ids.push_back(id);
         }
         sort(ids.begin(), ids.end(), [this](const string& a, const string& b) {
+            const auto& da = photos_.at(a).dateTimeOriginal;
+            const auto& db = photos_.at(b).dateTimeOriginal;
+            // Empty dates sort to end
+            if (da.empty() != db.empty()) return !da.empty();
+            if (da != db) return da > db;  // newest first
             return photos_.at(a).filename < photos_.at(b).filename;
         });
         return ids;
@@ -759,6 +781,28 @@ public:
             }
         }
         return result;
+    }
+
+    // --- Reference import (lrcat etc.) ---
+
+    // Import pre-built entries as external references (no copy, no EXIF, no XMP)
+    int importReferences(vector<PhotoEntry>& entries) {
+        int added = 0;
+        vector<PhotoEntry> newEntries;
+
+        for (auto& e : entries) {
+            if (photos_.count(e.id)) continue;  // skip duplicates
+            photos_[e.id] = e;
+            newEntries.push_back(e);
+            added++;
+        }
+
+        if (!newEntries.empty()) {
+            db_.insertPhotos(newEntries);
+        }
+        logNotice() << "[PhotoProvider] importReferences: " << added
+                    << " added (total: " << photos_.size() << ")";
+        return added;
     }
 
     // --- Smart Preview ---
@@ -980,6 +1024,8 @@ public:
 
         lock_guard<mutex> lock(embMutex_);
         for (const auto& id : ids) {
+            auto it = photos_.find(id);
+            if (it != photos_.end() && it->second.isVideo) continue;
             pendingEmbeddings_.push_back(id);
         }
         startEmbeddingThread();
@@ -1313,6 +1359,7 @@ private:
         embThread_ = thread([this, ids = std::move(ids)]() {
             logNotice() << "[CLIP] Generating embeddings for " << ids.size() << " photos";
             int done = 0;
+            int skipped = 0;
             for (const auto& id : ids) {
                 // Get thumbnail path for this photo
                 auto it = photos_.find(id);
@@ -1334,7 +1381,7 @@ private:
                 }
 
                 if (!loaded) {
-                    logWarning() << "[CLIP] No thumbnail for: " << id;
+                    skipped++;
                     continue;
                 }
 
@@ -1347,7 +1394,8 @@ private:
                 }
                 embCompletedCount_ = ++done;
             }
-            logNotice() << "[CLIP] Embedding done: " << done << "/" << ids.size();
+            logNotice() << "[CLIP] Embedding done: " << done << "/" << ids.size()
+                        << (skipped > 0 ? " (skipped " + to_string(skipped) + " without thumbnail)" : "");
             embThreadRunning_ = false;
         });
         embThread_.detach();
@@ -1904,10 +1952,10 @@ private:
         }
     }
 
-    // Write XMP only if photo has a local path
+    // Write XMP only if photo has a local path and is managed
     static void writeXmpSidecarIfLocal(const PhotoEntry& photo) {
-        if (!photo.localPath.empty() && fs::exists(photo.localPath)) {
-            writeXmpSidecar(photo.localPath, photo);
-        }
+        if (photo.localPath.empty() || !fs::exists(photo.localPath)) return;
+        if (!photo.isManaged) return;  // don't write XMP for external references
+        writeXmpSidecar(photo.localPath, photo);
     }
 };

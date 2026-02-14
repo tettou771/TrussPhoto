@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// SmartPreview.h - JPEG XL 16-bit lossless encode/decode for smart previews
+// SmartPreview.h - JPEG XL 16-bit lossy encode/decode for smart previews
 // =============================================================================
 
 #include <TrussC.h>
@@ -22,10 +22,11 @@ namespace fs = std::filesystem;
 
 class SmartPreview {
 public:
-    static constexpr int MAX_EDGE = 2560;
+    static constexpr int MAX_EDGE = 3072;
     static constexpr int BIT_DEPTH = 16;
+    static constexpr float ENCODE_DISTANCE = 2.0f; // 0=lossless, 1.0=visually lossless, 2.0=high quality
 
-    // Encode F32 Pixels to 16-bit lossless JPEG XL (resized to MAX_EDGE)
+    // Encode F32 Pixels to 16-bit lossy JPEG XL (resized to MAX_EDGE)
     static bool encode(const Pixels& srcF32, const string& outPath) {
         if (!srcF32.isAllocated() || srcF32.getFormat() != PixelFormat::F32) {
             logWarning() << "[SmartPreview] encode: need F32 pixels";
@@ -107,10 +108,12 @@ public:
             return false;
         }
 
-        // Frame settings: lossless
+        // Frame settings: lossy with configurable distance
         JxlEncoderFrameSettings* settings = JxlEncoderFrameSettingsCreate(enc, nullptr);
-        JxlEncoderSetFrameLossless(settings, JXL_TRUE);
-        JxlEncoderSetFrameDistance(settings, 0);
+        if (ENCODE_DISTANCE == 0.0f) {
+            JxlEncoderSetFrameLossless(settings, JXL_TRUE);
+        }
+        JxlEncoderSetFrameDistance(settings, ENCODE_DISTANCE);
 
         // Pixel format: UINT16, 3 channels, native endian
         JxlPixelFormat pixfmt = {3, JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN, 0};
@@ -126,7 +129,7 @@ public:
         JxlEncoderCloseInput(enc);
 
         // Process output
-        vector<uint8_t> compressed(1024 * 1024); // 1MB initial
+        vector<uint8_t> compressed(512 * 1024); // 512KB initial (lossy ~400KB typical)
         uint8_t* next = compressed.data();
         size_t avail = compressed.size();
 

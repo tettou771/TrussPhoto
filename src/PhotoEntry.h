@@ -31,6 +31,7 @@ struct PhotoEntry {
     int width = 0;
     int height = 0;
     bool isRaw = false;
+    bool isVideo = false;
     string creativeStyle;
     float focalLength = 0;
     float aperture = 0;
@@ -49,6 +50,10 @@ struct PhotoEntry {
     int64_t flagUpdatedAt = 0;
     int64_t memoUpdatedAt = 0;
     int64_t tagsUpdatedAt = 0;
+
+    // Develop settings (LR import)
+    string developSettings;  // LR develop settings text blob
+    bool isManaged = true;   // true=originals/ managed, false=external reference
 
     // GPS (0 = not available, use hasGps() to check)
     double latitude = 0;     // decimal degrees, positive=N
@@ -78,6 +83,7 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"width", e.width},
         {"height", e.height},
         {"isRaw", e.isRaw},
+        {"isVideo", e.isVideo},
         {"creativeStyle", e.creativeStyle},
         {"focalLength", e.focalLength},
         {"aperture", e.aperture},
@@ -95,7 +101,9 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"tagsUpdatedAt", e.tagsUpdatedAt},
         {"latitude", e.latitude},
         {"longitude", e.longitude},
-        {"altitude", e.altitude}
+        {"altitude", e.altitude},
+        {"developSettings", e.developSettings},
+        {"isManaged", e.isManaged}
     };
 }
 
@@ -114,6 +122,7 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.width = j.value("width", 0);
     e.height = j.value("height", 0);
     e.isRaw = j.value("isRaw", false);
+    e.isVideo = j.value("isVideo", false);
     e.creativeStyle = j.value("creativeStyle", string(""));
     e.focalLength = j.value("focalLength", 0.0f);
     e.aperture = j.value("aperture", 0.0f);
@@ -133,6 +142,9 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.latitude = j.value("latitude", 0.0);
     e.longitude = j.value("longitude", 0.0);
     e.altitude = j.value("altitude", 0.0);
+
+    e.developSettings = j.value("developSettings", string(""));
+    e.isManaged = j.value("isManaged", true);
 
     int state = j.value("syncState", 0);
     e.syncState = static_cast<SyncState>(state);

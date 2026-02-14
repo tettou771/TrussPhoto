@@ -9,6 +9,7 @@
 //   --catalog PATH     : Catalog folder path
 //   --choose-catalog   : Force catalog selection dialog on launch
 //   --raw-dir PATH     : Override RAW storage path (formerly --library-dir)
+//   --import-lrcat PATH: Import from Lightroom Classic catalog (.lrcat)
 
 #include <string>
 
@@ -21,6 +22,7 @@ inline bool chooseCatalog = false;
 inline int serverPort = 18730;
 inline string catalogDir;
 inline string rawDir;
+inline string importLrcatPath;
 
 inline void parse(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
@@ -35,6 +37,8 @@ inline void parse(int argc, char* argv[]) {
             chooseCatalog = true;
         } else if ((arg == "--raw-dir" || arg == "--library-dir") && i + 1 < argc) {
             rawDir = argv[++i];
+        } else if (arg == "--import-lrcat" && i + 1 < argc) {
+            importLrcatPath = argv[++i];
         }
     }
 }

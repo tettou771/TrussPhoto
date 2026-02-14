@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 5;
+    static constexpr int SCHEMA_VERSION = 6;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -48,6 +48,7 @@ public:
                 "  width                INTEGER NOT NULL DEFAULT 0,"
                 "  height               INTEGER NOT NULL DEFAULT 0,"
                 "  is_raw               INTEGER NOT NULL DEFAULT 0,"
+                "  is_video             INTEGER NOT NULL DEFAULT 0,"
                 "  creative_style       TEXT NOT NULL DEFAULT '',"
                 "  focal_length         REAL NOT NULL DEFAULT 0,"
                 "  aperture             REAL NOT NULL DEFAULT 0,"
@@ -65,7 +66,9 @@ public:
                 "  tags_updated_at      INTEGER NOT NULL DEFAULT 0,"
                 "  latitude             REAL NOT NULL DEFAULT 0,"
                 "  longitude            REAL NOT NULL DEFAULT 0,"
-                "  altitude             REAL NOT NULL DEFAULT 0"
+                "  altitude             REAL NOT NULL DEFAULT 0,"
+                "  develop_settings     TEXT NOT NULL DEFAULT '',"
+                "  is_managed           INTEGER NOT NULL DEFAULT 1"
                 ")"
             );
             if (!ok) return false;
@@ -138,8 +141,26 @@ public:
                     return false;
                 }
             }
+            version = 5;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v4 -> v5";
+        }
+
+        // v5 -> v6: add develop_settings + is_managed
+        if (version == 5) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN is_video INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN develop_settings TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN is_managed INTEGER NOT NULL DEFAULT 1",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v5->v6 failed: " << sql;
+                    return false;
+                }
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v4 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v5 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -153,13 +174,13 @@ public:
             "INSERT OR REPLACE INTO photos "
             "(id, filename, file_size, date_time_original, local_path, local_thumbnail_path, "
             "smart_preview_path, "
-            "camera_make, camera, lens, lens_make, width, height, is_raw, creative_style, "
+            "camera_make, camera, lens, lens_make, width, height, is_raw, is_video, creative_style, "
             "focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
             "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude) "
+            "latitude, longitude, altitude, develop_settings, is_managed) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)"
         );
         if (!stmt.valid()) return false;
         bindEntry(stmt, e);
@@ -291,13 +312,13 @@ public:
             "INSERT OR REPLACE INTO photos "
             "(id, filename, file_size, date_time_original, local_path, local_thumbnail_path, "
             "smart_preview_path, "
-            "camera_make, camera, lens, lens_make, width, height, is_raw, creative_style, "
+            "camera_make, camera, lens, lens_make, width, height, is_raw, is_video, creative_style, "
             "focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
             "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude) "
+            "latitude, longitude, altitude, develop_settings, is_managed) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)"
         );
         if (!stmt.valid()) {
             db_.rollback();
@@ -325,10 +346,10 @@ public:
             "SELECT id, filename, file_size, date_time_original, local_path, "
             "local_thumbnail_path, smart_preview_path, "
             "camera_make, camera, lens, lens_make, "
-            "width, height, is_raw, creative_style, focal_length, aperture, iso, sync_state, "
+            "width, height, is_raw, is_video, creative_style, focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
             "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude "
+            "latitude, longitude, altitude, develop_settings, is_managed "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -349,24 +370,27 @@ public:
             e.width              = stmt.getInt(11);
             e.height             = stmt.getInt(12);
             e.isRaw              = stmt.getInt(13) != 0;
-            e.creativeStyle      = stmt.getText(14);
-            e.focalLength        = (float)stmt.getDouble(15);
-            e.aperture           = (float)stmt.getDouble(16);
-            e.iso                = (float)stmt.getDouble(17);
-            e.syncState          = static_cast<SyncState>(stmt.getInt(18));
-            e.rating             = stmt.getInt(19);
-            e.colorLabel         = stmt.getText(20);
-            e.flag               = stmt.getInt(21);
-            e.memo               = stmt.getText(22);
-            e.tags               = stmt.getText(23);
-            e.ratingUpdatedAt    = stmt.getInt64(24);
-            e.colorLabelUpdatedAt = stmt.getInt64(25);
-            e.flagUpdatedAt      = stmt.getInt64(26);
-            e.memoUpdatedAt      = stmt.getInt64(27);
-            e.tagsUpdatedAt      = stmt.getInt64(28);
-            e.latitude           = stmt.getDouble(29);
-            e.longitude          = stmt.getDouble(30);
-            e.altitude           = stmt.getDouble(31);
+            e.isVideo            = stmt.getInt(14) != 0;
+            e.creativeStyle      = stmt.getText(15);
+            e.focalLength        = (float)stmt.getDouble(16);
+            e.aperture           = (float)stmt.getDouble(17);
+            e.iso                = (float)stmt.getDouble(18);
+            e.syncState          = static_cast<SyncState>(stmt.getInt(19));
+            e.rating             = stmt.getInt(20);
+            e.colorLabel         = stmt.getText(21);
+            e.flag               = stmt.getInt(22);
+            e.memo               = stmt.getText(23);
+            e.tags               = stmt.getText(24);
+            e.ratingUpdatedAt    = stmt.getInt64(25);
+            e.colorLabelUpdatedAt = stmt.getInt64(26);
+            e.flagUpdatedAt      = stmt.getInt64(27);
+            e.memoUpdatedAt      = stmt.getInt64(28);
+            e.tagsUpdatedAt      = stmt.getInt64(29);
+            e.latitude           = stmt.getDouble(30);
+            e.longitude          = stmt.getDouble(31);
+            e.altitude           = stmt.getDouble(32);
+            e.developSettings    = stmt.getText(33);
+            e.isManaged          = stmt.getInt(34) != 0;
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -520,23 +544,26 @@ private:
         stmt.bind(12, e.width);
         stmt.bind(13, e.height);
         stmt.bind(14, e.isRaw ? 1 : 0);
-        stmt.bind(15, e.creativeStyle);
-        stmt.bind(16, (double)e.focalLength);
-        stmt.bind(17, (double)e.aperture);
-        stmt.bind(18, (double)e.iso);
-        stmt.bind(19, static_cast<int>(e.syncState));
-        stmt.bind(20, e.rating);
-        stmt.bind(21, e.colorLabel);
-        stmt.bind(22, e.flag);
-        stmt.bind(23, e.memo);
-        stmt.bind(24, e.tags);
-        stmt.bind(25, e.ratingUpdatedAt);
-        stmt.bind(26, e.colorLabelUpdatedAt);
-        stmt.bind(27, e.flagUpdatedAt);
-        stmt.bind(28, e.memoUpdatedAt);
-        stmt.bind(29, e.tagsUpdatedAt);
-        stmt.bind(30, e.latitude);
-        stmt.bind(31, e.longitude);
-        stmt.bind(32, e.altitude);
+        stmt.bind(15, e.isVideo ? 1 : 0);
+        stmt.bind(16, e.creativeStyle);
+        stmt.bind(17, (double)e.focalLength);
+        stmt.bind(18, (double)e.aperture);
+        stmt.bind(19, (double)e.iso);
+        stmt.bind(20, static_cast<int>(e.syncState));
+        stmt.bind(21, e.rating);
+        stmt.bind(22, e.colorLabel);
+        stmt.bind(23, e.flag);
+        stmt.bind(24, e.memo);
+        stmt.bind(25, e.tags);
+        stmt.bind(26, e.ratingUpdatedAt);
+        stmt.bind(27, e.colorLabelUpdatedAt);
+        stmt.bind(28, e.flagUpdatedAt);
+        stmt.bind(29, e.memoUpdatedAt);
+        stmt.bind(30, e.tagsUpdatedAt);
+        stmt.bind(31, e.latitude);
+        stmt.bind(32, e.longitude);
+        stmt.bind(33, e.altitude);
+        stmt.bind(34, e.developSettings);
+        stmt.bind(35, e.isManaged ? 1 : 0);
     }
 };
