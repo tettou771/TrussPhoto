@@ -225,7 +225,7 @@ private:
     static constexpr float RELATED_SIZE_MIN = 60.0f;
     static constexpr float RELATED_SIZE_MAX = 120.0f;
     static constexpr float TIMELINE_SPACING = 12.0f;
-    static constexpr int TIMELINE_COUNT = 5;
+    static constexpr int TIMELINE_COUNT = 15;
     static constexpr int MAX_RELATED = 20;
     static constexpr int COLLISION_ITERATIONS = 8;
 
@@ -415,8 +415,11 @@ private:
             item.width = entry->width;
             item.height = entry->height;
 
-            // Position: horizontal strip centered on origin
-            float x = offset * (TIMELINE_SIZE + TIMELINE_SPACING);
+            // Position: start from center edge, no overlap
+            float sign = offset > 0 ? 1.0f : -1.0f;
+            int slot = abs(offset) - 1;  // 0-based slot index
+            float startX = CENTER_SIZE / 2 + TIMELINE_SPACING + TIMELINE_SIZE / 2;
+            float x = sign * (startX + slot * (TIMELINE_SIZE + TIMELINE_SPACING));
             item.position = {x, 0};
 
             timelineItems_.push_back(item);
@@ -503,9 +506,9 @@ private:
         float minScore = relatedItems_.back().score;
         float scoreRange = max(maxScore - minScore, 0.01f);
 
-        // Radii
-        float innerRadius = CENTER_SIZE / 2 + TIMELINE_SIZE + 40;
-        float outerRadius = innerRadius + 300;
+        // Radii (compact layout)
+        float innerRadius = CENTER_SIZE / 2 + 60;
+        float outerRadius = innerRadius + 160;
 
         // Golden angle spiral placement
         float goldenAngle = TAU * (1.0f - 1.0f / 1.618033988749895f);
