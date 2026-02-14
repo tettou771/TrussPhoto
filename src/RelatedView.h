@@ -94,8 +94,16 @@ public:
         // Compute related photos
         computeRelated(provider);
 
-        // Layout related photos
-        layoutRelated();
+        // Layout related photos (pass old positions for continuity)
+        {
+            unordered_map<string, Vec2> oldPos;
+            if (hasOldLayout) {
+                for (const auto& [id, snap] : oldSnapshots) {
+                    oldPos[id] = snap.position;
+                }
+            }
+            layoutRelated(oldPos);
+        }
 
         // --- Smart texture management: keep textures still in use ---
         unordered_set<string> neededIds;
@@ -210,6 +218,9 @@ public:
         float w = getWidth();
         float h = getHeight();
 
+        // Keep contentLayer_ centered even when view size changes
+        updateContentTransform();
+
         // Background
         setColor(0.06f, 0.06f, 0.08f);
         fill();
@@ -226,8 +237,8 @@ public:
                 Vec2 cur = animating_
                     ? getAnimatedWorldPos(node) : node->targetWorldPos;
                 Vec2 to = worldToScreen(cur);
-                float alpha = 0.15f + node->score * 0.2f;
-                setColor(0.4f, 0.4f, 0.5f, alpha);
+                float alpha = 0.25f + node->score * 0.35f;
+                setColor(0.55f, 0.55f, 0.7f, alpha);
                 noFill();
                 drawLine(centerScreen.x, centerScreen.y, to.x, to.y);
             }
@@ -238,7 +249,7 @@ public:
                 Vec2 hWorld = animating_
                     ? getAnimatedWorldPos(topHist) : topHist->targetWorldPos;
                 Vec2 hScreen = worldToScreen(hWorld);
-                setColor(0.3f, 0.4f, 0.55f, 0.4f);
+                setColor(0.45f, 0.55f, 0.75f, 0.6f);
                 noFill();
                 drawLine(centerScreen.x, centerScreen.y, hScreen.x, hScreen.y);
             }
@@ -251,7 +262,7 @@ public:
                     ? getAnimatedWorldPos(historyNodes_[i-1]) : historyNodes_[i-1]->targetWorldPos;
                 Vec2 sa = worldToScreen(a);
                 Vec2 sb = worldToScreen(b);
-                setColor(0.25f, 0.3f, 0.4f, 0.3f);
+                setColor(0.4f, 0.45f, 0.6f, 0.5f);
                 noFill();
                 drawLine(sa.x, sa.y, sb.x, sb.y);
             }
@@ -820,6 +831,11 @@ private:
     // =========================================================================
 
     void layoutRelated() {
+        layoutRelated({});
+    }
+
+    // Layout with optional old positions for continuity
+    void layoutRelated(const unordered_map<string, Vec2>& oldPositions) {
         if (relatedItems_.empty()) return;
 
         float maxScore = relatedItems_.front().score;
@@ -829,14 +845,39 @@ private:
         float innerRadius = CENTER_SIZE / 2 + 60;
         float outerRadius = innerRadius + 160;
 
+        // History exclusion zone: vertical strip below center
+        float histExclX = HISTORY_SIZE;  // half-width of exclusion zone
+        float histExclTop = HISTORY_START_Y - HISTORY_SIZE;
+        float histExclBottom = HISTORY_START_Y + MAX_HISTORY * HISTORY_SPACING;
+
         float goldenAngle = TAU * (1.0f - 1.0f / 1.618033988749895f);
         float angleOffset = TAU * 0.125f;
 
         for (int i = 0; i < (int)relatedItems_.size(); i++) {
-            float normalized = (relatedItems_[i].score - minScore) / scoreRange;
+            auto& item = relatedItems_[i];
+            float normalized = (item.score - minScore) / scoreRange;
             float dist = innerRadius + (1.0f - normalized * normalized) * (outerRadius - innerRadius);
-            float angle = angleOffset + i * goldenAngle;
-            relatedItems_[i].position = {cos(angle) * dist, sin(angle) * dist};
+
+            // Check if this item existed in the previous layout
+            auto oldIt = oldPositions.find(item.photoId);
+            if (oldIt != oldPositions.end()) {
+                // Reuse old angle but adjust distance for new score
+                Vec2 oldPos = oldIt->second;
+                float oldAngle = atan2(oldPos.y, oldPos.x);
+                item.position = {cos(oldAngle) * dist, sin(oldAngle) * dist};
+            } else {
+                float angle = angleOffset + i * goldenAngle;
+                item.position = {cos(angle) * dist, sin(angle) * dist};
+            }
+
+            // Push away from history exclusion zone
+            if (abs(item.position.x) < histExclX + item.displaySize / 2 &&
+                item.position.y > histExclTop &&
+                item.position.y < histExclBottom) {
+                // Move horizontally away from center column
+                float pushDir = (item.position.x >= 0) ? 1.0f : -1.0f;
+                item.position.x = pushDir * (histExclX + item.displaySize / 2 + 10);
+            }
         }
 
         resolveCollisions();
