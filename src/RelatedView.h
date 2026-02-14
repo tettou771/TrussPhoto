@@ -842,20 +842,26 @@ private:
         float minScore = relatedItems_.back().score;
         float scoreRange = max(maxScore - minScore, 0.01f);
 
-        float innerRadius = CENTER_SIZE / 2 + 60;
-        float outerRadius = innerRadius + 160;
+        // Enough clearance from center + timeline strip
+        float innerRadius = CENTER_SIZE / 2 + RELATED_SIZE_MAX + 20;
+        float outerRadius = innerRadius + 200;
 
         // History exclusion zone: vertical strip below center
-        float histExclX = HISTORY_SIZE;  // half-width of exclusion zone
+        float histExclHalfW = HISTORY_SIZE + 20;
         float histExclTop = HISTORY_START_Y - HISTORY_SIZE;
         float histExclBottom = HISTORY_START_Y + MAX_HISTORY * HISTORY_SPACING;
 
+        // Timeline exclusion: avoid horizontal band near y=0
+        float timelineExclHalfH = TIMELINE_SIZE * 0.5f + 20;
+
         float goldenAngle = TAU * (1.0f - 1.0f / 1.618033988749895f);
-        float angleOffset = TAU * 0.125f;
+        // Start at ~70° to avoid both timeline axis (horizontal) and history (below)
+        float angleOffset = -TAU * 0.19f;
 
         for (int i = 0; i < (int)relatedItems_.size(); i++) {
             auto& item = relatedItems_[i];
             float normalized = (item.score - minScore) / scoreRange;
+            // Higher score = closer to center
             float dist = innerRadius + (1.0f - normalized * normalized) * (outerRadius - innerRadius);
 
             // Check if this item existed in the previous layout
@@ -871,12 +877,19 @@ private:
             }
 
             // Push away from history exclusion zone
-            if (abs(item.position.x) < histExclX + item.displaySize / 2 &&
+            float halfSz = item.displaySize * 0.5f;
+            if (abs(item.position.x) < histExclHalfW + halfSz &&
                 item.position.y > histExclTop &&
                 item.position.y < histExclBottom) {
-                // Move horizontally away from center column
                 float pushDir = (item.position.x >= 0) ? 1.0f : -1.0f;
-                item.position.x = pushDir * (histExclX + item.displaySize / 2 + 10);
+                item.position.x = pushDir * (histExclHalfW + halfSz + 10);
+            }
+
+            // Push away from timeline horizontal band
+            if (abs(item.position.y) < timelineExclHalfH + halfSz &&
+                abs(item.position.x) > CENTER_SIZE * 0.5f) {
+                float pushDir = (item.position.y >= 0) ? 1.0f : -1.0f;
+                item.position.y = pushDir * (timelineExclHalfH + halfSz + 10);
             }
         }
 
@@ -891,24 +904,34 @@ private:
         };
         vector<ColItem> items;
 
-        items.push_back({&centerItem_.position, CENTER_SIZE / 2, true});
+        // Use half of the longer dimension as collision radius
+        // (photos are rectangular, displaySize is the square bounding box)
+        items.push_back({&centerItem_.position, CENTER_SIZE * 0.5f, true});
 
         for (auto& tl : timelineItems_) {
-            items.push_back({&tl.position, TIMELINE_SIZE / 2, true});
+            items.push_back({&tl.position, TIMELINE_SIZE * 0.5f, true});
         }
 
         for (auto& rel : relatedItems_) {
-            items.push_back({&rel.position, rel.displaySize / 2, false});
+            items.push_back({&rel.position, rel.displaySize * 0.5f, false});
         }
 
-        for (int iter = 0; iter < COLLISION_ITERATIONS; iter++) {
+        float padding = 12.0f;
+
+        for (int iter = 0; iter < COLLISION_ITERATIONS * 3; iter++) {
             for (int i = 0; i < (int)items.size(); i++) {
                 for (int j = i + 1; j < (int)items.size(); j++) {
                     Vec2 diff = *items[j].pos - *items[i].pos;
                     float dist = diff.length();
-                    float minDist = items[i].radius + items[j].radius + 8;
+                    float minDist = items[i].radius + items[j].radius + padding;
 
-                    if (dist < minDist && dist > 0.01f) {
+                    if (dist < minDist) {
+                        // Handle exact overlap: push in a deterministic direction
+                        if (dist < 0.1f) {
+                            float angle = (float)(i * 2.399f + j * 1.7f);
+                            diff = {cos(angle), sin(angle)};
+                            dist = 0.1f;
+                        }
                         Vec2 push = diff / dist * (minDist - dist);
                         if (items[i].fixed && !items[j].fixed) {
                             *items[j].pos = *items[j].pos + push;
