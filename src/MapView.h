@@ -154,16 +154,49 @@ public:
                     setColor(1.0f, 1.0f, 1.0f);
                     it->second.draw(drawX, drawY, (float)tileSize, (float)tileSize);
                 } else {
-                    // Placeholder
-                    setColor(0.15f, 0.15f, 0.18f);
-                    fill();
-                    drawRect(drawX, drawY, (float)tileSize, (float)tileSize);
-                    setColor(0.2f, 0.2f, 0.22f);
-                    noFill();
-                    drawRect(drawX, drawY, (float)tileSize, (float)tileSize);
+                    // Fallback: draw parent tile's sub-region (blurry but better than nothing)
+                    bool fallbackDrawn = false;
+                    if (tileZoom > 1) {
+                        TileKey parentKey{tileZoom - 1, tx / 2, ty / 2};
+                        auto pit = tileCache_.find(parentKey);
+                        if (pit != tileCache_.end() && pit->second.isAllocated()) {
+                            setColor(1.0f, 1.0f, 1.0f);
+                            float sx = (tx % 2) * 128.0f;
+                            float sy = (ty % 2) * 128.0f;
+                            pit->second.drawSubsection(
+                                drawX, drawY, (float)tileSize, (float)tileSize,
+                                sx, sy, 128, 128);
+                            fallbackDrawn = true;
+                        }
+                    }
+                    if (!fallbackDrawn) {
+                        setColor(0.15f, 0.15f, 0.18f);
+                        fill();
+                        drawRect(drawX, drawY, (float)tileSize, (float)tileSize);
+                    }
 
                     // Request tile
                     requestTile(tileZoom, tx, ty);
+                }
+            }
+        }
+
+        // Prefetch adjacent zoom level tiles for smooth zooming
+        for (int pz : {tileZoom + 1, tileZoom - 1}) {
+            if (pz < 1 || pz > 19) continue;
+            auto pCenter = latLonToPixel(centerLat_, centerLon_, (double)pz);
+            float pLeft = pCenter.x - halfW;
+            float pTop = pCenter.y - halfH;
+            float pRight = pCenter.x + halfW;
+            float pBottom = pCenter.y + halfH;
+            int pMax = (1 << pz);
+            int pMinX = max(0, (int)floor(pLeft / 256.0));
+            int pMaxX = min(pMax - 1, (int)floor(pRight / 256.0));
+            int pMinY = max(0, (int)floor(pTop / 256.0));
+            int pMaxY = min(pMax - 1, (int)floor(pBottom / 256.0));
+            for (int ty = pMinY; ty <= pMaxY; ty++) {
+                for (int tx = pMinX; tx <= pMaxX; tx++) {
+                    requestTile(pz, tx, ty, true);
                 }
             }
         }
@@ -289,6 +322,15 @@ public:
         zoom_ = clamp(zoom_, 1.0, 19.0);
 
         if (zoom_ != oldZoom) {
+            // Flush stale tile queue so visible tiles load first
+            {
+                lock_guard<mutex> lock(tileMutex_);
+                for (const auto& req : tileQueue_) {
+                    tileLoading_.erase(TileKey{req.z, req.x, req.y});
+                }
+                tileQueue_.clear();
+            }
+
             // Keep the point under the mouse cursor fixed
             float w = getWidth();
             float h = getHeight();
@@ -398,7 +440,7 @@ private:
 
     // --- Tile loading ---
 
-    void requestTile(int z, int x, int y) {
+    void requestTile(int z, int x, int y, bool prefetch = false) {
         TileKey key{z, x, y};
 
         // Already loaded or loading?
@@ -422,7 +464,11 @@ private:
 
         {
             lock_guard<mutex> lock(tileMutex_);
-            tileQueue_.push_back({z, x, y});
+            if (prefetch) {
+                tileQueue_.push_back({z, x, y});
+            } else {
+                tileQueue_.push_front({z, x, y});  // visible tiles first
+            }
         }
 
         startTileThread();
@@ -487,13 +533,15 @@ private:
 
     // LRU eviction: remove tiles from cache when it gets too large
     void evictOldTiles() {
-        const int MAX_TILES = 256;
+        const int MAX_TILES = 512;
         if ((int)tileCache_.size() <= MAX_TILES) return;
 
-        // Remove tiles from other zoom levels first
+        // Keep current and adjacent zoom levels for smooth transitions
+        int currentZoom = (int)floor(zoom_);
         auto it = tileCache_.begin();
         while (it != tileCache_.end() && (int)tileCache_.size() > MAX_TILES) {
-            if (it->first.z != (int)floor(zoom_)) {
+            int tz = it->first.z;
+            if (tz < currentZoom - 1 || tz > currentZoom + 1) {
                 it = tileCache_.erase(it);
             } else {
                 ++it;
