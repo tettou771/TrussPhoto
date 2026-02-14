@@ -155,6 +155,35 @@ void tcApp::setup() {
     };
     mapView_->onRedraw = [this]() { redraw(); };
 
+    // 5c2. Create related view
+    relatedView_ = make_shared<RelatedView>();
+    addChild(relatedView_);
+    relatedView_->setActive(false);
+    relatedView_->onPhotoClick = [this](const string& photoId) {
+        auto* entry = provider_.getPhoto(photoId);
+        if (!entry) return;
+        if (metadataPanel_) {
+            metadataPanel_->setPhoto(entry);
+            Pixels thumbPixels;
+            if (provider_.getThumbnail(photoId, thumbPixels)) {
+                Texture tex;
+                tex.allocate(thumbPixels, TextureUsage::Immutable, false);
+                metadataPanel_->setThumbnail(std::move(tex));
+            }
+        }
+        redraw();
+    };
+    relatedView_->onCenterDoubleClick = [this](const string& photoId) {
+        // Center double-click → open in single view
+        for (int i = 0; i < (int)grid_->getPhotoIdCount(); i++) {
+            if (grid_->getPhotoId(i) == photoId) {
+                showFullImage(i);
+                return;
+            }
+        }
+    };
+    relatedView_->onRedraw = [this]() { redraw(); };
+
     // 5d. Create metadata panel (right sidebar)
     metadataPanel_ = make_shared<MetadataPanel>();
     addChild(metadataPanel_);
@@ -543,6 +572,8 @@ void tcApp::draw() {
         drawSingleView();
     } else if (viewMode_ == ViewMode::Map) {
         // MapView draws itself via Node tree
+    } else if (viewMode_ == ViewMode::Related) {
+        // RelatedView draws itself via Node tree
     } else {
         // Show hint if no images
         if (provider_.getCount() == 0) {
@@ -701,6 +732,8 @@ void tcApp::keyPressed(int key) {
         }
     } else if (viewMode_ == ViewMode::Map) {
         // G key handles return to grid (mode-independent below)
+    } else if (viewMode_ == ViewMode::Related) {
+        // G key handles return to grid (mode-independent below)
     } else {
         // Grid mode: if search bar is active, only handle ESC
         if (searchBar_ && searchBar_->isActive()) {
@@ -736,6 +769,14 @@ void tcApp::keyPressed(int key) {
                 }
                 updateMetadataPanel();
             }
+        } else if (key == 'V' || key == 'v') {
+            // Related view: requires exactly 1 selected photo with embedding
+            if (grid_ && grid_->getSelectionCount() == 1) {
+                auto ids = grid_->getSelectedIds();
+                if (!ids.empty() && provider_.getCachedEmbedding(ids[0])) {
+                    enterRelatedView(ids[0]);
+                }
+            }
         } else if (key == 'R' || key == 'r') {
             repairLibrary();
         } else if (key == 'C') {  // Shift+C only (uppercase)
@@ -753,9 +794,14 @@ void tcApp::keyPressed(int key) {
             grid_->setActive(true);
             if (metadataPanel_) metadataPanel_->clearThumbnail();
             updateLayout();
+        } else if (viewMode_ == ViewMode::Related) {
+            exitRelatedView();
         }
     }
     if (key == 'M' || key == 'm') {
+        if (viewMode_ == ViewMode::Related) {
+            exitRelatedView();
+        }
         if (viewMode_ == ViewMode::Single || viewMode_ == ViewMode::Grid) {
             // Clean up single view resources if needed
             if (viewMode_ == ViewMode::Single) {
@@ -840,7 +886,7 @@ void tcApp::keyReleased(int key) {
 }
 
 void tcApp::mousePressed(Vec2 pos, int button) {
-    if (viewMode_ == ViewMode::Map) return;  // MapView handles via Node events
+    if (viewMode_ == ViewMode::Map || viewMode_ == ViewMode::Related) return;  // handled via Node events
     if (viewMode_ == ViewMode::Single && button == 0) {
         isDragging_ = true;
         dragStart_ = pos;
@@ -860,7 +906,7 @@ void tcApp::mouseMoved(Vec2 pos) {
 }
 
 void tcApp::mouseDragged(Vec2 pos, int button) {
-    if (viewMode_ == ViewMode::Map) return;  // MapView handles via Node events
+    if (viewMode_ == ViewMode::Map || viewMode_ == ViewMode::Related) return;
     if (viewMode_ == ViewMode::Single && button == 0 && isDragging_) {
         Vec2 delta = pos - dragStart_;
         panOffset_ = panOffset_ + delta;
@@ -872,8 +918,8 @@ void tcApp::mouseDragged(Vec2 pos, int button) {
 void tcApp::mouseScrolled(Vec2 delta) {
     redraw();
 
-    // Map view handles its own scroll via Node events
-    if (viewMode_ == ViewMode::Map) return;
+    // Map/Related view handles its own scroll via Node events
+    if (viewMode_ == ViewMode::Map || viewMode_ == ViewMode::Related) return;
     if (viewMode_ != ViewMode::Single) return;
 
     bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
@@ -952,6 +998,7 @@ void tcApp::exit() {
     }
 
     if (mapView_) mapView_->shutdown();
+    if (relatedView_) relatedView_->shutdown();
     uploadQueue_.stop();
     if (syncThread_.joinable()) syncThread_.join();
     if (rawLoadThread_.joinable()) rawLoadThread_.join();
@@ -1220,7 +1267,8 @@ void tcApp::showFullImage(int index) {
         zoomLevel_ = 1.0f;
         panOffset_ = {0, 0};
         grid_->setActive(false);
-        if (mapView_) mapView_->setActive(false);  // hide map when entering single view
+        if (mapView_) mapView_->setActive(false);
+        if (relatedView_) relatedView_->setActive(false);
         if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
         leftPaneWidth_ = 0;  // hide left pane in single view (no animation)
         leftTween_.finish();
@@ -1287,6 +1335,53 @@ void tcApp::exitFullImage() {
     // Clear view info, update with grid selection
     if (metadataPanel_) {
         metadataPanel_->clearViewInfo();
+        updateMetadataPanel();
+    }
+
+    updateLayout();
+    redraw();
+}
+
+void tcApp::enterRelatedView(const string& photoId) {
+    viewMode_ = ViewMode::Related;
+    grid_->setActive(false);
+    if (mapView_) mapView_->setActive(false);
+    if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
+
+    relatedView_->setCenter(photoId, provider_);
+    relatedView_->setActive(true);
+
+    // Hide left sidebar in related view
+    leftPaneWidth_ = 0;
+    leftTween_.finish();
+
+    // Update metadata panel with center photo
+    if (metadataPanel_) {
+        auto* entry = provider_.getPhoto(photoId);
+        metadataPanel_->setPhoto(entry);
+        metadataPanel_->clearViewInfo();
+        metadataPanel_->clearThumbnail();
+    }
+
+    updateLayout();
+    redraw();
+}
+
+void tcApp::exitRelatedView() {
+    if (viewMode_ != ViewMode::Related) return;
+
+    viewMode_ = ViewMode::Grid;
+    relatedView_->setActive(false);
+    relatedView_->shutdown();
+    grid_->setActive(true);
+
+    // Restore left pane
+    leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
+    leftTween_.finish();
+
+    if (metadataPanel_) {
+        metadataPanel_->clearViewInfo();
+        metadataPanel_->clearThumbnail();
         updateMetadataPanel();
     }
 
@@ -1386,11 +1481,16 @@ void tcApp::updateLayout() {
         }
     }
 
-    // Grid / Map
+    // Grid / Map / Related
     if (grid_) grid_->setRect(contentX, contentY, contentW, contentH);
     if (mapView_) {
         if (viewMode_ == ViewMode::Map) {
             mapView_->setRect(contentX, contentY, contentW, contentH);
+        }
+    }
+    if (relatedView_) {
+        if (viewMode_ == ViewMode::Related) {
+            relatedView_->setRect(contentX, contentY, contentW, contentH);
         }
     }
 

@@ -16,6 +16,7 @@
 #include "PaneToggle.h"
 #include "SearchBar.h"
 #include "MapView.h"
+#include "RelatedView.h"
 #include "UploadQueue.h"
 #include "CameraProfileManager.h"
 #include "ServerConfig.h"
@@ -27,7 +28,8 @@ using namespace tc;
 enum class ViewMode {
     Grid,       // Thumbnail grid
     Single,     // Single image view
-    Map         // Map view with GPS pins
+    Map,        // Map view with GPS pins
+    Related     // Related photos view
 };
 
 class tcApp : public App {
@@ -62,6 +64,7 @@ private:
     float metadataWidth_ = 260;
     MetadataPanel::Ptr metadataPanel_;
     MapView::Ptr mapView_;
+    RelatedView::Ptr relatedView_;
     SearchBar::Ptr searchBar_;
     float searchBarHeight_ = 36;
     PaneToggle::Ptr leftToggle_;
@@ -137,6 +140,8 @@ private:
     Font fontSmall_;
 
     void showFullImage(int index);
+    void enterRelatedView(const string& photoId);
+    void exitRelatedView();
     void deleteSelectedPhotos();
     void reprocessImage();   // re-apply lens correction from rawPixels_ cache
     void exitFullImage();

@@ -895,6 +895,33 @@ public:
         float score;  // cosine similarity
     };
 
+    // Get cached embedding (nullptr if not available)
+    const vector<float>* getCachedEmbedding(const string& id) const {
+        auto it = embeddingCache_.find(id);
+        return it != embeddingCache_.end() ? &it->second : nullptr;
+    }
+
+    // Find top-N similar photos by CLIP embedding
+    vector<SearchResult> findSimilar(const string& id, int topN = 20) const {
+        auto* ref = getCachedEmbedding(id);
+        if (!ref) return {};
+        vector<SearchResult> results;
+        for (const auto& [otherId, otherEmb] : embeddingCache_) {
+            if (otherId == id) continue;
+            float score = cosineSimilarity(*ref, otherEmb);
+            results.push_back({otherId, score});
+        }
+        if ((int)results.size() > topN) {
+            partial_sort(results.begin(), results.begin() + topN, results.end(),
+                [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
+            results.resize(topN);
+        } else {
+            sort(results.begin(), results.end(),
+                [](const SearchResult& a, const SearchResult& b) { return a.score > b.score; });
+        }
+        return results;
+    }
+
     // Semantic search: text query → sorted results (descending by similarity)
     // Uses dynamic threshold: keeps items within 15% of top score,
     // but if spread is tiny (< 0.03) returns all sorted by relevance.
