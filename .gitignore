@@ -26,6 +26,9 @@ bin/*
 bin/data/*.json
 bin/data/thumbnail_cache/
 
+# External libraries (downloaded, not committed)
+lib/
+
 # Python virtual environment
 .venv/
 __pycache__/

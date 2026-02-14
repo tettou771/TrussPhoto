@@ -5,6 +5,9 @@
 // =============================================================================
 
 #include <onnxruntime_cxx_api.h>
+#if defined(__APPLE__)
+#include <coreml_provider_factory.h>
+#endif
 #include <TrussC.h>
 #include <string>
 #include <vector>
@@ -22,6 +25,12 @@ public:
             Ort::SessionOptions opts;
             opts.SetIntraOpNumThreads(2);
             opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+#if defined(__APPLE__)
+            // CoreML EP: unsupported ops auto-fallback to CPU
+            OrtSessionOptionsAppendExecutionProvider_CoreML(opts, 0);
+            logNotice() << "[OnnxRunner] CoreML execution provider enabled";
+#endif
 
             session_ = make_unique<Ort::Session>(env_, modelPath.c_str(), opts);
             logNotice() << "[OnnxRunner] Model loaded: " << modelPath;

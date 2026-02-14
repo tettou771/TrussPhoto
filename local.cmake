@@ -24,25 +24,12 @@ if(NOT EMSCRIPTEN)
     message(STATUS "[${PROJECT_NAME}] Found libjxl: ${JXL_VERSION}")
 
     # onnxruntime - CLIP embedding inference
-    # NOTE: brew onnxruntime 1.24.1 produces NaN for EVA02-based models (LINE CLIP v2).
-    # The official Microsoft build (pip onnxruntime) works correctly.
-    # Use pip's dylib if available, fall back to brew.
-    set(_ORT_PIP_DIR "${CMAKE_SOURCE_DIR}/.venv/lib")
-    file(GLOB _ORT_PIP_DYLIB "${_ORT_PIP_DIR}/python*/site-packages/onnxruntime/capi/libonnxruntime.*.dylib")
-    if(_ORT_PIP_DYLIB)
-        list(GET _ORT_PIP_DYLIB 0 _ORT_PIP_DYLIB)
-        # Use brew headers (version-compatible) + pip dylib (correct build)
-        pkg_check_modules(ORT REQUIRED libonnxruntime)
-        target_include_directories(${PROJECT_NAME} PRIVATE ${ORT_INCLUDE_DIRS})
-        target_link_libraries(${PROJECT_NAME} PRIVATE "${_ORT_PIP_DYLIB}")
-        message(STATUS "[${PROJECT_NAME}] Using pip onnxruntime: ${_ORT_PIP_DYLIB}")
-    else()
-        pkg_check_modules(ORT REQUIRED libonnxruntime)
-        target_include_directories(${PROJECT_NAME} PRIVATE ${ORT_INCLUDE_DIRS})
-        target_link_directories(${PROJECT_NAME} PRIVATE ${ORT_LIBRARY_DIRS})
-        target_link_libraries(${PROJECT_NAME} PRIVATE ${ORT_LIBRARIES})
-        message(STATUS "[${PROJECT_NAME}] Found onnxruntime (brew): ${ORT_VERSION}")
-    endif()
+    # Official Microsoft release (includes CoreML execution provider)
+    set(ORT_DIR "${CMAKE_SOURCE_DIR}/lib/onnxruntime-osx-arm64-1.24.1")
+    target_include_directories(${PROJECT_NAME} PRIVATE "${ORT_DIR}/include")
+    target_link_directories(${PROJECT_NAME} PRIVATE "${ORT_DIR}/lib")
+    target_link_libraries(${PROJECT_NAME} PRIVATE onnxruntime)
+    message(STATUS "[${PROJECT_NAME}] Using onnxruntime: ${ORT_DIR}")
 endif()
 
 # SQLite amalgamation - embedded database for photo library
