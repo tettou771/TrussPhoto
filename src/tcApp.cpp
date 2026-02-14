@@ -129,11 +129,21 @@ void tcApp::setup() {
         redraw();
     };
 
-    // 5c. Create metadata panel (right sidebar)
+    // 5c. Create map view
+    mapView_ = make_shared<MapView>();
+    addChild(mapView_);
+    mapView_->setTileCacheDir(catalogPath_ + "/tile_cache");
+    mapView_->setActive(false);
+    mapView_->onPinClick = [this](int index) {
+        showFullImage(index);
+    };
+    mapView_->onRedraw = [this]() { redraw(); };
+
+    // 5d. Create metadata panel (right sidebar)
     metadataPanel_ = make_shared<MetadataPanel>();
     addChild(metadataPanel_);
 
-    // 5d. Create pane toggle buttons
+    // 5e. Create pane toggle buttons
     leftToggle_ = make_shared<PaneToggle>();
     addChild(leftToggle_);
     leftToggle_->onClick = [this]() {
@@ -515,6 +525,8 @@ void tcApp::draw() {
 
     if (viewMode_ == ViewMode::Single) {
         drawSingleView();
+    } else if (viewMode_ == ViewMode::Map) {
+        // MapView draws itself via Node tree
     } else {
         // Show hint if no images
         if (provider_.getCount() == 0) {
@@ -600,9 +612,7 @@ void tcApp::keyPressed(int key) {
     redraw(3);
 
     if (viewMode_ == ViewMode::Single) {
-        if (key == SAPP_KEYCODE_ESCAPE) {
-            exitFullImage();
-        } else if (key == SAPP_KEYCODE_LEFT && selectedIndex_ > 0) {
+        if (key == SAPP_KEYCODE_LEFT && selectedIndex_ > 0) {
             showFullImage(selectedIndex_ - 1);
         } else if (key == SAPP_KEYCODE_RIGHT && selectedIndex_ < (int)grid_->getPhotoIdCount() - 1) {
             showFullImage(selectedIndex_ + 1);
@@ -673,6 +683,8 @@ void tcApp::keyPressed(int key) {
             metadataPanel_->setViewInfo(zoomLevel_, profileEnabled_, profileBlend_,
                 hasProfileLut_, lensEnabled_, isSmartPreview_);
         }
+    } else if (viewMode_ == ViewMode::Map) {
+        // G key handles return to grid (mode-independent below)
     } else {
         // Grid mode: if search bar is active, only handle ESC
         if (searchBar_ && searchBar_->isActive()) {
@@ -712,10 +724,42 @@ void tcApp::keyPressed(int key) {
             repairLibrary();
         } else if (key == 'C') {  // Shift+C only (uppercase)
             consolidateLibrary();
+        } else if (key == 'M' || key == 'm') {
+            // Toggle map view
+            if (viewMode_ == ViewMode::Grid) {
+                viewMode_ = ViewMode::Map;
+                grid_->setActive(false);
+                if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
+
+                // Populate map pins from current photo list
+                vector<string> ids;
+                vector<PhotoEntry> photos;
+                for (size_t i = 0; i < grid_->getPhotoIdCount(); i++) {
+                    const string& id = grid_->getPhotoId((int)i);
+                    ids.push_back(id);
+                    auto* e = provider_.getPhoto(id);
+                    if (e) photos.push_back(*e);
+                    else photos.push_back(PhotoEntry{});
+                }
+                mapView_->setPhotos(photos, ids);
+                mapView_->setActive(true);
+                mapView_->fitBounds();
+                updateLayout();
+            }
         }
     }
 
     // Mode-independent keys
+    if (key == 'G' || key == 'g') {
+        if (viewMode_ == ViewMode::Single) {
+            exitFullImage();
+        } else if (viewMode_ == ViewMode::Map) {
+            viewMode_ = ViewMode::Grid;
+            mapView_->setActive(false);
+            grid_->setActive(true);
+            updateLayout();
+        }
+    }
     if ((key == 'F' || key == 'f') && cmdDown_) {
         // Cmd+F: activate search bar (grid mode only)
         if (viewMode_ == ViewMode::Grid && searchBar_) {
@@ -752,6 +796,7 @@ void tcApp::keyReleased(int key) {
 }
 
 void tcApp::mousePressed(Vec2 pos, int button) {
+    if (viewMode_ == ViewMode::Map) return;  // MapView handles via Node events
     if (viewMode_ == ViewMode::Single && button == 0) {
         isDragging_ = true;
         dragStart_ = pos;
@@ -771,6 +816,7 @@ void tcApp::mouseMoved(Vec2 pos) {
 }
 
 void tcApp::mouseDragged(Vec2 pos, int button) {
+    if (viewMode_ == ViewMode::Map) return;  // MapView handles via Node events
     if (viewMode_ == ViewMode::Single && button == 0 && isDragging_) {
         Vec2 delta = pos - dragStart_;
         panOffset_ = panOffset_ + delta;
@@ -782,6 +828,8 @@ void tcApp::mouseDragged(Vec2 pos, int button) {
 void tcApp::mouseScrolled(Vec2 delta) {
     redraw();
 
+    // Map view handles its own scroll via Node events
+    if (viewMode_ == ViewMode::Map) return;
     if (viewMode_ != ViewMode::Single) return;
 
     bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
@@ -859,6 +907,7 @@ void tcApp::exit() {
         server_.stop();
     }
 
+    if (mapView_) mapView_->shutdown();
     uploadQueue_.stop();
     if (syncThread_.joinable()) syncThread_.join();
     if (rawLoadThread_.joinable()) rawLoadThread_.join();
@@ -1291,8 +1340,13 @@ void tcApp::updateLayout() {
         }
     }
 
-    // Grid
+    // Grid / Map
     if (grid_) grid_->setRect(contentX, contentY, contentW, contentH);
+    if (mapView_) {
+        if (viewMode_ == ViewMode::Map) {
+            mapView_->setRect(contentX, contentY, contentW, contentH);
+        }
+    }
 
     // MetadataPanel — always full width, slide via X position
     if (metadataPanel_) {

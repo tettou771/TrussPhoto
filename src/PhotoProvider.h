@@ -1472,6 +1472,45 @@ private:
         db_.updateThumbnailPath(photo.id, cachePath);
     }
 
+    // Parse XMP GPS string like "35,41.25894N" or "139,50.14254E" to decimal degrees
+    // Lightroom writes GPS in deg,min.fracDir format
+    static double parseXmpGpsCoord(const string& str) {
+        if (str.empty()) return 0;
+
+        // Extract direction letter (last char: N/S/E/W)
+        char dir = str.back();
+        string numPart = str.substr(0, str.size() - 1);
+
+        // Split by comma: "35,41.25894"
+        auto commaPos = numPart.find(',');
+        if (commaPos == string::npos) return 0;
+
+        double deg = 0, min = 0;
+        try {
+            deg = stod(numPart.substr(0, commaPos));
+            min = stod(numPart.substr(commaPos + 1));
+        } catch (...) {
+            return 0;
+        }
+
+        double result = deg + min / 60.0;
+        if (dir == 'S' || dir == 'W') result = -result;
+        return result;
+    }
+
+    // Convert EXIF GPS DMS (Rational x3) to decimal degrees
+    static double exifGpsToDecimal(const Exiv2::Value& value) {
+        if (value.count() < 3) return 0;
+        auto r0 = value.toRational(0);
+        auto r1 = value.toRational(1);
+        auto r2 = value.toRational(2);
+        if (r0.second == 0 || r1.second == 0 || r2.second == 0) return 0;
+        double deg = (double)r0.first / (double)r0.second;
+        double min = (double)r1.first / (double)r1.second;
+        double sec = (double)r2.first / (double)r2.second;
+        return deg + min / 60.0 + sec / 3600.0;
+    }
+
     // Extract EXIF/MakerNote metadata using exiv2
     static void extractExifMetadata(const string& path, PhotoEntry& photo) {
         try {
@@ -1500,16 +1539,68 @@ private:
             photo.iso = getFloat("Exif.Photo.ISOSpeedRatings");
             photo.dateTimeOriginal = getString("Exif.Photo.DateTimeOriginal");
 
-            // Image dimensions from EXIF
+            // Image dimensions from EXIF (try multiple tags)
             auto wIt = exif.findKey(Exiv2::ExifKey("Exif.Photo.PixelXDimension"));
             auto hIt = exif.findKey(Exiv2::ExifKey("Exif.Photo.PixelYDimension"));
             if (wIt != exif.end()) photo.width = (int)wIt->toInt64();
             if (hIt != exif.end()) photo.height = (int)hIt->toInt64();
 
+            // Fallback: Exif.Image.ImageWidth/ImageLength
+            if (photo.width == 0 || photo.height == 0) {
+                auto w2 = exif.findKey(Exiv2::ExifKey("Exif.Image.ImageWidth"));
+                auto h2 = exif.findKey(Exiv2::ExifKey("Exif.Image.ImageLength"));
+                if (w2 != exif.end() && photo.width == 0) photo.width = (int)w2->toInt64();
+                if (h2 != exif.end() && photo.height == 0) photo.height = (int)h2->toInt64();
+            }
+
+            // Fallback: read from image file header (JPEG SOF, PNG IHDR, etc.)
+            if (photo.width == 0 || photo.height == 0) {
+                int w = 0, h = 0, ch = 0;
+                if (stbi_info(path.c_str(), &w, &h, &ch)) {
+                    if (photo.width == 0) photo.width = w;
+                    if (photo.height == 0) photo.height = h;
+                }
+            }
+
             // Sony MakerNote: Creative Style
             string style = getString("Exif.Sony2.CreativeStyle");
             if (!style.empty()) {
                 photo.creativeStyle = style;
+            }
+
+            // GPS coordinates
+            // Use toString() for Ref (returns "N"/"S"/"E"/"W"), not print() which returns "North"/"West"
+            auto getRawString = [&](const char* key) -> string {
+                auto it = exif.findKey(Exiv2::ExifKey(key));
+                if (it != exif.end()) return it->toString();
+                return "";
+            };
+
+            auto latIt = exif.findKey(Exiv2::ExifKey("Exif.GPSInfo.GPSLatitude"));
+            string latRef = getRawString("Exif.GPSInfo.GPSLatitudeRef");
+            if (latIt != exif.end() && !latRef.empty()) {
+                photo.latitude = exifGpsToDecimal(latIt->value());
+                if (latRef == "S") photo.latitude = -photo.latitude;
+            }
+
+            auto lonIt = exif.findKey(Exiv2::ExifKey("Exif.GPSInfo.GPSLongitude"));
+            string lonRef = getRawString("Exif.GPSInfo.GPSLongitudeRef");
+            if (lonIt != exif.end() && !lonRef.empty()) {
+                photo.longitude = exifGpsToDecimal(lonIt->value());
+                if (lonRef == "W") photo.longitude = -photo.longitude;
+            }
+
+            auto altIt = exif.findKey(Exiv2::ExifKey("Exif.GPSInfo.GPSAltitude"));
+            if (altIt != exif.end()) {
+                auto altR = altIt->value().toRational(0);
+                if (altR.second != 0) {
+                    photo.altitude = (double)altR.first / (double)altR.second;
+                }
+                // Check altitude ref (1 = below sea level)
+                auto altRefIt = exif.findKey(Exiv2::ExifKey("Exif.GPSInfo.GPSAltitudeRef"));
+                if (altRefIt != exif.end() && altRefIt->toInt64() == 1) {
+                    photo.altitude = -photo.altitude;
+                }
             }
         } catch (...) {
             // exiv2 failed, leave metadata empty
@@ -1667,6 +1758,38 @@ private:
             }
             if (!tagArr.empty()) {
                 photo.tags = tagArr.dump();
+            }
+
+            // GPS from XMP (Lightroom writes exif:GPSLatitude/GPSLongitude)
+            if (!photo.hasGps()) {
+                auto gpsLatIt = xmp.findKey(Exiv2::XmpKey("Xmp.exif.GPSLatitude"));
+                auto gpsLonIt = xmp.findKey(Exiv2::XmpKey("Xmp.exif.GPSLongitude"));
+                if (gpsLatIt != xmp.end() && gpsLonIt != xmp.end()) {
+                    photo.latitude = parseXmpGpsCoord(gpsLatIt->toString());
+                    photo.longitude = parseXmpGpsCoord(gpsLonIt->toString());
+                }
+
+                auto gpsAltIt = xmp.findKey(Exiv2::XmpKey("Xmp.exif.GPSAltitude"));
+                if (gpsAltIt != xmp.end()) {
+                    // Altitude is stored as rational string like "59000/10000"
+                    string altStr = gpsAltIt->toString();
+                    auto slashPos = altStr.find('/');
+                    if (slashPos != string::npos) {
+                        try {
+                            double num = stod(altStr.substr(0, slashPos));
+                            double den = stod(altStr.substr(slashPos + 1));
+                            if (den != 0) photo.altitude = num / den;
+                        } catch (...) {}
+                    } else {
+                        try { photo.altitude = stod(altStr); } catch (...) {}
+                    }
+
+                    // Check altitude ref
+                    auto altRefIt = xmp.findKey(Exiv2::XmpKey("Xmp.exif.GPSAltitudeRef"));
+                    if (altRefIt != xmp.end() && altRefIt->toString() == "1") {
+                        photo.altitude = -photo.altitude;
+                    }
+                }
             }
 
             // Use sidecar mtime as updatedAt

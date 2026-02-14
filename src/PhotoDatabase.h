@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 4;
+    static constexpr int SCHEMA_VERSION = 5;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -62,7 +62,10 @@ public:
                 "  color_label_updated_at INTEGER NOT NULL DEFAULT 0,"
                 "  flag_updated_at      INTEGER NOT NULL DEFAULT 0,"
                 "  memo_updated_at      INTEGER NOT NULL DEFAULT 0,"
-                "  tags_updated_at      INTEGER NOT NULL DEFAULT 0"
+                "  tags_updated_at      INTEGER NOT NULL DEFAULT 0,"
+                "  latitude             REAL NOT NULL DEFAULT 0,"
+                "  longitude            REAL NOT NULL DEFAULT 0,"
+                "  altitude             REAL NOT NULL DEFAULT 0"
                 ")"
             );
             if (!ok) return false;
@@ -117,8 +120,26 @@ public:
                 logError() << "[PhotoDatabase] Migration v3->v4 failed";
                 return false;
             }
+            version = 4;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v3 -> v4";
+        }
+
+        // v4 -> v5: add GPS columns
+        if (version == 4) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN latitude REAL NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN longitude REAL NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN altitude REAL NOT NULL DEFAULT 0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v4->v5 failed: " << sql;
+                    return false;
+                }
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v3 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v4 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -135,9 +156,10 @@ public:
             "camera_make, camera, lens, lens_make, width, height, is_raw, creative_style, "
             "focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
-            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at) "
+            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
+            "latitude, longitude, altitude) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)"
         );
         if (!stmt.valid()) return false;
         bindEntry(stmt, e);
@@ -272,9 +294,10 @@ public:
             "camera_make, camera, lens, lens_make, width, height, is_raw, creative_style, "
             "focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
-            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at) "
+            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
+            "latitude, longitude, altitude) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32)"
         );
         if (!stmt.valid()) {
             db_.rollback();
@@ -304,7 +327,8 @@ public:
             "camera_make, camera, lens, lens_make, "
             "width, height, is_raw, creative_style, focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
-            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at "
+            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
+            "latitude, longitude, altitude "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -340,6 +364,9 @@ public:
             e.flagUpdatedAt      = stmt.getInt64(26);
             e.memoUpdatedAt      = stmt.getInt64(27);
             e.tagsUpdatedAt      = stmt.getInt64(28);
+            e.latitude           = stmt.getDouble(29);
+            e.longitude          = stmt.getDouble(30);
+            e.altitude           = stmt.getDouble(31);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -508,5 +535,8 @@ private:
         stmt.bind(27, e.flagUpdatedAt);
         stmt.bind(28, e.memoUpdatedAt);
         stmt.bind(29, e.tagsUpdatedAt);
+        stmt.bind(30, e.latitude);
+        stmt.bind(31, e.longitude);
+        stmt.bind(32, e.altitude);
     }
 };

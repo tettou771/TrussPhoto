@@ -15,6 +15,7 @@
 #include "MetadataPanel.h"
 #include "PaneToggle.h"
 #include "SearchBar.h"
+#include "MapView.h"
 #include "UploadQueue.h"
 #include "CameraProfileManager.h"
 #include "ServerConfig.h"
@@ -25,7 +26,8 @@ using namespace tc;
 // View mode
 enum class ViewMode {
     Grid,       // Thumbnail grid
-    Single      // Single image view
+    Single,     // Single image view
+    Map         // Map view with GPS pins
 };
 
 class tcApp : public App {
@@ -59,6 +61,7 @@ private:
     bool showMetadata_ = true;
     float metadataWidth_ = 260;
     MetadataPanel::Ptr metadataPanel_;
+    MapView::Ptr mapView_;
     SearchBar::Ptr searchBar_;
     float searchBarHeight_ = 36;
     PaneToggle::Ptr leftToggle_;

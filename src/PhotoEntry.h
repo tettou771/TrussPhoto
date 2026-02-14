@@ -50,6 +50,13 @@ struct PhotoEntry {
     int64_t memoUpdatedAt = 0;
     int64_t tagsUpdatedAt = 0;
 
+    // GPS (0 = not available, use hasGps() to check)
+    double latitude = 0;     // decimal degrees, positive=N
+    double longitude = 0;    // decimal degrees, positive=E
+    double altitude = 0;     // meters above sea level
+
+    bool hasGps() const { return latitude != 0 || longitude != 0; }
+
     // State
     SyncState syncState = SyncState::LocalOnly;
 };
@@ -85,7 +92,10 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"colorLabelUpdatedAt", e.colorLabelUpdatedAt},
         {"flagUpdatedAt", e.flagUpdatedAt},
         {"memoUpdatedAt", e.memoUpdatedAt},
-        {"tagsUpdatedAt", e.tagsUpdatedAt}
+        {"tagsUpdatedAt", e.tagsUpdatedAt},
+        {"latitude", e.latitude},
+        {"longitude", e.longitude},
+        {"altitude", e.altitude}
     };
 }
 
@@ -119,6 +129,10 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.flagUpdatedAt = j.value("flagUpdatedAt", (int64_t)0);
     e.memoUpdatedAt = j.value("memoUpdatedAt", (int64_t)0);
     e.tagsUpdatedAt = j.value("tagsUpdatedAt", (int64_t)0);
+
+    e.latitude = j.value("latitude", 0.0);
+    e.longitude = j.value("longitude", 0.0);
+    e.altitude = j.value("altitude", 0.0);
 
     int state = j.value("syncState", 0);
     e.syncState = static_cast<SyncState>(state);

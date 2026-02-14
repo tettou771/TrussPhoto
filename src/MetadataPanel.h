@@ -167,6 +167,14 @@ private:
             y += sectionGap_;
         }
 
+        // Location section
+        if (e.hasGps()) {
+            y += lineH_; // header
+            y += lineH_; // coordinates
+            if (e.altitude != 0) y += lineH_;
+            y += sectionGap_;
+        }
+
         // Metadata section
         if (e.rating > 0 || !e.colorLabel.empty() || e.flag != 0 || !e.tags.empty()) {
             y += lineH_; // header
@@ -286,6 +294,21 @@ private:
 
             if (!e.creativeStyle.empty()) {
                 drawValue(e.creativeStyle, y, Color(0.6f, 0.6f, 0.65f));
+            }
+            y += sectionGap_;
+        }
+
+        // === Location ===
+        if (e.hasGps()) {
+            drawSectionHeader("Location", y, w);
+
+            string coords = format("{:.4f}{} {}, {:.4f}{} {}",
+                abs(e.latitude), "\xC2\xB0", e.latitude >= 0 ? "N" : "S",
+                abs(e.longitude), "\xC2\xB0", e.longitude >= 0 ? "E" : "W");
+            drawValue(coords, y, Color(0.65f, 0.75f, 0.85f));
+
+            if (e.altitude != 0) {
+                drawValue(format("Alt: {:.0f}m", e.altitude), y, Color(0.6f, 0.6f, 0.65f));
             }
             y += sectionGap_;
         }
