@@ -161,14 +161,17 @@ public:
         // Draw tiles
         for (int ty = tileMinY; ty <= tileMaxY; ty++) {
             for (int tx = tileMinX; tx <= tileMaxX; tx++) {
+                // Compute tile rect from edge positions to avoid float gaps
                 float drawX = (float)(tx * tileSize) - left;
                 float drawY = (float)(ty * tileSize) - top;
+                float drawW = (float)((tx + 1) * tileSize) - left - drawX;
+                float drawH = (float)((ty + 1) * tileSize) - top - drawY;
 
                 TileKey key{tileZoom, tx, ty};
                 auto it = tileCache_.find(key);
                 if (it != tileCache_.end() && it->second.isAllocated()) {
                     setColor(1.0f, 1.0f, 1.0f);
-                    it->second.draw(drawX, drawY, (float)tileSize, (float)tileSize);
+                    it->second.draw(drawX, drawY, drawW, drawH);
                 } else {
                     // Fallback: draw parent tile's sub-region (blurry but better than nothing)
                     bool fallbackDrawn = false;
@@ -180,7 +183,7 @@ public:
                             float sx = (tx % 2) * 128.0f;
                             float sy = (ty % 2) * 128.0f;
                             pit->second.drawSubsection(
-                                drawX, drawY, (float)tileSize, (float)tileSize,
+                                drawX, drawY, drawW, drawH,
                                 sx, sy, 128, 128);
                             fallbackDrawn = true;
                         }
@@ -188,7 +191,7 @@ public:
                     if (!fallbackDrawn) {
                         setColor(0.15f, 0.15f, 0.18f);
                         fill();
-                        drawRect(drawX, drawY, (float)tileSize, (float)tileSize);
+                        drawRect(drawX, drawY, drawW, drawH);
                     }
 
                     // Request tile
