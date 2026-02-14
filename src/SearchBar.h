@@ -29,6 +29,7 @@ public:
     void activate() {
         if (active_) return;
         active_ = true;
+        lastInputTime_ = getElapsedTimef();
         ime_.enable();
         redraw();
     }
@@ -58,11 +59,33 @@ public:
     void update() override {
         if (!active_) return;
 
-        // Detect text changes
+        // Detect text changes (confirmed text)
         string current = getQuery();
         if (current != lastQuery_) {
             lastQuery_ = current;
+            lastInputTime_ = getElapsedTimef();
             if (onSearch) onSearch(current);
+        }
+
+        // Detect composition changes (IME preedit) for redraw
+        string marked = ime_.getMarkedText();
+        if (marked != lastMarked_) {
+            lastMarked_ = marked;
+            lastInputTime_ = getElapsedTimef();
+            redraw();
+        }
+
+        // Auto-deactivate after idle timeout (save battery from cursor blink)
+        if (getElapsedTimef() - lastInputTime_ > idleTimeout_) {
+            deactivate();
+            return;
+        }
+
+        // Cursor blink: redraw on phase change (~2 redraws/sec)
+        bool cursorOn = fmod(getElapsedTimef(), 1.0f) < 0.5f;
+        if (cursorOn != lastCursorOn_) {
+            lastCursorOn_ = cursorOn;
+            redraw();
         }
     }
 
@@ -121,5 +144,9 @@ private:
     tcxIME ime_;
     Font labelFont_;
     bool active_ = false;
+    bool lastCursorOn_ = false;
+    float lastInputTime_ = 0;
+    static constexpr float idleTimeout_ = 600.0f;  // 10 minutes
     string lastQuery_;
+    string lastMarked_;
 };
