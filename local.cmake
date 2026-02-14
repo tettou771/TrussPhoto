@@ -24,12 +24,25 @@ if(NOT EMSCRIPTEN)
     message(STATUS "[${PROJECT_NAME}] Found libjxl: ${JXL_VERSION}")
 
     # onnxruntime - CLIP embedding inference
-    # brew install onnxruntime
-    pkg_check_modules(ORT REQUIRED libonnxruntime)
-    target_include_directories(${PROJECT_NAME} PRIVATE ${ORT_INCLUDE_DIRS})
-    target_link_directories(${PROJECT_NAME} PRIVATE ${ORT_LIBRARY_DIRS})
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${ORT_LIBRARIES})
-    message(STATUS "[${PROJECT_NAME}] Found onnxruntime: ${ORT_VERSION}")
+    # NOTE: brew onnxruntime 1.24.1 produces NaN for EVA02-based models (LINE CLIP v2).
+    # The official Microsoft build (pip onnxruntime) works correctly.
+    # Use pip's dylib if available, fall back to brew.
+    set(_ORT_PIP_DIR "${CMAKE_SOURCE_DIR}/.venv/lib")
+    file(GLOB _ORT_PIP_DYLIB "${_ORT_PIP_DIR}/python*/site-packages/onnxruntime/capi/libonnxruntime.*.dylib")
+    if(_ORT_PIP_DYLIB)
+        list(GET _ORT_PIP_DYLIB 0 _ORT_PIP_DYLIB)
+        # Use brew headers (version-compatible) + pip dylib (correct build)
+        pkg_check_modules(ORT REQUIRED libonnxruntime)
+        target_include_directories(${PROJECT_NAME} PRIVATE ${ORT_INCLUDE_DIRS})
+        target_link_libraries(${PROJECT_NAME} PRIVATE "${_ORT_PIP_DYLIB}")
+        message(STATUS "[${PROJECT_NAME}] Using pip onnxruntime: ${_ORT_PIP_DYLIB}")
+    else()
+        pkg_check_modules(ORT REQUIRED libonnxruntime)
+        target_include_directories(${PROJECT_NAME} PRIVATE ${ORT_INCLUDE_DIRS})
+        target_link_directories(${PROJECT_NAME} PRIVATE ${ORT_LIBRARY_DIRS})
+        target_link_libraries(${PROJECT_NAME} PRIVATE ${ORT_LIBRARIES})
+        message(STATUS "[${PROJECT_NAME}] Found onnxruntime (brew): ${ORT_VERSION}")
+    endif()
 endif()
 
 # SQLite amalgamation - embedded database for photo library
@@ -40,6 +53,20 @@ FetchContent_Declare(
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 FetchContent_MakeAvailable(sqlite3)
+
+# SentencePiece - tokenizer for Japanese Stable CLIP text encoder
+set(SPM_ENABLE_SHARED OFF CACHE BOOL "" FORCE)
+set(SPM_ENABLE_TCMALLOC OFF CACHE BOOL "" FORCE)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+FetchContent_Declare(
+    sentencepiece
+    GIT_REPOSITORY https://github.com/google/sentencepiece.git
+    GIT_TAG        v0.2.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(sentencepiece)
+target_link_libraries(${PROJECT_NAME} PRIVATE sentencepiece-static)
+target_include_directories(${PROJECT_NAME} PRIVATE ${sentencepiece_SOURCE_DIR}/src)
 
 add_library(sqlite3_lib STATIC ${sqlite3_SOURCE_DIR}/sqlite3.c)
 target_include_directories(sqlite3_lib PUBLIC ${sqlite3_SOURCE_DIR})

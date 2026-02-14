@@ -867,17 +867,20 @@ public:
 
     bool isEmbedderReady() const { return clipEmbedder_.isReady(); }
     bool isEmbedderInitializing() const { return clipEmbedder_.isInitializing(); }
-    bool isEmbedderDownloading() const { return clipEmbedder_.isDownloading(); }
-    float getEmbedderDownloadProgress() { return clipEmbedder_.getDownloadProgress(); }
     const string& getEmbedderStatus() const { return clipEmbedder_.getStatusText(); }
     bool isTextEncoderReady() const { return textEncoder_.isReady(); }
+
+    // Unload vision model to free ~340MB memory (after all embeddings generated)
+    void unloadVisionModel() {
+        clipEmbedder_.unload();
+    }
 
     // Load all image embeddings from DB into memory cache
     void loadEmbeddingCache() {
         auto ids = getSortedIds();
         int loaded = 0;
         for (const auto& id : ids) {
-            auto vec = db_.getEmbedding(id, ClipEmbedder::MODEL_NAME);
+            auto vec = db_.getEmbedding(id, clipEmbedder_.MODEL_NAME);
             if (!vec.empty()) {
                 embeddingCache_[id] = std::move(vec);
                 loaded++;
@@ -921,11 +924,12 @@ public:
         float botScore = all.back().score;
         float spread = topScore - botScore;
 
-        // Dynamic filtering: if clear separation exists, cut low scorers
+        // Dynamic filtering: spread-based cutoff (model-agnostic)
+        // If scores are well-spread, keep only the top cluster.
+        // If scores are clustered (no clear match), return all sorted.
         vector<SearchResult> results;
-        if (spread > 0.03f && topScore > 0.2f) {
-            // Keep items within 85% of top score
-            float cutoff = topScore * 0.85f;
+        if (spread > 0.03f) {
+            float cutoff = topScore - spread * 0.35f;
             for (const auto& r : all) {
                 if (r.score >= cutoff) results.push_back(r);
             }
@@ -944,7 +948,7 @@ public:
     // Queue all photos that don't have embeddings yet
     int queueAllMissingEmbeddings() {
         if (!clipEmbedder_.isReady()) return 0;
-        auto ids = db_.getPhotosWithoutEmbedding(ClipEmbedder::MODEL_NAME);
+        auto ids = db_.getPhotosWithoutEmbedding(clipEmbedder_.MODEL_NAME);
         if (ids.empty()) return 0;
 
         lock_guard<mutex> lock(embMutex_);
@@ -960,7 +964,7 @@ public:
         if (!clipEmbedder_.isReady() || ids.empty()) return;
         lock_guard<mutex> lock(embMutex_);
         for (const auto& id : ids) {
-            if (!db_.hasEmbedding(id, ClipEmbedder::MODEL_NAME)) {
+            if (!db_.hasEmbedding(id, clipEmbedder_.MODEL_NAME)) {
                 pendingEmbeddings_.push_back(id);
             }
         }
@@ -972,7 +976,7 @@ public:
         lock_guard<mutex> lock(embMutex_);
         int count = (int)completedEmbeddings_.size();
         for (const auto& result : completedEmbeddings_) {
-            db_.insertEmbedding(result.photoId, ClipEmbedder::MODEL_NAME,
+            db_.insertEmbedding(result.photoId, clipEmbedder_.MODEL_NAME,
                                 "image", result.embedding);
             // Update in-memory cache
             embeddingCache_[result.photoId] = result.embedding;

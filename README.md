@@ -6,8 +6,10 @@ TrussC ベースの写真管理・RAW現像アプリケーション。
 ## 特徴
 
 - **RAW対応**: LibRaw によるRAWデコード、プログレッシブ表示（半サイズ即時 → フルサイズバックグラウンド）
+- **CLIP セマンティック検索**: 自然言語で写真を検索（multilingual対応で日本語もOK）
 - **カメラプロファイル**: Creative Style別の LUT (.cube) をGPUシェーダーで適用
 - **レンズ補正**: lensfun DB ベースの歪曲・周辺光量・色収差補正（自前実装）
+- **スマートプレビュー**: JPEG XL 16bit lossless で RAW 不在時もフル解像度表示
 - **セルフホストサーバ**: REST API サーバとの同期・自動アップロード
 - **MCP対応**: AI エージェントからの操作（フォルダ読み込み、サーバ設定、ライブラリ修復）
 - **省電力**: イベント駆動レンダリング（変更時のみ描画）
@@ -48,11 +50,14 @@ cmake --build build-macos
 |------|------|
 | フレームワーク | TrussC (sokol) |
 | RAW デコード | LibRaw (tcxLibRaw アドオン) |
-| HTTP クライアント | libcurl (tcxCurl アドオン) |
+| メタデータ | exiv2 (EXIF / MakerNote / XMP) |
+| スマートプレビュー | libjxl (JPEG XL 16bit lossless) |
+| セマンティック検索 | CLIP ViT-B/32 + ONNX Runtime |
 | カラーグレーディング | GPU LUT シェーダー (tcxLut アドオン) |
-| メタデータ | exiv2 (EXIF / MakerNote) |
 | レンズ補正 | lensfun XML + 自前実装 |
+| HTTP クライアント | libcurl (tcxCurl アドオン) |
 | サーバ | Crow (tcxCrow アドオン) |
+| データベース | SQLite (FetchContent) |
 
 ## ライセンス
 

@@ -431,10 +431,19 @@ void tcApp::update() {
         }
     }
 
-    // Redraw during model download (progress bar)
+    // Unload vision model after all embeddings are generated (free ~340MB)
+    if (embeddingsQueued_ && !visionModelUnloaded_ &&
+        !provider_.isEmbeddingRunning() && provider_.isEmbedderReady()) {
+        visionModelUnloaded_ = true;
+        provider_.unloadVisionModel();
+        logNotice() << "[CLIP] Vision model unloaded (all embeddings done)";
+    }
+
+    // Redraw during model loading
     if (provider_.isEmbedderInitializing()) {
         redraw();
     }
+
 
     // Process consolidation results
     provider_.processConsolidateResults();
@@ -535,28 +544,6 @@ void tcApp::draw() {
         fontSmall_.drawString(provider_.getEmbedderStatus(),
             centerX, centerY - 20, Direction::Center, Direction::Center);
 
-        // Progress bar (only during download)
-        if (provider_.isEmbedderDownloading()) {
-            float barW = 300;
-            float barH = 6;
-            float barX = centerX - barW / 2;
-            float barY2 = centerY;
-            float progress = provider_.getEmbedderDownloadProgress();
-
-            // Background
-            setColor(0.15f, 0.15f, 0.18f);
-            fill();
-            drawRect(barX, barY2, barW, barH);
-
-            // Fill
-            setColor(0.3f, 0.55f, 0.9f);
-            drawRect(barX, barY2, barW * progress, barH);
-
-            // Percentage
-            setColor(0.5f, 0.5f, 0.55f);
-            fontSmall_.drawString(format("{:.0f}%", progress * 100),
-                centerX, barY2 + 20, Direction::Center, Direction::Center);
-        }
         popStyle();
     }
 
@@ -1343,6 +1330,7 @@ void tcApp::rebuildFolderTree() {
     if (!folderTree_) return;
     auto folders = provider_.buildFolderList();
     folderTree_->buildTree(folders, provider_.getRawStoragePath());
+    redraw();
 }
 
 void tcApp::updateMetadataPanel() {
@@ -1363,4 +1351,5 @@ void tcApp::updateMetadataPanel() {
     } else {
         metadataPanel_->setPhoto(nullptr);
     }
+    redraw();
 }

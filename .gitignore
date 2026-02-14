@@ -26,6 +26,10 @@ bin/*
 bin/data/*.json
 bin/data/thumbnail_cache/
 
+# Python virtual environment
+.venv/
+__pycache__/
+
 # IDE specific
 .vscode/
 .vs/

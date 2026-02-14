@@ -1,13 +1,13 @@
 #pragma once
 
 // =============================================================================
-// ClipTextEncoder.h - CLIP text encoder (ViT-B/32 text branch)
+// ClipTextEncoder.h - Text encoder for semantic search (SigLIP2)
 // =============================================================================
-// Tokenizes text with BPE, runs ONNX text model → 512-dim L2-normalized vector.
-// Auto-downloads text model + vocab/merges if missing.
+// Currently: waon-siglip2-base-patch16-256 (SentencePiece/Gemma, 768-dim)
+// Extensible: add new Mode + loadXxx() + encode branch for future models.
 
 #include "OnnxRunner.h"
-#include "ClipTokenizer.h"
+#include "SentencePieceTokenizer.h"
 #include <TrussC.h>
 #include <filesystem>
 #include <thread>
@@ -22,61 +22,38 @@ namespace fs = std::filesystem;
 
 class ClipTextEncoder {
 public:
-    static constexpr int EMBED_DIM = 512;
-    static constexpr const char* MODEL_FILE = "clip-vit-b32-text.onnx";
-    static constexpr const char* MODEL_URL =
-        "https://huggingface.co/Qdrant/clip-ViT-B-32-text/resolve/main/model.onnx";
-    static constexpr const char* VOCAB_FILE = "clip-vit-b32-vocab.json";
-    static constexpr const char* MERGES_FILE = "clip-vit-b32-merges.txt";
-    static constexpr const char* VOCAB_URL =
-        "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/vocab.json";
-    static constexpr const char* MERGES_URL =
-        "https://huggingface.co/openai/clip-vit-base-patch32/resolve/main/merges.txt";
+    // Embedding dim (set after load)
+    int EMBED_DIM = 768;
 
-    // Load tokenizer + model (blocking — call from background thread)
+    // SigLIP2 model files
+    static constexpr const char* SIGLIP2_MODEL_FILE = "waon-siglip2-text.onnx";
+    static constexpr const char* SIGLIP2_SPIECE_FILE = "waon-siglip2-spiece.model";
+
+    enum class Mode { None, SigLIP2 };
+
+    // Load tokenizer + model in background thread
     void loadAsync(const string& modelDir) {
         modelDir_ = modelDir;
         fs::create_directories(modelDir);
 
         initThread_ = thread([this]() {
-            // 1. Load tokenizer (download vocab/merges if needed)
-            string vocabPath = modelDir_ + "/" + VOCAB_FILE;
-            string mergesPath = modelDir_ + "/" + MERGES_FILE;
-
-            if (!fs::exists(vocabPath)) {
-                downloadFile(VOCAB_URL, vocabPath);
+            string modelPath = modelDir_ + "/" + SIGLIP2_MODEL_FILE;
+            string spiecePath = modelDir_ + "/" + SIGLIP2_SPIECE_FILE;
+            if (fs::exists(modelPath) && fs::exists(spiecePath)) {
+                loadSigLIP2(modelPath, spiecePath);
+            } else {
+                logError() << "[TextEncoder] SigLIP2 model not found in " << modelDir_;
+                logError() << "[TextEncoder] Run: python scripts/export_siglip2.py";
             }
-            if (!fs::exists(mergesPath)) {
-                downloadFile(MERGES_URL, mergesPath);
-            }
-
-            if (!tokenizer_.load(vocabPath, mergesPath)) {
-                logError() << "[TextEncoder] Failed to load tokenizer";
-                return;
-            }
-
-            // 2. Load ONNX model (download if needed)
-            string modelPath = modelDir_ + "/" + MODEL_FILE;
-            if (!fs::exists(modelPath)) {
-                logNotice() << "[TextEncoder] Downloading text model...";
-                downloadFile(MODEL_URL, modelPath);
-            }
-
-            if (!runner_.load(modelPath)) {
-                logError() << "[TextEncoder] Failed to load ONNX model";
-                return;
-            }
-            runner_.printModelInfo();
-
-            ready_ = true;
-            logNotice() << "[TextEncoder] Ready";
         });
         initThread_.detach();
     }
 
     bool isReady() const { return ready_; }
+    Mode getMode() const { return mode_; }
+    bool isMultilingual() const { return mode_ != Mode::None; }
 
-    // Encode text → 512-dim L2-normalized embedding
+    // Encode text -> L2-normalized embedding
     vector<float> encode(const string& text) {
         if (!ready_) return {};
 
@@ -86,18 +63,18 @@ public:
             if (it != cache_.end()) return it->second;
         }
 
-        // Tokenize
-        auto tokens = tokenizer_.encode(text);
+        vector<float> output;
 
-        // Build attention mask (1 for non-padding, 0 for padding)
-        vector<int64_t> attentionMask(ClipTokenizer::CONTEXT_LEN);
-        for (int i = 0; i < ClipTokenizer::CONTEXT_LEN; i++) {
-            attentionMask[i] = (tokens[i] != 0) ? 1 : 0;
+        if (mode_ == Mode::SigLIP2) {
+            // SigLIP2: SentencePiece (Gemma) -> [1, 64] + attention_mask (all ones!)
+            // SigLIP2 handles PAD internally; passing a real mask breaks embeddings.
+            auto tokens = spTokenizer_.encode(text);
+            int seqLen = spTokenizer_.getMaxSeqLen();
+            vector<int64_t> mask(seqLen, 1);
+            vector<int64_t> shape = {1, seqLen};
+            output = runner_.runInt64x2(tokens, mask, shape);
         }
 
-        // Run inference
-        vector<int64_t> shape = {1, ClipTokenizer::CONTEXT_LEN};
-        auto output = runner_.runInt64x2(tokens, attentionMask, shape);
         if (output.empty()) return {};
 
         // L2 normalize
@@ -113,11 +90,45 @@ public:
 
 private:
     OnnxRunner runner_;
-    ClipTokenizer tokenizer_;
+    SentencePieceTokenizer spTokenizer_;
     string modelDir_;
     atomic<bool> ready_{false};
+    Mode mode_ = Mode::None;
     thread initThread_;
     unordered_map<string, vector<float>> cache_;
+
+    void loadSigLIP2(const string& modelPath, const string& spiecePath) {
+        logNotice() << "[TextEncoder] SigLIP2 mode: loading SentencePiece...";
+
+        if (!spTokenizer_.load(spiecePath)) {
+            logError() << "[TextEncoder] Failed to load SigLIP2 SentencePiece model";
+            return;
+        }
+
+        // GemmaTokenizer config: PAD=0, EOS=1, BOS=2, UNK=3
+        // No CLS prefix, add EOS suffix, lowercase
+        spTokenizer_.configure(
+            -1,   // CLS (unused)
+            1,    // EOS
+            0,    // PAD
+            3,    // UNK
+            64,   // max_seq_len
+            false, // no CLS prefix
+            true,  // add EOS suffix
+            true   // lowercase
+        );
+
+        if (!runner_.load(modelPath)) {
+            logError() << "[TextEncoder] Failed to load SigLIP2 text model";
+            return;
+        }
+        runner_.printModelInfo();
+
+        mode_ = Mode::SigLIP2;
+        EMBED_DIM = 768;
+        ready_ = true;
+        logNotice() << "[TextEncoder] SigLIP2 mode ready (SentencePiece/Gemma, 768-dim)";
+    }
 
     static void l2Normalize(vector<float>& vec) {
         float norm = 0;
@@ -126,22 +137,5 @@ private:
         if (norm > 1e-8f) {
             for (float& v : vec) v /= norm;
         }
-    }
-
-    static bool downloadFile(const char* url, const string& destPath) {
-        string tmpPath = destPath + ".download";
-        string cmd = "curl -L -f -s -o '" + tmpPath + "' '" + string(url) + "'";
-        int ret = system(cmd.c_str());
-        if (ret != 0) {
-            logError() << "[TextEncoder] Download failed: " << url;
-            try { fs::remove(tmpPath); } catch (...) {}
-            return false;
-        }
-        try {
-            fs::rename(tmpPath, destPath);
-        } catch (...) {
-            return false;
-        }
-        return true;
     }
 };

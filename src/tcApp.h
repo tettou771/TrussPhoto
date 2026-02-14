@@ -119,6 +119,7 @@ private:
 
     // Embedding
     bool embeddingsQueued_ = false;
+    bool visionModelUnloaded_ = false;
 
     // Modifier key tracking
     bool cmdDown_ = false;
