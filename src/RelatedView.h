@@ -31,15 +31,12 @@ public:
     // Set center photo and compute layout
     void setCenter(const string& centerId, PhotoProvider& provider,
                    bool pushToHistory = true) {
-        // Ensure node tree is initialized (setup() may not have been called yet
-        // if the view was created with setActive(false))
         ensureInitialized();
 
-        // --- Snapshot old layout before clearing ---
+        // --- Snapshot old layout ---
         unordered_map<string, AnimSnapshot> oldSnapshots;
         bool hasOldLayout = !centerId_.empty();
         if (hasOldLayout) {
-            // Collect snapshots from existing nodes
             if (centerNode_) {
                 oldSnapshots[centerNode_->photoId] = {
                     centerNode_->targetWorldPos, centerNode_->targetSize};
@@ -57,7 +54,6 @@ public:
                     node->targetWorldPos, node->targetSize};
             }
 
-            // Push old center to history
             if (pushToHistory && !centerId_.empty()) {
                 history_.push_back(centerId_);
                 if ((int)history_.size() > MAX_HISTORY) {
@@ -66,12 +62,10 @@ public:
             }
         }
 
-        // --- Clear and recompute layout ---
+        // --- Compute new layout (into temporary items) ---
         centerId_ = centerId;
         provider_ = &provider;
         pendingLoads_.clear();
-
-        // Clear layout items (temporary data for computation)
         timelineItems_.clear();
         relatedItems_.clear();
         centerItem_ = {};
@@ -79,7 +73,6 @@ public:
         auto* centerEntry = provider.getPhoto(centerId);
         if (!centerEntry) return;
 
-        // Center item
         centerItem_.photoId = centerId;
         centerItem_.score = 1.0f;
         centerItem_.position = {0, 0};
@@ -88,13 +81,8 @@ public:
         centerItem_.height = centerEntry->height;
         centerItem_.isTimeline = false;
 
-        // Build timeline
         buildTimeline(provider);
-
-        // Compute related photos
         computeRelated(provider);
-
-        // Layout related photos (pass old positions for continuity)
         {
             unordered_map<string, Vec2> oldPos;
             if (hasOldLayout) {
@@ -105,35 +93,36 @@ public:
             layoutRelated(oldPos);
         }
 
-        // --- Smart texture management: keep textures still in use ---
-        unordered_set<string> neededIds;
-        neededIds.insert(centerItem_.photoId);
-        for (const auto& item : timelineItems_) neededIds.insert(item.photoId);
-        for (const auto& item : relatedItems_) neededIds.insert(item.photoId);
-        for (const auto& hid : history_) neededIds.insert(hid);
+        // --- Check if any old nodes will disappear ---
+        unordered_set<string> newIds;
+        newIds.insert(centerItem_.photoId);
+        for (const auto& item : timelineItems_) newIds.insert(item.photoId);
+        for (const auto& item : relatedItems_) newIds.insert(item.photoId);
+        for (const auto& hid : history_) newIds.insert(hid);
 
-        // Remove textures no longer needed
-        for (auto it = textures_.begin(); it != textures_.end(); ) {
-            if (neededIds.count(it->first) == 0) {
-                it = textures_.erase(it);
-            } else {
-                ++it;
+        bool hasFadeOuts = false;
+        if (hasOldLayout) {
+            for (auto* node : allPhotoNodes()) {
+                if (newIds.count(node->photoId) == 0) {
+                    hasFadeOuts = true;
+                    break;
+                }
             }
         }
 
-        // Queue loads only for items without textures
-        queueMissingThumbnails(neededIds);
-
-        // --- Rebuild node tree ---
-        rebuildNodes(oldSnapshots, hasOldLayout);
-
-        logNotice() << "[RelatedView] center=" << centerId
-                    << " timeline=" << timelineNodes_.size()
-                    << " related=" << relatedNodes_.size()
-                    << " history=" << historyNodes_.size();
+        if (hasFadeOuts) {
+            // Phase 1: fade out departing nodes, then rebuild
+            startFadeOut(newIds, oldSnapshots);
+        } else {
+            // No fade-outs: rebuild immediately
+            applyLayout(oldSnapshots, hasOldLayout);
+        }
     }
 
     void shutdown() {
+        fadingOutNodes_.clear();
+        pendingOldSnapshots_.clear();
+        fadeOutPhase_ = false;
         if (contentLayer_) contentLayer_->removeAllChildren();
         centerNode_ = nullptr;
         centerId_.clear();
@@ -179,7 +168,35 @@ public:
             startLoadThread();
         }
 
-        // Morphing animation update
+        // Phase 1: Fade-out departing nodes
+        if (fadeOutPhase_) {
+            auto now = chrono::steady_clock::now();
+            float dt = chrono::duration<float>(now - lastAnimTime_).count();
+            lastAnimTime_ = now;
+            fadeOutProgress_.update(dt);
+
+            float t = fadeOutProgress_.getValue();
+            for (auto& fn : fadingOutNodes_) {
+                fn->fadeAlpha = 1.0f - t;
+            }
+
+            if (onRedraw) onRedraw();
+            if (fadeOutProgress_.isComplete()) {
+                // Remove faded-out nodes
+                for (auto& fn : fadingOutNodes_) {
+                    contentLayer_->removeChild(fn);
+                }
+                fadingOutNodes_.clear();
+                fadeOutPhase_ = false;
+
+                // Now apply the pending layout with morph
+                applyLayout(pendingOldSnapshots_, true);
+                pendingOldSnapshots_.clear();
+            }
+            return;  // don't run morph during fade-out
+        }
+
+        // Phase 2: Morphing animation
         if (animating_) {
             auto now = chrono::steady_clock::now();
             float dt = chrono::duration<float>(now - lastAnimTime_).count();
@@ -188,7 +205,7 @@ public:
 
             float t = animProgress_.getValue();
 
-            // Interpolate all photo node positions
+            // Interpolate positions + fade-in new items
             for (auto* node : allPhotoNodes()) {
                 auto it = animOldSnapshots_.find(node->photoId);
                 if (it != animOldSnapshots_.end()) {
@@ -197,16 +214,19 @@ public:
                         (node->targetSize - it->second.displaySize) * t;
                     node->setPos(curPos.x - curSize / 2, curPos.y - curSize / 2);
                     node->setSize(curSize, curSize);
+                } else if (node->fadeAlpha < 1.0f) {
+                    // New item fading in
+                    node->fadeAlpha = t;
                 }
             }
 
             if (onRedraw) onRedraw();
             if (animProgress_.isComplete()) {
-                // Snap to final positions
                 for (auto* node : allPhotoNodes()) {
                     node->setPos(node->targetWorldPos.x - node->targetSize / 2,
                                  node->targetWorldPos.y - node->targetSize / 2);
                     node->setSize(node->targetSize, node->targetSize);
+                    node->fadeAlpha = 1.0f;
                 }
                 animating_ = false;
                 animOldSnapshots_.clear();
@@ -368,6 +388,9 @@ private:
         Vec2 targetWorldPos;   // layout target (world center coord)
         float targetSize = 0;  // layout target size
 
+        float fadeAlpha = 1.0f;  // 0→1 fade in, 1→0 fade out
+        bool fadingOut = false;  // true = scheduled for removal after fade
+
         // Borrowed pointers (owned by RelatedView)
         Texture* textureRef = nullptr;
         Font* fontRef = nullptr;
@@ -380,10 +403,13 @@ private:
         }
 
         void draw() override {
+            if (fadeAlpha <= 0.001f) return;
+
             float w = getWidth(), h = getHeight();
+            float a = fadeAlpha;
 
             // Border (drawn slightly outside)
-            setColor(borderColor);
+            setColor(borderColor.r, borderColor.g, borderColor.b, borderColor.a * a);
             fill();
             drawRect(-2, -2, w + 4, h + 4);
 
@@ -393,17 +419,17 @@ private:
                 float imgH = textureRef->getHeight();
                 float fitScale = min(w / imgW, h / imgH);
                 float dw = imgW * fitScale, dh = imgH * fitScale;
-                setColor(1, 1, 1);
+                setColor(1, 1, 1, a);
                 textureRef->draw((w - dw) / 2, (h - dh) / 2, dw, dh);
             } else {
-                setColor(0.15f, 0.15f, 0.18f);
+                setColor(0.15f, 0.15f, 0.18f, a);
                 fill();
                 drawRect(0, 0, w, h);
             }
 
             // Score/history label below item
             if (!label.empty() && fontRef) {
-                setColor(0.5f, 0.5f, 0.55f);
+                setColor(0.5f, 0.5f, 0.55f, a);
                 fontRef->drawString(label, w / 2, h + 12,
                     Direction::Center, Direction::Center);
             }
@@ -411,7 +437,7 @@ private:
 
         bool onMousePress(Vec2 pos, int button) override {
             (void)pos;
-            if (button != 0) return false;
+            if (button != 0 || fadingOut) return false;
             auto now = chrono::steady_clock::now();
             bool isDouble = (chrono::duration_cast<chrono::milliseconds>(
                 now - lastPress_).count() < 400);
@@ -497,7 +523,14 @@ private:
     Vec2 dragStart_;
     Vec2 dragPanStart_;
 
-    // Morphing animation
+    // Phase 1: Fade-out
+    Tween<float> fadeOutProgress_;
+    bool fadeOutPhase_ = false;
+    vector<shared_ptr<PhotoItemNode>> fadingOutNodes_;
+    unordered_map<string, AnimSnapshot> pendingOldSnapshots_;
+    static constexpr float FADE_DURATION = 0.4f;
+
+    // Phase 2: Morphing animation
     Tween<float> animProgress_;
     unordered_map<string, AnimSnapshot> animOldSnapshots_;
     bool animating_ = false;
@@ -511,20 +544,44 @@ private:
     Font fontSmall_;
 
     // =========================================================================
-    // Node tree rebuild
+    // Transition: fade-out → rebuild → morph
     // =========================================================================
 
-    void rebuildNodes(const unordered_map<string, AnimSnapshot>& oldSnapshots,
-                      bool hasOldLayout) {
-        // Clear old nodes
+    // Start fade-out phase for departing nodes
+    void startFadeOut(const unordered_set<string>& newIds,
+                      const unordered_map<string, AnimSnapshot>& oldSnapshots) {
+        // Mark nodes not in new layout for fade-out
+        auto& children = contentLayer_->getChildren();
+        for (auto& child : children) {
+            auto pn = dynamic_pointer_cast<PhotoItemNode>(child);
+            if (pn && !pn->fadingOut && newIds.count(pn->photoId) == 0) {
+                pn->fadingOut = true;
+                pn->onClicked = nullptr;
+                pn->disableEvents();
+                fadingOutNodes_.push_back(pn);
+            }
+        }
+
+        // Save snapshots for morph phase after fade-out completes
+        pendingOldSnapshots_ = oldSnapshots;
+
+        // Start fade-out tween
+        fadeOutProgress_.from(0).to(1).duration(FADE_DURATION)
+            .ease(EaseType::Cubic, EaseMode::InOut).start();
+        lastAnimTime_ = chrono::steady_clock::now();
+        fadeOutPhase_ = true;
+    }
+
+    // Apply computed layout: rebuild node tree + start morph
+    void applyLayout(const unordered_map<string, AnimSnapshot>& oldSnapshots,
+                     bool hasOldLayout) {
         contentLayer_->removeAllChildren();
         centerNode_ = nullptr;
         relatedNodes_.clear();
         timelineNodes_.clear();
         historyNodes_.clear();
 
-        // Add in back-to-front order (addChild order = draw order)
-        // 1. Related: low score (far) first → high score on top
+        // Add in back-to-front order
         for (int i = (int)relatedItems_.size() - 1; i >= 0; i--) {
             auto& item = relatedItems_[i];
             auto* node = createPhotoNode(
@@ -535,7 +592,6 @@ private:
             relatedNodes_.push_back(node);
         }
 
-        // 2. Timeline items
         for (auto& item : timelineItems_) {
             auto* node = createPhotoNode(
                 item.photoId, item.position, item.displaySize,
@@ -543,9 +599,7 @@ private:
             timelineNodes_.push_back(node);
         }
 
-        // 3. History: oldest first, newest on top
         for (int i = 0; i < (int)history_.size(); i++) {
-            // Draw order: oldest at bottom, newest at top
             int drawIdx = (int)history_.size() - 1 - i;
             Vec2 worldPos = {0, HISTORY_START_Y + drawIdx * HISTORY_SPACING};
             auto* node = createPhotoNode(
@@ -555,27 +609,54 @@ private:
             historyNodes_.push_back(node);
         }
 
-        // 4. Center (topmost)
         centerNode_ = createPhotoNode(
             centerItem_.photoId, centerItem_.position, centerItem_.displaySize,
             Color(0.3f, 0.5f, 0.7f), "");
 
-        // --- Set up morphing animation ---
+        // Texture management
+        unordered_set<string> neededIds;
+        neededIds.insert(centerItem_.photoId);
+        for (const auto& item : timelineItems_) neededIds.insert(item.photoId);
+        for (const auto& item : relatedItems_) neededIds.insert(item.photoId);
+        for (const auto& hid : history_) neededIds.insert(hid);
+
+        for (auto it = textures_.begin(); it != textures_.end(); ) {
+            if (neededIds.count(it->first) == 0) {
+                it = textures_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        queueMissingThumbnails(neededIds);
+
+        // Start morph animation + fade-in for new items
         if (hasOldLayout) {
             animOldSnapshots_.clear();
             for (auto* node : allPhotoNodes()) {
                 auto it = oldSnapshots.find(node->photoId);
                 if (it != oldSnapshots.end()) {
                     animOldSnapshots_[node->photoId] = it->second;
+                    // Start at old position (avoid 1-frame flash at target)
+                    auto& snap = it->second;
+                    node->setPos(snap.position.x - snap.displaySize / 2,
+                                 snap.position.y - snap.displaySize / 2);
+                    node->setSize(snap.displaySize, snap.displaySize);
+                } else {
+                    node->fadeAlpha = 0.0f;
                 }
             }
             animProgress_.from(0).to(1).duration(0.4f)
-                .ease(EaseType::Cubic, EaseMode::Out).start();
+                .ease(EaseType::Cubic, EaseMode::InOut).start();
             lastAnimTime_ = chrono::steady_clock::now();
             animating_ = true;
         }
 
         updateContentTransform();
+
+        logNotice() << "[RelatedView] center=" << centerId_
+                    << " timeline=" << timelineNodes_.size()
+                    << " related=" << relatedNodes_.size()
+                    << " history=" << historyNodes_.size();
     }
 
     PhotoItemNode* createPhotoNode(const string& photoId, Vec2 worldPos,

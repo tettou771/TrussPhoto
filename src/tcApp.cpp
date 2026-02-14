@@ -722,6 +722,17 @@ void tcApp::keyPressed(int key) {
             }
         }
 
+        if (key == 'V' || key == 'v') {
+            // Enter related view from single view
+            if (selectedIndex_ >= 0 && selectedIndex_ < (int)grid_->getPhotoIdCount()) {
+                const string& photoId = grid_->getPhotoId(selectedIndex_);
+                if (provider_.getCachedEmbedding(photoId)) {
+                    exitFullImage();
+                    enterRelatedView(photoId);
+                }
+            }
+        }
+
         // Update metadata panel with current state
         if (metadataPanel_ && selectedIndex_ >= 0 && selectedIndex_ < (int)grid_->getPhotoIdCount()) {
             const string& pid = grid_->getPhotoId(selectedIndex_);
