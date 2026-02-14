@@ -93,20 +93,36 @@ public:
 
     void update() override {
         // Process completed tile downloads on main thread
-        lock_guard<mutex> lock(tileMutex_);
-        for (auto& result : tileResults_) {
-            TileKey key{result.z, result.x, result.y};
-            if (result.pixels.isAllocated()) {
-                Texture tex;
-                tex.allocate(result.pixels, TextureUsage::Immutable, false);
-                tileCache_[key] = std::move(tex);
+        bool hadResults = false;
+        {
+            lock_guard<mutex> lock(tileMutex_);
+            for (auto& result : tileResults_) {
+                TileKey key{result.z, result.x, result.y};
+                if (result.pixels.isAllocated()) {
+                    Texture tex;
+                    tex.allocate(result.pixels, TextureUsage::Immutable, false);
+                    tileCache_[key] = std::move(tex);
+                    tileFailed_.erase(key);
+                } else {
+                    tileFailed_[key]++;
+                }
+                tileLoading_.erase(key);
             }
-            tileLoading_.erase(key);
+            hadResults = !tileResults_.empty();
+            tileResults_.clear();
         }
-        bool hadResults = !tileResults_.empty();
-        tileResults_.clear();
 
         if (hadResults && onRedraw) onRedraw();
+
+        // Restart tile thread if it stopped but queue still has items (race condition fix)
+        if (!tileThreadRunning_ && !tileThreadStop_) {
+            bool hasQueue;
+            {
+                lock_guard<mutex> lock(tileMutex_);
+                hasQueue = !tileQueue_.empty();
+            }
+            if (hasQueue) startTileThread();
+        }
     }
 
     void draw() override {
@@ -388,6 +404,7 @@ private:
     // Tile cache
     std::map<TileKey, Texture> tileCache_;
     std::map<TileKey, bool> tileLoading_;
+    std::map<TileKey, int> tileFailed_;  // retry count for failed tiles
     string tileCacheDir_;
 
     // Photo pins
@@ -443,8 +460,10 @@ private:
     void requestTile(int z, int x, int y, bool prefetch = false) {
         TileKey key{z, x, y};
 
-        // Already loaded or loading?
+        // Already loaded, loading, or failed too many times?
         if (tileCache_.count(key) || tileLoading_.count(key)) return;
+        auto fit = tileFailed_.find(key);
+        if (fit != tileFailed_.end() && fit->second >= 3) return;
 
         // Check disk cache first
         if (!tileCacheDir_.empty()) {
@@ -533,7 +552,7 @@ private:
 
     // LRU eviction: remove tiles from cache when it gets too large
     void evictOldTiles() {
-        const int MAX_TILES = 512;
+        const int MAX_TILES = 256;
         if ((int)tileCache_.size() <= MAX_TILES) return;
 
         // Keep current and adjacent zoom levels for smooth transitions
