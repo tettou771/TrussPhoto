@@ -134,7 +134,23 @@ void tcApp::setup() {
     addChild(mapView_);
     mapView_->setTileCacheDir(catalogPath_ + "/tile_cache");
     mapView_->setActive(false);
-    mapView_->onPinClick = [this](int index) {
+    mapView_->onPinClick = [this](int index, const string& photoId) {
+        // Single click: show thumbnail in metadata panel
+        auto* entry = provider_.getPhoto(photoId);
+        if (!entry) return;
+        if (metadataPanel_) {
+            metadataPanel_->setPhoto(entry);
+            // Load thumbnail and display
+            Pixels thumbPixels;
+            if (provider_.getThumbnail(photoId, thumbPixels)) {
+                Texture tex;
+                tex.allocate(thumbPixels, TextureUsage::Immutable, false);
+                metadataPanel_->setThumbnail(std::move(tex));
+            }
+        }
+        redraw();
+    };
+    mapView_->onPinDoubleClick = [this](int index, const string& photoId) {
         showFullImage(index);
     };
     mapView_->onRedraw = [this]() { redraw(); };
@@ -724,28 +740,6 @@ void tcApp::keyPressed(int key) {
             repairLibrary();
         } else if (key == 'C') {  // Shift+C only (uppercase)
             consolidateLibrary();
-        } else if (key == 'M' || key == 'm') {
-            // Toggle map view
-            if (viewMode_ == ViewMode::Grid) {
-                viewMode_ = ViewMode::Map;
-                grid_->setActive(false);
-                if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-
-                // Populate map pins from current photo list
-                vector<string> ids;
-                vector<PhotoEntry> photos;
-                for (size_t i = 0; i < grid_->getPhotoIdCount(); i++) {
-                    const string& id = grid_->getPhotoId((int)i);
-                    ids.push_back(id);
-                    auto* e = provider_.getPhoto(id);
-                    if (e) photos.push_back(*e);
-                    else photos.push_back(PhotoEntry{});
-                }
-                mapView_->setPhotos(photos, ids);
-                mapView_->setActive(true);
-                mapView_->fitBounds();
-                updateLayout();
-            }
         }
     }
 
@@ -757,6 +751,56 @@ void tcApp::keyPressed(int key) {
             viewMode_ = ViewMode::Grid;
             mapView_->setActive(false);
             grid_->setActive(true);
+            if (metadataPanel_) metadataPanel_->clearThumbnail();
+            updateLayout();
+        }
+    }
+    if (key == 'M' || key == 'm') {
+        if (viewMode_ == ViewMode::Single || viewMode_ == ViewMode::Grid) {
+            // Clean up single view resources if needed
+            if (viewMode_ == ViewMode::Single) {
+                if (rawLoadThread_.joinable()) rawLoadThread_.join();
+                rawLoadInProgress_ = false;
+                rawLoadCompleted_ = false;
+                if (isRawImage_) {
+                    rawPixels_.clear();
+                    fullPixels_.clear();
+                    fullTexture_.clear();
+                    previewTexture_.clear();
+                    { lock_guard<mutex> lock(rawLoadMutex_); pendingRawPixels_.clear(); }
+                } else {
+                    fullImage_ = Image();
+                }
+                isRawImage_ = false;
+                isSmartPreview_ = false;
+                selectedIndex_ = -1;
+                hasProfileLut_ = false;
+                profileLut_.clear();
+                currentProfilePath_.clear();
+            }
+
+            // Switch to map
+            viewMode_ = ViewMode::Map;
+            grid_->setActive(false);
+            if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
+            if (metadataPanel_) {
+                metadataPanel_->clearViewInfo();
+                metadataPanel_->clearThumbnail();
+            }
+
+            // Populate map pins from current photo list
+            vector<string> ids;
+            vector<PhotoEntry> photos;
+            for (size_t i = 0; i < grid_->getPhotoIdCount(); i++) {
+                const string& id = grid_->getPhotoId((int)i);
+                ids.push_back(id);
+                auto* e = provider_.getPhoto(id);
+                if (e) photos.push_back(*e);
+                else photos.push_back(PhotoEntry{});
+            }
+            mapView_->setPhotos(photos, ids);
+            mapView_->setActive(true);
+            mapView_->fitBounds();
             updateLayout();
         }
     }
@@ -1176,6 +1220,7 @@ void tcApp::showFullImage(int index) {
         zoomLevel_ = 1.0f;
         panOffset_ = {0, 0};
         grid_->setActive(false);
+        if (mapView_) mapView_->setActive(false);  // hide map when entering single view
         if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
         leftPaneWidth_ = 0;  // hide left pane in single view (no animation)
         leftTween_.finish();
@@ -1184,6 +1229,7 @@ void tcApp::showFullImage(int index) {
 
         // Update metadata panel
         if (metadataPanel_) {
+            metadataPanel_->clearThumbnail();  // clear map pin thumbnail
             metadataPanel_->setPhoto(entry);
             metadataPanel_->setViewInfo(zoomLevel_, profileEnabled_, profileBlend_,
                 hasProfileLut_, lensEnabled_, isSmartPreview_);

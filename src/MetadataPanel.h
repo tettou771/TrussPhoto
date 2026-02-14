@@ -40,6 +40,19 @@ public:
         needsRedraw_ = true;
     }
 
+    // Set thumbnail texture to display at top of panel
+    void setThumbnail(Texture&& tex) {
+        thumbnail_ = std::move(tex);
+        hasThumbnail_ = true;
+        needsRedraw_ = true;
+    }
+
+    void clearThumbnail() {
+        thumbnail_.clear();
+        hasThumbnail_ = false;
+        needsRedraw_ = true;
+    }
+
     // Set single-view info
     void setViewInfo(float zoom, bool profileEnabled, float profileBlend,
                      bool hasProfile, bool lensEnabled, bool isSmartPreview) {
@@ -100,6 +113,10 @@ private:
     bool hasViewInfo_ = false;
     bool needsRedraw_ = false;
 
+    // Thumbnail (for map pin preview)
+    Texture thumbnail_;
+    bool hasThumbnail_ = false;
+
     // View info (single view only)
     float viewZoom_ = 1.0f;
     bool viewProfileEnabled_ = false;
@@ -146,6 +163,13 @@ private:
 
     float estimateHeight() const {
         float y = padding_;
+
+        // Thumbnail area (square, full width)
+        if (hasThumbnail_ && thumbnail_.isAllocated()) {
+            float thumbSize = getWidth() - 12 - padding_ * 2;  // scrollbar + padding
+            y += thumbSize + sectionGap_;
+        }
+
         const auto& e = entry_;
 
         // File section
@@ -247,6 +271,29 @@ private:
         const auto& e = entry_;
         float w = getWidth();
         float y = padding_;
+
+        // === Thumbnail ===
+        if (hasThumbnail_ && thumbnail_.isAllocated()) {
+            float areaSize = w - padding_ * 2;
+            float imgW = thumbnail_.getWidth();
+            float imgH = thumbnail_.getHeight();
+            float scale = min(areaSize / imgW, areaSize / imgH);
+            float drawW = imgW * scale;
+            float drawH = imgH * scale;
+            float dx = padding_ + (areaSize - drawW) / 2.0f;
+            float dy = y + (areaSize - drawH) / 2.0f;
+
+            // Black background for letterbox
+            setColor(0.0f, 0.0f, 0.0f);
+            fill();
+            drawRect(padding_, y, areaSize, areaSize);
+
+            // Draw thumbnail fitted
+            setColor(1.0f, 1.0f, 1.0f);
+            thumbnail_.draw(dx, dy, drawW, drawH);
+
+            y += areaSize + sectionGap_;
+        }
 
         // === File ===
         drawSectionHeader("File", y, w);

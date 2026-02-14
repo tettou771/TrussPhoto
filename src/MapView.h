@@ -80,7 +80,8 @@ public:
     }
 
     // Callbacks
-    function<void(int index)> onPinClick;  // photo index in original list
+    function<void(int index, const string& photoId)> onPinClick;        // single click on pin
+    function<void(int index, const string& photoId)> onPinDoubleClick;  // double click on pin
     function<void()> onRedraw;
 
     void setup() override {
@@ -284,21 +285,32 @@ public:
         float top = centerPx.y - h / 2.0f;
 
         float bestDist = PIN_RADIUS * 2;
-        int bestIndex = -1;
+        int bestPinIdx = -1;
 
-        for (const auto& pin : pins_) {
-            auto px = latLonToPixel(pin.lat, pin.lon, zoom_);
+        for (size_t i = 0; i < pins_.size(); i++) {
+            auto px = latLonToPixel(pins_[i].lat, pins_[i].lon, zoom_);
             float sx = px.x - left;
             float sy = px.y - top;
             float dist = sqrt((pos.x - sx) * (pos.x - sx) + (pos.y - sy) * (pos.y - sy));
             if (dist < bestDist) {
                 bestDist = dist;
-                bestIndex = pin.photoIndex;
+                bestPinIdx = (int)i;
             }
         }
 
-        if (bestIndex >= 0 && onPinClick) {
-            onPinClick(bestIndex);
+        if (bestPinIdx >= 0) {
+            auto& pin = pins_[bestPinIdx];
+            auto now = chrono::steady_clock::now();
+            bool isDouble = (pin.photoIndex == lastPinClickIndex_ &&
+                chrono::duration_cast<chrono::milliseconds>(now - lastPinClickTime_).count() < 400);
+            lastPinClickTime_ = now;
+            lastPinClickIndex_ = pin.photoIndex;
+
+            if (isDouble && onPinDoubleClick) {
+                onPinDoubleClick(pin.photoIndex, pin.photoId);
+            } else if (onPinClick) {
+                onPinClick(pin.photoIndex, pin.photoId);
+            }
             return true;
         }
 
@@ -422,6 +434,10 @@ private:
     bool dragging_ = false;
     Vec2 dragStart_;
     double dragStartLat_ = 0, dragStartLon_ = 0;
+
+    // Double-click detection for pins
+    chrono::steady_clock::time_point lastPinClickTime_;
+    int lastPinClickIndex_ = -1;
 
     // Fonts
     Font font_;
