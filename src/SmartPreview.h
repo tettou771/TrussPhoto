@@ -1,12 +1,14 @@
 #pragma once
 
 // =============================================================================
-// SmartPreview.h - JPEG XL 16-bit lossy encode/decode for smart previews
+// SmartPreview.h - JPEG XL float16 lossy encode/decode for smart previews
+// Uses XYB color space for perceptually optimized compression
 // =============================================================================
 
 #include <TrussC.h>
 #include <jxl/encode.h>
 #include <jxl/decode.h>
+#include <jxl/color_encoding.h>
 #include <jxl/thread_parallel_runner.h>
 #include <jxl/resizable_parallel_runner.h>
 #include <fstream>
@@ -23,10 +25,12 @@ namespace fs = std::filesystem;
 class SmartPreview {
 public:
     static constexpr int MAX_EDGE = 3072;
-    static constexpr int BIT_DEPTH = 16;
     static constexpr float ENCODE_DISTANCE = 2.0f; // 0=lossless, 1.0=visually lossless, 2.0=high quality
+    static constexpr int ENCODE_EFFORT = 3;          // 1=fastest, 7=default, 9=slowest
+    static constexpr size_t ENCODE_THREADS = 4;      // threads per encode (multiple encodes run in parallel)
 
-    // Encode F32 Pixels to 16-bit lossy JPEG XL (resized to MAX_EDGE)
+    // Encode F32 Pixels to float16 lossy JPEG XL with XYB transform (resized to MAX_EDGE)
+    // Preserves HDR values above 1.0 (highlight headroom)
     static bool encode(const Pixels& srcF32, const string& outPath) {
         if (!srcF32.isAllocated() || srcF32.getFormat() != PixelFormat::F32) {
             logWarning() << "[SmartPreview] encode: need F32 pixels";
@@ -45,8 +49,8 @@ public:
             dstH = (int)(srcH * scale);
         }
 
-        // Resize F32 to target size and convert to uint16 RGB (3ch)
-        vector<uint16_t> u16buf(dstW * dstH * 3);
+        // Resize F32 to target size as RGB (3ch), no clamping (preserves HDR)
+        vector<float> rgbBuf(dstW * dstH * 3);
         const float* src = srcF32.getDataF32();
 
         for (int y = 0; y < dstH; y++) {
@@ -68,18 +72,15 @@ public:
                     float v10 = src[(y0 * srcW + x1) * srcCh + c];
                     float v01 = src[(y1 * srcW + x0) * srcCh + c];
                     float v11 = src[(y1 * srcW + x1) * srcCh + c];
-                    float v = v00 * (1-fx) * (1-fy) + v10 * fx * (1-fy)
-                            + v01 * (1-fx) * fy + v11 * fx * fy;
-                    v = clamp(v, 0.0f, 1.0f);
-                    u16buf[dstIdx + c] = (uint16_t)(v * 65535.0f + 0.5f);
+                    rgbBuf[dstIdx + c] = v00 * (1-fx) * (1-fy) + v10 * fx * (1-fy)
+                                       + v01 * (1-fx) * fy + v11 * fx * fy;
                 }
             }
         }
 
-        // Create parallel runner
+        // Create parallel runner (limit threads since multiple encodes run concurrently)
         void* runner = JxlResizableParallelRunnerCreate(nullptr);
-        JxlResizableParallelRunnerSetThreads(runner,
-            JxlResizableParallelRunnerSuggestThreads(dstW, dstH));
+        JxlResizableParallelRunnerSetThreads(runner, ENCODE_THREADS);
 
         // Create encoder
         JxlEncoder* enc = JxlEncoderCreate(nullptr);
@@ -89,17 +90,17 @@ public:
         }
         JxlEncoderSetParallelRunner(enc, JxlResizableParallelRunner, runner);
 
-        // Basic info
+        // Basic info: float16 with XYB transform
         JxlBasicInfo info;
         JxlEncoderInitBasicInfo(&info);
         info.xsize = dstW;
         info.ysize = dstH;
-        info.bits_per_sample = BIT_DEPTH;
-        info.exponent_bits_per_sample = 0; // integer
+        info.bits_per_sample = 16;
+        info.exponent_bits_per_sample = 5; // IEEE float16
         info.num_color_channels = 3;
         info.num_extra_channels = 0;
         info.alpha_bits = 0;
-        info.uses_original_profile = JXL_TRUE;
+        info.uses_original_profile = JXL_FALSE; // Enable XYB transform
 
         if (JxlEncoderSetBasicInfo(enc, &info) != JXL_ENC_SUCCESS) {
             logWarning() << "[SmartPreview] Failed to set basic info";
@@ -108,18 +109,26 @@ public:
             return false;
         }
 
+        // Tell encoder the input is sRGB (gamma-encoded from LibRaw)
+        JxlColorEncoding colorEnc;
+        JxlColorEncodingSetToSRGB(&colorEnc, JXL_FALSE);
+        JxlEncoderSetColorEncoding(enc, &colorEnc);
+
         // Frame settings: lossy with configurable distance
         JxlEncoderFrameSettings* settings = JxlEncoderFrameSettingsCreate(enc, nullptr);
         if (ENCODE_DISTANCE == 0.0f) {
             JxlEncoderSetFrameLossless(settings, JXL_TRUE);
         }
         JxlEncoderSetFrameDistance(settings, ENCODE_DISTANCE);
+        // Effort 3 = fast encode (default 7 is too slow for batch SP generation)
+        JxlEncoderFrameSettingsSetOption(settings,
+            JXL_ENC_FRAME_SETTING_EFFORT, ENCODE_EFFORT);
 
-        // Pixel format: UINT16, 3 channels, native endian
-        JxlPixelFormat pixfmt = {3, JXL_TYPE_UINT16, JXL_NATIVE_ENDIAN, 0};
+        // Pixel format: FLOAT32 input, 3 channels (encoder stores as float16)
+        JxlPixelFormat pixfmt = {3, JXL_TYPE_FLOAT, JXL_NATIVE_ENDIAN, 0};
 
         if (JxlEncoderAddImageFrame(settings, &pixfmt,
-                u16buf.data(), u16buf.size() * sizeof(uint16_t)) != JXL_ENC_SUCCESS) {
+                rgbBuf.data(), rgbBuf.size() * sizeof(float)) != JXL_ENC_SUCCESS) {
             logWarning() << "[SmartPreview] Failed to add image frame";
             JxlEncoderDestroy(enc);
             JxlResizableParallelRunnerDestroy(runner);
@@ -129,7 +138,7 @@ public:
         JxlEncoderCloseInput(enc);
 
         // Process output
-        vector<uint8_t> compressed(512 * 1024); // 512KB initial (lossy ~400KB typical)
+        vector<uint8_t> compressed(256 * 1024); // 256KB initial (XYB float16 ~300KB typical)
         uint8_t* next = compressed.data();
         size_t avail = compressed.size();
 

@@ -1125,15 +1125,14 @@ public:
                fs::exists(it->second.localSmartPreviewPath);
     }
 
-    // Queue photos for background SP generation (from RAW)
+    // Queue photos for background SP generation (RAW + JPEG)
     void queueSmartPreviewGeneration(const vector<string>& ids) {
         lock_guard<mutex> lock(spMutex_);
         for (const auto& id : ids) {
             auto it = photos_.find(id);
             if (it == photos_.end()) continue;
             auto& photo = it->second;
-            // Only queue RAW files that don't already have SP
-            if (!photo.isRaw) continue;
+            if (photo.isVideo) continue;
             if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) continue;
             if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
             pendingSPGenerations_.push_back(id);
@@ -1141,11 +1140,11 @@ public:
         startSPGenerationThread();
     }
 
-    // Queue all photos without smart preview
+    // Queue all photos without smart preview (RAW + JPEG)
     int queueAllMissingSP() {
         vector<string> ids;
         for (const auto& [id, photo] : photos_) {
-            if (!photo.isRaw) continue;
+            if (photo.isVideo) continue;
             if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) continue;
             if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
             ids.push_back(id);
@@ -1598,7 +1597,10 @@ public:
         }
         embThreads_.clear();
         if (faceThread_.joinable()) faceThread_.join();
-        if (spThread_.joinable()) spThread_.join();
+        for (auto& t : spThreads_) {
+            if (t.joinable()) t.join();
+        }
+        spThreads_.clear();
         if (copyThread_.joinable()) copyThread_.join();
         if (consolidateThread_.joinable()) consolidateThread_.join();
     }
@@ -1658,7 +1660,8 @@ private:
     atomic<bool> spThreadRunning_{false};
     atomic<int> spCompletedCount_{0};
     atomic<int> spTotalCount_{0};
-    thread spThread_;
+    static constexpr int SP_WORKERS = 2;
+    vector<thread> spThreads_;
 
     // CLIP embedding
     ClipEmbedder clipEmbedder_;
@@ -1964,64 +1967,100 @@ private:
         if (pendingSPGenerations_.empty() || spThreadRunning_) return;
 
         spThreadRunning_ = true;
-        if (spThread_.joinable()) spThread_.join();
+        for (auto& t : spThreads_) {
+            if (t.joinable()) t.join();
+        }
+        spThreads_.clear();
 
-        vector<string> ids = std::move(pendingSPGenerations_);
+        // Pre-collect paths on main thread (avoid data race on photos_)
+        struct SPJob { string id; string localPath; string spPath; bool isRaw; };
+        auto jobs = make_shared<vector<SPJob>>();
+        jobs->reserve(pendingSPGenerations_.size());
+        for (const auto& id : pendingSPGenerations_) {
+            auto it = photos_.find(id);
+            if (it == photos_.end()) continue;
+            string lp = it->second.localPath;
+            string sp = smartPreviewPath(it->second);
+            if (!lp.empty() && !sp.empty()) {
+                jobs->push_back({id, std::move(lp), std::move(sp), it->second.isRaw});
+            }
+        }
         pendingSPGenerations_.clear();
-        spTotalCount_ = (int)ids.size();
+        spTotalCount_ = (int)jobs->size();
         spCompletedCount_ = 0;
 
-        spThread_ = thread([this, ids = std::move(ids)]() {
-            logNotice() << "[SmartPreview] Starting generation for " << ids.size() << " photos";
-            int done = 0;
-            for (const auto& id : ids) {
-                if (stopping_) break;
+        auto workIdx = make_shared<atomic<int>>(0);
+        auto doneCount = make_shared<atomic<int>>(0);
+        int totalJobs = (int)jobs->size();
 
-                // Check photo still exists and has a local path
-                PhotoEntry* photo = nullptr;
-                string localPath;
-                string spPath;
-                {
-                    auto it = photos_.find(id);
-                    if (it == photos_.end()) { spCompletedCount_++; continue; }
-                    photo = &it->second;
-                    localPath = photo->localPath;
-                    spPath = smartPreviewPath(*photo);
-                }
-                if (localPath.empty() || !fs::exists(localPath) || spPath.empty()) {
+        logNotice() << "[SmartPreview] Starting generation for " << totalJobs
+                    << " photos (" << SP_WORKERS << " workers)";
+
+        auto finishedWorkers = make_shared<atomic<int>>(0);
+
+        for (int w = 0; w < SP_WORKERS; w++) {
+            spThreads_.emplace_back([this, jobs, workIdx, doneCount, totalJobs, finishedWorkers]() {
+                while (!stopping_) {
+                    int idx = workIdx->fetch_add(1);
+                    if (idx >= totalJobs) break;
+
+                    const auto& job = (*jobs)[idx];
+
+                    if (!fs::exists(job.localPath)) {
+                        spCompletedCount_++;
+                        continue;
+                    }
+
+                    // Already exists?
+                    if (fs::exists(job.spPath)) {
+                        lock_guard<mutex> lock(spMutex_);
+                        completedSPGenerations_.push_back({job.id, job.spPath});
+                        (*doneCount)++;
+                        spCompletedCount_++;
+                        continue;
+                    }
+
+                    // Load image as F32 pixels
+                    Pixels rawF32;
+                    if (job.isRaw) {
+                        // RAW: half resolution decode (skips demosaic, ~10x faster)
+                        if (!RawLoader::loadFloatPreview(job.localPath, rawF32)) {
+                            spCompletedCount_++;
+                            continue;
+                        }
+                    } else {
+                        // JPEG/other: load via stb_image (U8) and convert to F32
+                        Pixels u8;
+                        if (!u8.load(job.localPath)) {
+                            spCompletedCount_++;
+                            continue;
+                        }
+                        int w = u8.getWidth(), h = u8.getHeight(), ch = u8.getChannels();
+                        rawF32.allocate(w, h, ch, PixelFormat::F32);
+                        const unsigned char* src8 = u8.getData();
+                        float* dst = rawF32.getDataF32();
+                        for (int i = 0; i < w * h * ch; i++) {
+                            dst[i] = src8[i] / 255.0f;
+                        }
+                    }
+
+                    // Encode to JPEG XL (XYB float16)
+                    if (SmartPreview::encode(rawF32, job.spPath)) {
+                        lock_guard<mutex> lock(spMutex_);
+                        completedSPGenerations_.push_back({job.id, job.spPath});
+                        (*doneCount)++;
+                    }
                     spCompletedCount_++;
-                    continue;
                 }
 
-                // Already exists?
-                if (fs::exists(spPath)) {
-                    lock_guard<mutex> lock(spMutex_);
-                    completedSPGenerations_.push_back({id, spPath});
-                    done++;
-                    spCompletedCount_++;
-                    continue;
+                // Last worker to finish marks pipeline done
+                if (finishedWorkers->fetch_add(1) + 1 == SP_WORKERS) {
+                    logNotice() << "[SmartPreview] Generation done: " << doneCount->load()
+                                << "/" << jobs->size();
+                    spThreadRunning_ = false;
                 }
-
-                // Load RAW to F32
-                Pixels rawF32;
-                bool loaded = RawLoader::loadFloat(localPath, rawF32);
-                if (!loaded) {
-                    logWarning() << "[SmartPreview] Failed to load RAW: " << localPath;
-                    spCompletedCount_++;
-                    continue;
-                }
-
-                // Encode
-                if (SmartPreview::encode(rawF32, spPath)) {
-                    lock_guard<mutex> lock(spMutex_);
-                    completedSPGenerations_.push_back({id, spPath});
-                    done++;
-                }
-                spCompletedCount_++;
-            }
-            logNotice() << "[SmartPreview] Generation done: " << done << "/" << ids.size();
-            spThreadRunning_ = false;
-        });
+            });
+        }
     }
 
     void startCopyThread() {
