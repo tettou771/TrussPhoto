@@ -25,6 +25,7 @@ bin/*
 !bin/data/.gitkeep
 bin/data/*.json
 bin/data/thumbnail_cache/
+bin/data/insightface/*.onnx
 
 # External libraries (downloaded, not committed)
 lib/
