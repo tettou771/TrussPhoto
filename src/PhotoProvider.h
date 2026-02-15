@@ -879,6 +879,19 @@ public:
         return it != faceNameCache_.end() ? &it->second : nullptr;
     }
 
+    // Check if two photos share any person
+    bool sharesPerson(const string& id1, const string& id2) const {
+        auto* names1 = getPersonNames(id1);
+        auto* names2 = getPersonNames(id2);
+        if (!names1 || !names2) return false;
+        for (const auto& n : *names1) {
+            for (const auto& m : *names2) {
+                if (n == m) return true;
+            }
+        }
+        return false;
+    }
+
     // Search photos by person name (case-insensitive partial match)
     vector<string> searchByPersonName(const string& query) const {
         if (query.empty() || faceNameCache_.empty()) return {};

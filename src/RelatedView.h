@@ -15,6 +15,8 @@
 using namespace std;
 using namespace tc;
 
+enum class MatchType { Clip, Gps };
+
 class RelatedView : public RectNode {
 public:
     using Ptr = shared_ptr<RelatedView>;
@@ -252,13 +254,17 @@ public:
                 ? getAnimatedWorldPos(centerNode_) : centerNode_->targetWorldPos;
             Vec2 centerScreen = worldToScreen(centerWorld);
 
-            // Center → related
+            // Center → related (color by match type)
             for (auto* node : relatedNodes_) {
                 Vec2 cur = animating_
                     ? getAnimatedWorldPos(node) : node->targetWorldPos;
                 Vec2 to = worldToScreen(cur);
                 float alpha = 0.25f + node->score * 0.35f;
-                setColor(0.55f, 0.55f, 0.7f, alpha);
+                if (node->matchType == MatchType::Gps) {
+                    setColor(0.9f, 0.7f, 0.3f, alpha);   // orange line
+                } else {
+                    setColor(0.4f, 0.6f, 0.9f, alpha);   // blue line
+                }
                 noFill();
                 drawLine(centerScreen.x, centerScreen.y, to.x, to.y);
             }
@@ -384,6 +390,7 @@ private:
         float score = 0;
         Color borderColor;
         string label;  // "83%" or "#3"
+        MatchType matchType = MatchType::Clip;
 
         Vec2 targetWorldPos;   // layout target (world center coord)
         float targetSize = 0;  // layout target size
@@ -483,6 +490,7 @@ private:
         int width = 0, height = 0;
         bool isTimeline = false;
         int timelineIndex = 0;  // -5..+5
+        MatchType matchType = MatchType::Clip;
     };
 
     // --- State ---
@@ -584,11 +592,15 @@ private:
         // Add in back-to-front order
         for (int i = (int)relatedItems_.size() - 1; i >= 0; i--) {
             auto& item = relatedItems_[i];
+            Color border = (item.matchType == MatchType::Gps)
+                ? Color(0.9f, 0.65f, 0.2f)    // orange (GPS)
+                : Color(0.4f, 0.7f, 1.0f);     // blue (CLIP/face)
             auto* node = createPhotoNode(
                 item.photoId, item.position, item.displaySize,
-                Color(0.25f, 0.25f, 0.3f),
+                border,
                 format("{:.0f}%", item.score * 100));
             node->score = item.score;
+            node->matchType = item.matchType;
             relatedNodes_.push_back(node);
         }
 
@@ -866,11 +878,19 @@ private:
             timelineIds.insert(tl.photoId);
         }
 
-        vector<pair<string, float>> candidates;
+        struct Candidate {
+            string photoId;
+            float score;
+            MatchType matchType;
+        };
+        vector<Candidate> candidates;
+
         for (const auto& sr : similar) {
             if (timelineIds.count(sr.photoId)) continue;
 
-            float combined = sr.score * 0.85f;
+            float clipContrib = sr.score * 0.70f;
+            float faceBonus = provider.sharesPerson(centerId_, sr.photoId) ? 0.15f : 0.0f;
+            float gpsBonus = 0.0f;
 
             if (centerEntry && centerEntry->hasGps()) {
                 auto* other = provider.getPhoto(sr.photoId);
@@ -878,27 +898,31 @@ private:
                     double dist = haversine(
                         centerEntry->latitude, centerEntry->longitude,
                         other->latitude, other->longitude);
-                    float gpsBonus = 0.15f / (1.0f + (float)dist / 2.0f);
-                    combined += gpsBonus;
+                    gpsBonus = 0.15f / (1.0f + (float)dist / 2.0f);
                 }
             }
 
-            candidates.push_back({sr.photoId, combined});
+            float combined = clipContrib + gpsBonus + faceBonus;
+            MatchType mt = (gpsBonus > clipContrib + faceBonus)
+                ? MatchType::Gps : MatchType::Clip;
+
+            candidates.push_back({sr.photoId, combined, mt});
         }
 
         sort(candidates.begin(), candidates.end(),
-             [](const auto& a, const auto& b) { return a.second > b.second; });
+             [](const auto& a, const auto& b) { return a.score > b.score; });
 
         int count = min((int)candidates.size(), MAX_RELATED);
         for (int i = 0; i < count; i++) {
-            auto* entry = provider.getPhoto(candidates[i].first);
+            auto* entry = provider.getPhoto(candidates[i].photoId);
             if (!entry) continue;
 
             RelatedItem item;
-            item.photoId = candidates[i].first;
-            item.score = candidates[i].second;
+            item.photoId = candidates[i].photoId;
+            item.score = candidates[i].score;
+            item.matchType = candidates[i].matchType;
             item.displaySize = RELATED_SIZE_MIN +
-                (RELATED_SIZE_MAX - RELATED_SIZE_MIN) * candidates[i].second;
+                (RELATED_SIZE_MAX - RELATED_SIZE_MIN) * candidates[i].score;
             item.width = entry->width;
             item.height = entry->height;
             item.isTimeline = false;
