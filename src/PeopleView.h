@@ -7,6 +7,7 @@
 
 #include <TrussC.h>
 #include <tcxIME.h>
+#include <optional>
 #include "PhotoProvider.h"
 #include "FolderTree.h"  // for loadJapaneseFont, PlainScrollContainer
 
@@ -48,13 +49,62 @@ public:
 
     void populate(PhotoProvider& provider) {
         provider_ = &provider;
-        clusters_ = provider.buildFaceClusters();
         editingCard_ = nullptr;
         selectedCards_.clear();
-        needsRebuild_ = true;  // defer until draw when we have correct size
+        pendingClickCluster_.reset();
+        clusteringDone_ = false;
+
+        // Load face data from DB on main thread (thread-safe: no concurrent DB access)
+        auto input = provider.loadFaceClusterData();
+
+        // Run CPU-only clustering in background thread (no DB access)
+        if (clusterThread_.joinable()) clusterThread_.join();
+        clusterThread_ = thread([this, input = std::move(input)]() {
+            auto result = PhotoProvider::clusterFaces(
+                input.allFaces, input.personNames);
+            {
+                lock_guard<mutex> lock(clusterMutex_);
+                pendingClusters_ = std::move(result);
+            }
+            clusteringDone_ = true;
+        });
     }
 
     void update() override {
+        // Process deferred card click (prevents destroying card during its own callback)
+        if (pendingClickCluster_) {
+            auto cluster = std::move(*pendingClickCluster_);
+            pendingClickCluster_.reset();
+            if (onPersonClick) onPersonClick(cluster);
+            return;  // onPersonClick may destroy us, bail out
+        }
+
+        // Process deferred double-click (name edit)
+        if (pendingDoubleClickCard_) {
+            auto* card = pendingDoubleClickCard_;
+            pendingDoubleClickCard_ = nullptr;
+            editingCard_ = card;
+            string initial = card->cluster.name;
+            string placeholder = card->cluster.suggestedName;
+            if (nameOverlay_) {
+                nameOverlay_->setPos(0, 0);
+                nameOverlay_->setSize(getWidth(), getHeight());
+                nameOverlay_->show(initial, placeholder);
+            }
+            if (onRedraw) onRedraw();
+        }
+
+        // Process clustering completion from background thread
+        if (clusteringDone_) {
+            clusteringDone_ = false;
+            {
+                lock_guard<mutex> lock(clusterMutex_);
+                clusters_ = std::move(pendingClusters_);
+            }
+            needsRebuild_ = true;
+            if (onRedraw) onRedraw();
+        }
+
         // Process completed thumbnail loads
         bool anyNew = false;
         {
@@ -105,6 +155,13 @@ public:
         fill();
         drawRect(0, 0, w, h);
 
+        // Loading indicator while clustering runs
+        if (clusterThread_.joinable() && !clusteringDone_ && clusters_.empty()) {
+            setColor(0.5f, 0.5f, 0.55f);
+            font_.drawString("Building face clusters...", w / 2, h / 2,
+                Direction::Center, Direction::Center);
+        }
+
         // Status bar at bottom
         setColor(0, 0, 0, 0.5f);
         fill();
@@ -120,6 +177,7 @@ public:
     }
 
     void shutdown() {
+        if (clusterThread_.joinable()) clusterThread_.join();
         if (loadThread_.joinable()) loadThread_.join();
         content_->removeAllChildren();
         allCards_.clear();
@@ -128,6 +186,8 @@ public:
         pendingLoads_.clear();
         clusters_.clear();
         editingCard_ = nullptr;
+        pendingClickCluster_.reset();
+        pendingDoubleClickCard_ = nullptr;
     }
 
     bool onKeyPress(int key) override {
@@ -145,6 +205,12 @@ private:
     PhotoProvider* provider_ = nullptr;
     vector<PhotoProvider::FaceCluster> clusters_;
     bool needsRebuild_ = false;
+
+    // Background clustering
+    thread clusterThread_;
+    mutex clusterMutex_;
+    vector<PhotoProvider::FaceCluster> pendingClusters_;
+    atomic<bool> clusteringDone_{false};
 
     // UI components
     PlainScrollContainer::Ptr scrollContainer_;
@@ -437,6 +503,10 @@ private:
     PersonCard* editingCard_ = nullptr;
     shared_ptr<NameEditOverlay> nameOverlay_;
 
+    // Deferred actions (avoid destroying nodes during their own callbacks)
+    optional<PhotoProvider::FaceCluster> pendingClickCluster_;
+    PersonCard* pendingDoubleClickCard_ = nullptr;
+
     // Textures keyed by photoId
     unordered_map<string, Texture> textures_;
 
@@ -555,19 +625,11 @@ private:
 
     void handleCardClick(PersonCard* card, bool isDouble) {
         if (isDouble) {
-            // Double-click: edit name
-            editingCard_ = card;
-            string initial = card->cluster.name;
-            string placeholder = card->cluster.suggestedName;
-            if (nameOverlay_) {
-                nameOverlay_->setPos(0, 0);
-                nameOverlay_->setSize(getWidth(), getHeight());
-                nameOverlay_->show(initial, placeholder);
-            }
-            if (onRedraw) onRedraw();
+            // Double-click: defer name edit to update() (safe from callback stack)
+            pendingDoubleClickCard_ = card;
         } else {
-            // Single click: navigate to person's photos
-            if (onPersonClick) onPersonClick(card->cluster);
+            // Single click: defer navigation to update() (prevents self-destruction)
+            pendingClickCluster_ = card->cluster;  // copy by value
         }
     }
 

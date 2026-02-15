@@ -976,13 +976,25 @@ public:
         float repFaceX = 0, repFaceY = 0, repFaceW = 0, repFaceH = 0;  // rep face bbox
     };
 
-    // Build clusters from face embeddings
-    vector<FaceCluster> buildFaceClusters(float threshold = 0.45f) {
-        auto allFaces = db_.loadAllFacesWithEmbeddings();
-        if (allFaces.empty()) return {};
+    // Pre-load face data from DB (call on main thread, returns data for clustering)
+    struct FaceClusterInput {
+        vector<PhotoDatabase::FaceInfo> allFaces;
+        unordered_map<int, string> personNames;
+    };
 
-        // Load person id->name map
-        auto personNames = loadPersonIdToName();
+    FaceClusterInput loadFaceClusterData() {
+        FaceClusterInput input;
+        input.allFaces = db_.loadAllFacesWithEmbeddings();
+        input.personNames = loadPersonIdToName();
+        return input;
+    }
+
+    // Build clusters from pre-loaded data (thread-safe: no DB access)
+    static vector<FaceCluster> clusterFaces(
+            const vector<PhotoDatabase::FaceInfo>& allFaces,
+            const unordered_map<int, string>& personNames,
+            float threshold = 0.45f) {
+        if (allFaces.empty()) return {};
 
         // Step 1: Group named faces by person_id
         unordered_map<int, vector<int>> namedGroups;  // person_id -> face indices
@@ -1003,7 +1015,8 @@ public:
         for (auto& [pid, indices] : namedGroups) {
             FaceCluster c;
             c.personId = pid;
-            c.name = personNames.count(pid) ? personNames[pid] : "";
+            auto nameIt = personNames.find(pid);
+            c.name = nameIt != personNames.end() ? nameIt->second : "";
             c.clusterId = pid;
 
             unordered_set<string> photoSet;
@@ -1127,7 +1140,8 @@ public:
                 float sim = cosineSimilarity(uc.centroid, nc);
                 if (sim > bestSim) {
                     bestSim = sim;
-                    bestName = personNames.count(pid) ? personNames[pid] : "";
+                    auto nit = personNames.find(pid);
+                    bestName = nit != personNames.end() ? nit->second : "";
                 }
             }
             if (bestSim > threshold && !bestName.empty()) {
@@ -1142,6 +1156,12 @@ public:
                     << (clusters.size() - namedGroups.size()) << " unnamed) from "
                     << allFaces.size() << " faces";
         return clusters;
+    }
+
+    // Convenience: load data + cluster in one call (main thread only)
+    vector<FaceCluster> buildFaceClusters(float threshold = 0.45f) {
+        auto input = loadFaceClusterData();
+        return clusterFaces(input.allFaces, input.personNames, threshold);
     }
 
     // Assign a name to an unnamed cluster (batch update face person_id)
