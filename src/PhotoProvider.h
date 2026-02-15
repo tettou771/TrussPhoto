@@ -30,6 +30,8 @@ namespace fs = std::filesystem;
 #include "SmartPreview.h"
 #include "ClipEmbedder.h"
 #include "ClipTextEncoder.h"
+#include "FaceDetector.h"
+#include "FaceRecognizer.h"
 #include "LrcatImporter.h"
 
 // Photo provider - manages local + server photos
@@ -125,6 +127,7 @@ public:
 
         // Load face name cache
         loadFaceCache();
+        loadFaceEmbeddingCache();
 
         return !photos_.empty();
     }
@@ -873,6 +876,13 @@ public:
                     << faceNameCache_.size() << " photos with faces";
     }
 
+    // Load face embedding cache from DB (face DB id → embedding)
+    void loadFaceEmbeddingCache() {
+        faceEmbeddingCache_ = db_.loadFaceEmbeddings();
+        logNotice() << "[PhotoProvider] Face embedding cache: "
+                    << faceEmbeddingCache_.size() << " face embeddings";
+    }
+
     // Get person names for a photo (empty if none)
     const vector<string>* getPersonNames(const string& photoId) const {
         auto it = faceNameCache_.find(photoId);
@@ -952,6 +962,122 @@ public:
         }
         return result;
     }
+
+    // --- Face Detection Pipeline ---
+
+    // Initialize face detection models (SCRFD + ArcFace)
+    void initFaceModels(const string& detModelPath, const string& recModelPath) {
+        if (faceDetector_.load(detModelPath) && faceRecognizer_.load(recModelPath)) {
+            faceModelsReady_ = true;
+        }
+    }
+
+    bool isFaceModelsReady() const { return faceModelsReady_; }
+
+    // Queue all photos that have SP but haven't been face-scanned yet
+    int queueAllMissingFaceDetections() {
+        if (!faceModelsReady_) return 0;
+
+        vector<string> ids;
+        for (const auto& [id, photo] : photos_) {
+            if (photo.isVideo) continue;
+            if (photo.faceScanned) continue;
+            // Need SP to exist
+            if (photo.localSmartPreviewPath.empty() || !fs::exists(photo.localSmartPreviewPath)) continue;
+            ids.push_back(id);
+        }
+
+        if (ids.empty()) return 0;
+
+        {
+            lock_guard<mutex> lock(faceMutex_);
+            pendingFaceDetections_ = std::move(ids);
+            faceTotalCount_ = (int)pendingFaceDetections_.size();
+            faceCompletedCount_ = 0;
+        }
+
+        startFaceDetectionThread();
+        logNotice() << "[FaceDetection] Queued " << faceTotalCount_.load() << " photos";
+        return faceTotalCount_;
+    }
+
+    // Process completed face detection results (call from main thread)
+    int processFaceDetectionResults() {
+        vector<FaceDetResult> results;
+        {
+            lock_guard<mutex> lock(faceMutex_);
+            if (completedFaceDetections_.empty()) return 0;
+            results.swap(completedFaceDetections_);
+        }
+
+        int totalInserted = 0;
+        for (auto& result : results) {
+            auto* photo = getPhoto(result.photoId);
+
+            // No faces found — just mark as scanned
+            if (result.faces.empty()) {
+                db_.updateFaceScanned(result.photoId, true);
+                if (photo) photo->faceScanned = true;
+                continue;
+            }
+
+            // Load existing Lightroom faces for this photo
+            auto existingFaces = db_.getFacesForPhoto(result.photoId);
+            if (!photo) continue;
+
+            vector<PhotoDatabase::FaceRow> newRows;
+            for (size_t i = 0; i < result.faces.size(); i++) {
+                auto& det = result.faces[i];
+
+                // Normalize bbox to 0-1 (det coords are already normalized by SP dimensions)
+                float nx = det.x1, ny = det.y1;
+                float nw = det.x2 - det.x1, nh = det.y2 - det.y1;
+
+                // Try to match with existing Lightroom faces by overlap
+                int matchedPersonId = 0;
+                float bestOverlap = 0;
+                for (const auto& existing : existingFaces) {
+                    if (existing.source != "lightroom") continue;
+                    float overlap = faceOverlap(existing, nx, ny, nw, nh);
+                    if (overlap > bestOverlap && overlap > 0.5f) {
+                        bestOverlap = overlap;
+                        matchedPersonId = existing.personId;
+                    }
+                }
+
+                PhotoDatabase::FaceRow row;
+                row.photoId = result.photoId;
+                row.personId = matchedPersonId;
+                row.x = nx;
+                row.y = ny;
+                row.w = nw;
+                row.h = nh;
+                row.source = "insightface";
+                if (i < result.embeddings.size()) {
+                    row.embedding = std::move(result.embeddings[i]);
+                }
+                newRows.push_back(std::move(row));
+            }
+
+            int inserted = db_.insertFaces(newRows);
+            totalInserted += inserted;
+
+            // Mark photo as face-scanned
+            db_.updateFaceScanned(result.photoId, true);
+            if (photo) photo->faceScanned = true;
+        }
+
+        if (totalInserted > 0) {
+            loadFaceCache();
+            loadFaceEmbeddingCache();
+        }
+
+        return totalInserted;
+    }
+
+    bool isFaceDetectionRunning() const { return faceThreadRunning_; }
+    int getFaceDetectionTotalCount() const { return faceTotalCount_; }
+    int getFaceDetectionCompletedCount() const { return faceCompletedCount_; }
 
     // --- Smart Preview ---
 
@@ -1048,11 +1174,16 @@ public:
         lock_guard<mutex> lock(spMutex_);
         return (int)pendingSPGenerations_.size();
     }
+    int getSPCompletedCount() const { return spCompletedCount_; }
+    int getSPTotalCount() const { return spTotalCount_; }
 
     // --- CLIP Embedding ---
 
     // Initialize CLIP embedder + text encoder in background
     void initEmbedder(const string& modelsDir) {
+        // Eagerly create shared Ort::Env on main thread before background threads
+        // (ONNX Runtime's Env init is not thread-safe)
+        getSharedOrtEnv();
         clipEmbedder_.loadAsync(modelsDir);
         textEncoder_.loadAsync(modelsDir);
     }
@@ -1466,6 +1597,7 @@ public:
             if (t.joinable()) t.join();
         }
         embThreads_.clear();
+        if (faceThread_.joinable()) faceThread_.join();
         if (spThread_.joinable()) spThread_.join();
         if (copyThread_.joinable()) copyThread_.join();
         if (consolidateThread_.joinable()) consolidateThread_.join();
@@ -1524,6 +1656,8 @@ private:
     vector<string> pendingSPGenerations_;
     vector<SPResult> completedSPGenerations_;
     atomic<bool> spThreadRunning_{false};
+    atomic<int> spCompletedCount_{0};
+    atomic<int> spTotalCount_{0};
     thread spThread_;
 
     // CLIP embedding
@@ -1533,6 +1667,28 @@ private:
 
     // Face name cache (photo_id -> person names)
     unordered_map<string, vector<string>> faceNameCache_;
+
+    // Face detection pipeline
+    FaceDetector faceDetector_;
+    FaceRecognizer faceRecognizer_;
+    bool faceModelsReady_ = false;
+
+    struct FaceDetResult {
+        string photoId;
+        vector<DetectedFace> faces;
+        vector<vector<float>> embeddings;
+    };
+
+    mutable mutex faceMutex_;
+    vector<string> pendingFaceDetections_;
+    vector<FaceDetResult> completedFaceDetections_;
+    atomic<bool> faceThreadRunning_{false};
+    atomic<int> faceCompletedCount_{0};
+    atomic<int> faceTotalCount_{0};
+    thread faceThread_;
+
+    // Face embedding cache (face DB id → embedding)
+    unordered_map<int, vector<float>> faceEmbeddingCache_;
 
     static float cosineSimilarity(const vector<float>& a, const vector<float>& b) {
         if (a.size() != b.size() || a.empty()) return 0;
@@ -1701,6 +1857,108 @@ private:
         }
     }
 
+    // Face overlap: ratio of intersection to smaller face area
+    static float faceOverlap(const PhotoDatabase::FaceRow& a,
+                             float bx, float by, float bw, float bh) {
+        float ix1 = max(a.x, bx);
+        float iy1 = max(a.y, by);
+        float ix2 = min(a.x + a.w, bx + bw);
+        float iy2 = min(a.y + a.h, by + bh);
+        float iw = max(0.0f, ix2 - ix1);
+        float ih = max(0.0f, iy2 - iy1);
+        float inter = iw * ih;
+        float areaA = a.w * a.h;
+        float areaB = bw * bh;
+        float smaller = min(areaA, areaB);
+        return smaller > 0 ? inter / smaller : 0;
+    }
+
+    void startFaceDetectionThread() {
+        lock_guard<mutex> lock(faceMutex_);
+        if (pendingFaceDetections_.empty() || faceThreadRunning_) return;
+
+        faceThreadRunning_ = true;
+        if (faceThread_.joinable()) faceThread_.join();
+
+        // Collect SP paths on main thread to avoid data race on photos_
+        struct FaceJob { string id; string spPath; };
+        vector<FaceJob> jobs;
+        jobs.reserve(pendingFaceDetections_.size());
+        for (const auto& id : pendingFaceDetections_) {
+            auto it = photos_.find(id);
+            if (it == photos_.end()) continue;
+            jobs.push_back({id, it->second.localSmartPreviewPath});
+        }
+        pendingFaceDetections_.clear();
+
+        faceThread_ = thread([this, jobs = std::move(jobs)]() {
+            logNotice() << "[FaceDetection] Starting for " << jobs.size() << " photos";
+            int done = 0;
+
+            for (const auto& job : jobs) {
+                if (stopping_) break;
+
+                // Decode smart preview to get pixel data
+                Pixels spF32;
+                if (!SmartPreview::decode(job.spPath, spF32)) {
+                    logWarning() << "[FaceDetection] Failed to decode SP: " << job.id;
+                    faceCompletedCount_++;
+                    done++;
+                    continue;
+                }
+
+                int spW = spF32.getWidth();
+                int spH = spF32.getHeight();
+                int ch = spF32.getChannels();
+
+                // Convert F32 → RGB uint8 for face detector
+                vector<uint8_t> rgb(spW * spH * 3);
+                const float* src = spF32.getDataF32();
+                for (int i = 0; i < spW * spH; i++) {
+                    for (int c = 0; c < 3; c++) {
+                        int srcIdx = (ch == 4) ? (i * 4 + c) : (i * 3 + c);
+                        rgb[i * 3 + c] = (uint8_t)(clamp(src[srcIdx], 0.0f, 1.0f) * 255.0f);
+                    }
+                }
+
+                // Detect faces
+                auto faces = faceDetector_.detect(rgb.data(), spW, spH);
+
+                FaceDetResult result;
+                result.photoId = job.id;
+
+                if (!faces.empty()) {
+                    // Get embeddings for each face (using pixel-space coords before normalization)
+                    vector<vector<float>> embeddings;
+                    embeddings.reserve(faces.size());
+                    for (auto& face : faces) {
+                        auto emb = faceRecognizer_.getEmbedding(rgb.data(), spW, spH, face);
+                        embeddings.push_back(std::move(emb));
+                    }
+
+                    // Normalize face coordinates to 0-1
+                    for (auto& face : faces) {
+                        face.normalize(spW, spH);
+                    }
+
+                    result.faces = std::move(faces);
+                    result.embeddings = std::move(embeddings);
+                }
+                // Empty faces → result.faces stays empty, main thread sets faceScanned
+
+                {
+                    lock_guard<mutex> lk(faceMutex_);
+                    completedFaceDetections_.push_back(std::move(result));
+                }
+                faceCompletedCount_++;
+                done++;
+            }
+
+            logNotice() << "[FaceDetection] Done: " << done << "/" << jobs.size();
+            faceThreadRunning_ = false;
+        });
+    }
+
     void startSPGenerationThread() {
         // Called with spMutex_ already held
         if (pendingSPGenerations_.empty() || spThreadRunning_) return;
@@ -1710,6 +1968,8 @@ private:
 
         vector<string> ids = std::move(pendingSPGenerations_);
         pendingSPGenerations_.clear();
+        spTotalCount_ = (int)ids.size();
+        spCompletedCount_ = 0;
 
         spThread_ = thread([this, ids = std::move(ids)]() {
             logNotice() << "[SmartPreview] Starting generation for " << ids.size() << " photos";
@@ -1723,18 +1983,22 @@ private:
                 string spPath;
                 {
                     auto it = photos_.find(id);
-                    if (it == photos_.end()) continue;
+                    if (it == photos_.end()) { spCompletedCount_++; continue; }
                     photo = &it->second;
                     localPath = photo->localPath;
                     spPath = smartPreviewPath(*photo);
                 }
-                if (localPath.empty() || !fs::exists(localPath) || spPath.empty()) continue;
+                if (localPath.empty() || !fs::exists(localPath) || spPath.empty()) {
+                    spCompletedCount_++;
+                    continue;
+                }
 
                 // Already exists?
                 if (fs::exists(spPath)) {
                     lock_guard<mutex> lock(spMutex_);
                     completedSPGenerations_.push_back({id, spPath});
                     done++;
+                    spCompletedCount_++;
                     continue;
                 }
 
@@ -1743,6 +2007,7 @@ private:
                 bool loaded = RawLoader::loadFloat(localPath, rawF32);
                 if (!loaded) {
                     logWarning() << "[SmartPreview] Failed to load RAW: " << localPath;
+                    spCompletedCount_++;
                     continue;
                 }
 
@@ -1752,6 +2017,7 @@ private:
                     completedSPGenerations_.push_back({id, spPath});
                     done++;
                 }
+                spCompletedCount_++;
             }
             logNotice() << "[SmartPreview] Generation done: " << done << "/" << ids.size();
             spThreadRunning_ = false;

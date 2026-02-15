@@ -16,9 +16,15 @@
 using namespace std;
 using namespace tc;
 
+// Shared ONNX Runtime environment (one per process, as recommended)
+inline Ort::Env& getSharedOrtEnv() {
+    static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "TrussPhoto");
+    return env;
+}
+
 class OnnxRunner {
 public:
-    OnnxRunner() : env_(ORT_LOGGING_LEVEL_WARNING, "TrussPhoto") {}
+    OnnxRunner() = default;
 
     bool load(const string& modelPath) {
         try {
@@ -32,7 +38,7 @@ public:
             logNotice() << "[OnnxRunner] CoreML execution provider enabled";
 #endif
 
-            session_ = make_unique<Ort::Session>(env_, modelPath.c_str(), opts);
+            session_ = make_unique<Ort::Session>(getSharedOrtEnv(), modelPath.c_str(), opts);
             logNotice() << "[OnnxRunner] Model loaded: " << modelPath;
             return true;
         } catch (const Ort::Exception& e) {
@@ -191,7 +197,6 @@ public:
     }
 
 private:
-    Ort::Env env_;
     unique_ptr<Ort::Session> session_;
 
     static string shapeStr(const vector<int64_t>& shape) {

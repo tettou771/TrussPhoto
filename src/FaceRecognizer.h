@@ -5,10 +5,6 @@
 // Takes detected face landmarks, aligns the face, extracts 512D embedding.
 // =============================================================================
 
-#include <onnxruntime_cxx_api.h>
-#if defined(__APPLE__)
-#include <coreml_provider_factory.h>
-#endif
 #include <TrussC.h>
 #include "FaceDetector.h"
 #include <string>
@@ -34,7 +30,7 @@ public:
             OrtSessionOptionsAppendExecutionProvider_CoreML(opts, 0);
 #endif
 
-            session_ = make_unique<Ort::Session>(env_, modelPath.c_str(), opts);
+            session_ = make_unique<Ort::Session>(getSharedOrtEnv(), modelPath.c_str(), opts);
 
             // Discover names
             Ort::AllocatorWithDefaultOptions alloc;
@@ -148,7 +144,6 @@ private:
         {70.7299f, 92.2041f}
     };
 
-    Ort::Env env_{ORT_LOGGING_LEVEL_WARNING, "FaceRecognizer"};
     unique_ptr<Ort::Session> session_;
     string inputName_;
     string outputName_;

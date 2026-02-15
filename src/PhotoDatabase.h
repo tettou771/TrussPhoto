@@ -7,6 +7,7 @@
 #include "Database.h"
 #include "PhotoEntry.h"
 #include <vector>
+#include <unordered_set>
 #include <fstream>
 #include <filesystem>
 
@@ -14,7 +15,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 7;
+    static constexpr int SCHEMA_VERSION = 8;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -68,7 +69,8 @@ public:
                 "  longitude            REAL NOT NULL DEFAULT 0,"
                 "  altitude             REAL NOT NULL DEFAULT 0,"
                 "  develop_settings     TEXT NOT NULL DEFAULT '',"
-                "  is_managed           INTEGER NOT NULL DEFAULT 1"
+                "  is_managed           INTEGER NOT NULL DEFAULT 1,"
+                "  face_scanned        INTEGER NOT NULL DEFAULT 0"
                 ")"
             );
             if (!ok) return false;
@@ -171,8 +173,20 @@ public:
                 logError() << "[PhotoDatabase] Migration v6->v7 failed";
                 return false;
             }
+            version = 7;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v6 -> v7";
+        }
+
+        // v7 -> v8: add face_embedding BLOB to faces + face_scanned to photos
+        if (version == 7) {
+            if (!db_.exec("ALTER TABLE faces ADD COLUMN face_embedding BLOB DEFAULT NULL") ||
+                !db_.exec("ALTER TABLE photos ADD COLUMN face_scanned INTEGER NOT NULL DEFAULT 0")) {
+                logError() << "[PhotoDatabase] Migration v7->v8 failed";
+                return false;
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v6 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v7 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -190,9 +204,9 @@ public:
             "focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
             "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude, develop_settings, is_managed) "
+            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36)"
         );
         if (!stmt.valid()) return false;
         bindEntry(stmt, e);
@@ -290,6 +304,15 @@ public:
         return stmt.execute();
     }
 
+    bool updateFaceScanned(const string& id, bool scanned) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET face_scanned=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, scanned ? 1 : 0);
+        stmt.bind(2, id);
+        return stmt.execute();
+    }
+
     bool updateSmartPreviewPath(const string& id, const string& path) {
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare("UPDATE photos SET smart_preview_path=?1 WHERE id=?2");
@@ -328,9 +351,9 @@ public:
             "focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
             "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude, develop_settings, is_managed) "
+            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36)"
         );
         if (!stmt.valid()) {
             db_.rollback();
@@ -361,7 +384,7 @@ public:
             "width, height, is_raw, is_video, creative_style, focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
             "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude, develop_settings, is_managed "
+            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -403,6 +426,7 @@ public:
             e.altitude           = stmt.getDouble(32);
             e.developSettings    = stmt.getText(33);
             e.isManaged          = stmt.getInt(34) != 0;
+            e.faceScanned        = stmt.getInt(35) != 0;
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -528,6 +552,7 @@ public:
         float x, y, w, h;
         string source;
         int lrClusterId = 0;
+        vector<float> embedding;  // face embedding (512D from ArcFace)
     };
 
     int insertFaces(const vector<FaceRow>& faces) {
@@ -537,8 +562,8 @@ public:
         db_.beginTransaction();
 
         auto stmt = db_.prepare(
-            "INSERT INTO faces (photo_id, person_id, x, y, w, h, source, lr_cluster_id, created_at) "
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
+            "INSERT INTO faces (photo_id, person_id, x, y, w, h, source, lr_cluster_id, face_embedding, created_at) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)");
         if (!stmt.valid()) { db_.rollback(); return 0; }
 
         int64_t now = chrono::duration_cast<chrono::milliseconds>(
@@ -558,7 +583,12 @@ public:
             stmt.bind(6, (double)f.h);
             stmt.bind(7, f.source);
             stmt.bind(8, f.lrClusterId);
-            stmt.bind(9, now);
+            if (!f.embedding.empty()) {
+                stmt.bindBlob(9, f.embedding.data(), (int)(f.embedding.size() * sizeof(float)));
+            } else {
+                stmt.bindNull(9);
+            }
+            stmt.bind(10, now);
             if (stmt.execute()) count++;
             stmt.reset();
         }
@@ -589,6 +619,72 @@ public:
             result.push_back(std::move(row));
         }
         return result;
+    }
+
+    // Load all face embeddings (face DB id → embedding vector)
+    unordered_map<int, vector<float>> loadFaceEmbeddings() {
+        unordered_map<int, vector<float>> result;
+        auto stmt = db_.prepare(
+            "SELECT id, face_embedding FROM faces WHERE face_embedding IS NOT NULL");
+        if (!stmt.valid()) return result;
+        while (stmt.step()) {
+            int faceId = stmt.getInt(0);
+            auto [data, size] = stmt.getBlob(1);
+            if (data && size > 0) {
+                int count = size / (int)sizeof(float);
+                vector<float> vec(count);
+                memcpy(vec.data(), data, size);
+                result[faceId] = std::move(vec);
+            }
+        }
+        return result;
+    }
+
+    // Update face embedding by face DB id
+    bool updateFaceEmbedding(int faceId, const vector<float>& embedding) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE faces SET face_embedding=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bindBlob(1, embedding.data(), (int)(embedding.size() * sizeof(float)));
+        stmt.bind(2, faceId);
+        return stmt.execute();
+    }
+
+    // Update person_id for a face
+    bool updateFacePersonId(int faceId, int personId) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE faces SET person_id=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        if (personId > 0) {
+            stmt.bind(1, personId);
+        } else {
+            stmt.bindNull(1);
+        }
+        stmt.bind(2, faceId);
+        return stmt.execute();
+    }
+
+    // Get photo IDs that have faces with a given source
+    unordered_set<string> getPhotosWithFaceSource(const string& source) {
+        unordered_set<string> result;
+        auto stmt = db_.prepare(
+            "SELECT DISTINCT photo_id FROM faces WHERE source=?1");
+        if (!stmt.valid()) return result;
+        stmt.bind(1, source);
+        while (stmt.step()) {
+            result.insert(stmt.getText(0));
+        }
+        return result;
+    }
+
+    // Delete faces for a photo with a given source
+    bool deleteFacesForPhoto(const string& photoId, const string& source) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("DELETE FROM faces WHERE photo_id=?1 AND source=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, photoId);
+        stmt.bind(2, source);
+        return stmt.execute();
     }
 
     // Get person list with face count, sorted by count descending
@@ -710,6 +806,7 @@ private:
             "  h REAL NOT NULL,"
             "  source TEXT NOT NULL DEFAULT 'lightroom',"
             "  lr_cluster_id INTEGER,"
+            "  face_embedding BLOB DEFAULT NULL,"
             "  created_at INTEGER NOT NULL DEFAULT 0"
             ")");
         if (!ok) return false;
@@ -757,5 +854,6 @@ private:
         stmt.bind(33, e.altitude);
         stmt.bind(34, e.developSettings);
         stmt.bind(35, e.isManaged ? 1 : 0);
+        stmt.bind(36, e.faceScanned ? 1 : 0);
     }
 };

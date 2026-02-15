@@ -7,10 +7,7 @@
 // Output: vector of DetectedFace (bbox + landmarks + score)
 // =============================================================================
 
-#include <onnxruntime_cxx_api.h>
-#if defined(__APPLE__)
-#include <coreml_provider_factory.h>
-#endif
+#include "OnnxRunner.h"  // for getSharedOrtEnv()
 #include <TrussC.h>
 #include <string>
 #include <vector>
@@ -54,7 +51,7 @@ public:
             OrtSessionOptionsAppendExecutionProvider_CoreML(opts, 0);
 #endif
 
-            session_ = make_unique<Ort::Session>(env_, modelPath.c_str(), opts);
+            session_ = make_unique<Ort::Session>(getSharedOrtEnv(), modelPath.c_str(), opts);
 
             // Discover input/output names
             Ort::AllocatorWithDefaultOptions alloc;
@@ -62,10 +59,15 @@ public:
             inputName_ = inName.get();
 
             size_t numOutputs = session_->GetOutputCount();
+            outputNames_.reserve(numOutputs);
             for (size_t i = 0; i < numOutputs; i++) {
                 auto name = session_->GetOutputNameAllocated(i, alloc);
                 outputNames_.push_back(name.get());
-                outputNamePtrs_.push_back(outputNames_.back().c_str());
+            }
+            // Build pointer array after all names added (push_back may reallocate)
+            outputNamePtrs_.reserve(numOutputs);
+            for (const auto& n : outputNames_) {
+                outputNamePtrs_.push_back(n.c_str());
             }
 
             // det_10g has 9 outputs: 3×scores + 3×bbox + 3×kps
@@ -173,7 +175,6 @@ private:
     static constexpr int NUM_ANCHORS = 2;
     static constexpr int STRIDES[3] = {8, 16, 32};
 
-    Ort::Env env_{ORT_LOGGING_LEVEL_WARNING, "FaceDetector"};
     unique_ptr<Ort::Session> session_;
     string inputName_;
     vector<string> outputNames_;

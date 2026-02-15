@@ -427,6 +427,13 @@ void tcApp::setup() {
     // 9. CLIP embedder (async: downloads model in background if needed)
     provider_.initEmbedder(AppPaths::modelsDir());
 
+    // 9.5 Face detection models (InsightFace SCRFD + ArcFace)
+    {
+        string insightDir = getDataPath("insightface/");
+        provider_.initFaceModels(insightDir + "det_10g.onnx",
+                                 insightDir + "w600k_r50.onnx");
+    }
+
     // 10. Camera profile manager
     string home = getenv("HOME") ? getenv("HOME") : ".";
     profileManager_.setProfileDir(home + "/.trussc/profiles");
@@ -509,6 +516,15 @@ void tcApp::update() {
     // Process smart preview generation results
     provider_.processSPResults();
 
+    // Auto-queue SP generation on startup (one-shot)
+    if (!spQueued_) {
+        spQueued_ = true;
+        int queued = provider_.queueAllMissingSP();
+        if (queued > 0) {
+            logNotice() << "[SmartPreview] Auto-queued " << queued << " photos";
+        }
+    }
+
     // Process embedding generation results
     provider_.processEmbeddingResults();
 
@@ -530,8 +546,20 @@ void tcApp::update() {
         logNotice() << "[CLIP] Vision model unloaded (all embeddings done)";
     }
 
-    // Redraw during model loading
-    if (provider_.isEmbedderInitializing()) {
+    // Face detection pipeline: process results + auto re-queue
+    // (no one-shot flag: checks every frame, but faceScanned bool makes iteration cheap)
+    provider_.processFaceDetectionResults();
+
+    if (provider_.isFaceModelsReady() && !provider_.isFaceDetectionRunning()) {
+        int queued = provider_.queueAllMissingFaceDetections();
+        if (queued > 0) {
+            logNotice() << "[FaceDetection] Queued " << queued << " photos";
+        }
+    }
+
+    // Redraw during background tasks (model loading, SP, embedding, face detection)
+    if (provider_.isEmbedderInitializing() || provider_.isSPGenerationRunning() ||
+        provider_.isEmbeddingRunning() || provider_.isFaceDetectionRunning()) {
         redraw();
     }
 
@@ -679,15 +707,26 @@ void tcApp::draw() {
         consolidateStatus = format("  Consolidate: {}/{}",
             provider_.getConsolidateProgress(), provider_.getConsolidateTotal());
     }
+    string spStatus;
+    if (provider_.isSPGenerationRunning()) {
+        spStatus = format("  SP: {}/{}",
+            provider_.getSPCompletedCount(), provider_.getSPTotalCount());
+    }
     string embeddingStatus;
     if (provider_.isEmbeddingRunning()) {
         embeddingStatus = format("  Embedding: {}/{}",
             provider_.getEmbeddingCompletedCount(),
             provider_.getEmbeddingTotalCount());
     }
-    fontSmall_.drawString(format("{}  Photos: {}{}{}{}  FPS: {:.0f}",
+    string faceStatus;
+    if (provider_.isFaceDetectionRunning()) {
+        faceStatus = format("  Faces: {}/{}",
+            provider_.getFaceDetectionCompletedCount(),
+            provider_.getFaceDetectionTotalCount());
+    }
+    fontSmall_.drawString(format("{}  Photos: {}{}{}{}{}{}  FPS: {:.0f}",
         serverLabel, provider_.getCount(), uploadStatus, consolidateStatus,
-        embeddingStatus, getFrameRate()),
+        spStatus, embeddingStatus, faceStatus, getFrameRate()),
         textX, textY, Direction::Left, Direction::Center);
 }
 
@@ -1036,6 +1075,9 @@ void tcApp::filesDropped(const vector<string>& files) {
 
         // Queue embedding generation for new photos
         provider_.queueAllMissingEmbeddings();
+
+        // Queue face detection for new photos (requires SP)
+        provider_.queueAllMissingFaceDetections();
     }
 }
 

@@ -54,6 +54,7 @@ struct PhotoEntry {
     // Develop settings (LR import)
     string developSettings;  // LR develop settings text blob
     bool isManaged = true;   // true=originals/ managed, false=external reference
+    bool faceScanned = false; // true=insightface detection has been run
 
     // GPS (0 = not available, use hasGps() to check)
     double latitude = 0;     // decimal degrees, positive=N

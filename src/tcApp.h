@@ -124,9 +124,11 @@ private:
     float rightPaneWidth_ = 260;  // current animated width
     double lastTime_ = 0;
 
-    // Embedding
+    // Background pipeline flags
+    bool spQueued_ = false;
     bool embeddingsQueued_ = false;
     bool visionModelUnloaded_ = false;
+
 
     // Modifier key tracking
     bool cmdDown_ = false;
