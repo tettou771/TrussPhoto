@@ -199,6 +199,25 @@ public:
         thumbnail_->clearImage();
         setLoadState(LoadState::Unloaded);
     }
+
+    // Rebind this item to a different data index and start loading
+    void rebindAndLoad(int dataIndex, const string& label, SyncState syncState,
+                       bool selected, Font* font) {
+        // Cancel pending load for old data
+        if (loadState_ == LoadState::Loading && onRequestUnload)
+            onRequestUnload(entryIndex_);
+
+        entryIndex_ = dataIndex;
+        setLabelText(label);
+        label_->font = font;
+        setSyncState(syncState);
+        setSelected(selected);
+        thumbnail_->clearImage();
+
+        // Set Loading before firing request to prevent onActiveChanged re-request
+        loadState_ = LoadState::Loading;
+        if (onRequestLoad) onRequestLoad(entryIndex_);
+    }
     
     void update() override {
         if (pastMouseOver != isMouseOver()) {
