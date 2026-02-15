@@ -1114,6 +1114,46 @@ public:
         return results;
     }
 
+    // Haversine distance between two GPS coordinates (km)
+    static double haversine(double lat1, double lon1, double lat2, double lon2) {
+        double R = 6371.0;
+        double dLat = (lat2 - lat1) * M_PI / 180.0;
+        double dLon = (lon2 - lon1) * M_PI / 180.0;
+        double a = sin(dLat / 2) * sin(dLat / 2) +
+                   cos(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0) *
+                   sin(dLon / 2) * sin(dLon / 2);
+        return R * 2 * atan2(sqrt(a), sqrt(1 - a));
+    }
+
+    // Find nearby photos by GPS distance (within maxKm), sorted by distance
+    vector<SearchResult> findNearby(const string& id, double maxKm = 5.0, int limit = 20) const {
+        auto it = photos_.find(id);
+        if (it == photos_.end() || !it->second.hasGps()) return {};
+        const auto& ref = it->second;
+
+        vector<pair<string, double>> nearby;
+        for (const auto& [otherId, entry] : photos_) {
+            if (otherId == id || !entry.hasGps()) continue;
+            double dist = haversine(ref.latitude, ref.longitude,
+                                    entry.latitude, entry.longitude);
+            if (dist <= maxKm) {
+                nearby.push_back({otherId, dist});
+            }
+        }
+
+        sort(nearby.begin(), nearby.end(),
+             [](const auto& a, const auto& b) { return a.second < b.second; });
+        if ((int)nearby.size() > limit) nearby.resize(limit);
+
+        // Convert distance to score: closer = higher (0~1 range)
+        vector<SearchResult> results;
+        for (const auto& [pid, dist] : nearby) {
+            float score = 1.0f / (1.0f + (float)dist / 2.0f);
+            results.push_back({pid, score});
+        }
+        return results;
+    }
+
     // Semantic search: text query → sorted results (descending by similarity)
     // Uses dynamic threshold: keeps items within 15% of top score,
     // but if spread is tiny (< 0.03) returns all sorted by relevance.

@@ -373,6 +373,7 @@ private:
     static constexpr float TIMELINE_SPACING = 12.0f;
     static constexpr int TIMELINE_COUNT = 15;
     static constexpr int MAX_RELATED = 20;
+    static constexpr int MAX_GPS_ONLY = 5;  // reserved slots for GPS-only candidates
     static constexpr int COLLISION_ITERATIONS = 8;
 
     // History chain constants
@@ -856,20 +857,8 @@ private:
     // Related photos computation
     // =========================================================================
 
-    static double haversine(double lat1, double lon1, double lat2, double lon2) {
-        double R = 6371.0;
-        double dLat = (lat2 - lat1) * M_PI / 180.0;
-        double dLon = (lon2 - lon1) * M_PI / 180.0;
-        double a = sin(dLat / 2) * sin(dLat / 2) +
-                   cos(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0) *
-                   sin(dLon / 2) * sin(dLon / 2);
-        return R * 2 * atan2(sqrt(a), sqrt(1 - a));
-    }
-
     void computeRelated(PhotoProvider& provider) {
         auto similar = provider.findSimilar(centerId_, MAX_RELATED * 2);
-        if (similar.empty()) return;
-
         auto* centerEntry = provider.getPhoto(centerId_);
 
         unordered_set<string> timelineIds;
@@ -883,7 +872,10 @@ private:
             float score;
             MatchType matchType;
         };
-        vector<Candidate> candidates;
+
+        // Route 1: CLIP similarity + GPS/face bonus
+        vector<Candidate> clipCandidates;
+        unordered_set<string> clipIds;
 
         for (const auto& sr : similar) {
             if (timelineIds.count(sr.photoId)) continue;
@@ -895,7 +887,7 @@ private:
             if (centerEntry && centerEntry->hasGps()) {
                 auto* other = provider.getPhoto(sr.photoId);
                 if (other && other->hasGps()) {
-                    double dist = haversine(
+                    double dist = PhotoProvider::haversine(
                         centerEntry->latitude, centerEntry->longitude,
                         other->latitude, other->longitude);
                     gpsBonus = 0.15f / (1.0f + (float)dist / 2.0f);
@@ -906,29 +898,48 @@ private:
             MatchType mt = (gpsBonus > clipContrib + faceBonus)
                 ? MatchType::Gps : MatchType::Clip;
 
-            candidates.push_back({sr.photoId, combined, mt});
+            clipCandidates.push_back({sr.photoId, combined, mt});
+            clipIds.insert(sr.photoId);
         }
 
-        sort(candidates.begin(), candidates.end(),
+        sort(clipCandidates.begin(), clipCandidates.end(),
              [](const auto& a, const auto& b) { return a.score > b.score; });
 
-        int count = min((int)candidates.size(), MAX_RELATED);
-        for (int i = 0; i < count; i++) {
-            auto* entry = provider.getPhoto(candidates[i].photoId);
-            if (!entry) continue;
+        // Route 2: GPS nearby — reserve up to MAX_GPS_ONLY slots
+        vector<Candidate> gpsCandidates;
+        auto nearby = provider.findNearby(centerId_, 5.0, MAX_GPS_ONLY);
+        for (const auto& nr : nearby) {
+            if (timelineIds.count(nr.photoId)) continue;
+            if (clipIds.count(nr.photoId)) continue;  // already in CLIP route
 
+            float gpsScore = nr.score * 0.15f;
+            float faceBonus = provider.sharesPerson(centerId_, nr.photoId) ? 0.15f : 0.0f;
+            float combined = gpsScore + faceBonus;
+            MatchType mt = (faceBonus > gpsScore) ? MatchType::Clip : MatchType::Gps;
+            gpsCandidates.push_back({nr.photoId, combined, mt});
+        }
+
+        // Merge: CLIP fills remaining slots, GPS gets guaranteed slots
+        int gpsCount = min((int)gpsCandidates.size(), MAX_GPS_ONLY);
+        int clipCount = min((int)clipCandidates.size(), MAX_RELATED - gpsCount);
+
+        auto addItem = [&](const Candidate& c) {
+            auto* entry = provider.getPhoto(c.photoId);
+            if (!entry) return;
             RelatedItem item;
-            item.photoId = candidates[i].photoId;
-            item.score = candidates[i].score;
-            item.matchType = candidates[i].matchType;
+            item.photoId = c.photoId;
+            item.score = c.score;
+            item.matchType = c.matchType;
             item.displaySize = RELATED_SIZE_MIN +
-                (RELATED_SIZE_MAX - RELATED_SIZE_MIN) * candidates[i].score;
+                (RELATED_SIZE_MAX - RELATED_SIZE_MIN) * c.score;
             item.width = entry->width;
             item.height = entry->height;
             item.isTimeline = false;
-
             relatedItems_.push_back(item);
-        }
+        };
+
+        for (int i = 0; i < clipCount; i++) addItem(clipCandidates[i]);
+        for (int i = 0; i < gpsCount; i++) addItem(gpsCandidates[i]);
     }
 
     // =========================================================================
