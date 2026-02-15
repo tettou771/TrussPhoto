@@ -17,6 +17,7 @@
 #include "SearchBar.h"
 #include "MapView.h"
 #include "RelatedView.h"
+#include "PeopleView.h"
 #include "UploadQueue.h"
 #include "CameraProfileManager.h"
 #include "ServerConfig.h"
@@ -30,7 +31,8 @@ enum class ViewMode {
     Grid,       // Thumbnail grid
     Single,     // Single image view
     Map,        // Map view with GPS pins
-    Related     // Related photos view
+    Related,    // Related photos view
+    People      // People / face clusters view
 };
 
 class tcApp : public App {
@@ -66,6 +68,7 @@ private:
     MetadataPanel::Ptr metadataPanel_;
     MapView::Ptr mapView_;
     RelatedView::Ptr relatedView_;
+    PeopleView::Ptr peopleView_;
     SearchBar::Ptr searchBar_;
     float searchBarHeight_ = 36;
     PaneToggle::Ptr leftToggle_;
@@ -145,6 +148,8 @@ private:
     void showFullImage(int index);
     void enterRelatedView(const string& photoId);
     void exitRelatedView();
+    void enterPeopleView();
+    void exitPeopleView();
     void deleteSelectedPhotos();
     void reprocessImage();   // re-apply lens correction from rawPixels_ cache
     void exitFullImage();

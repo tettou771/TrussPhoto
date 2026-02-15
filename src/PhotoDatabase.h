@@ -729,6 +729,152 @@ public:
         return result;
     }
 
+    // --- Clustering / People view queries ---
+
+    // Face info for clustering (id, photo_id, person_id, bbox, embedding)
+    struct FaceInfo {
+        int faceId;
+        string photoId;
+        int personId = 0;  // 0 = unnamed
+        float x, y, w, h;
+        vector<float> embedding;
+    };
+
+    vector<FaceInfo> loadAllFacesWithEmbeddings() {
+        vector<FaceInfo> result;
+        auto stmt = db_.prepare(
+            "SELECT id, photo_id, COALESCE(person_id, 0), x, y, w, h, face_embedding "
+            "FROM faces WHERE face_embedding IS NOT NULL");
+        if (!stmt.valid()) return result;
+        while (stmt.step()) {
+            FaceInfo fi;
+            fi.faceId = stmt.getInt(0);
+            fi.photoId = stmt.getText(1);
+            fi.personId = stmt.getInt(2);
+            fi.x = (float)stmt.getDouble(3);
+            fi.y = (float)stmt.getDouble(4);
+            fi.w = (float)stmt.getDouble(5);
+            fi.h = (float)stmt.getDouble(6);
+            auto [data, size] = stmt.getBlob(7);
+            if (data && size > 0) {
+                int count = size / (int)sizeof(float);
+                fi.embedding.resize(count);
+                memcpy(fi.embedding.data(), data, size);
+            }
+            result.push_back(std::move(fi));
+        }
+        return result;
+    }
+
+    // Batch update: assign person_id to multiple face IDs
+    bool batchUpdateFacePersonId(const vector<int>& faceIds, int personId) {
+        if (faceIds.empty()) return true;
+        lock_guard<mutex> lock(db_.writeMutex());
+        db_.beginTransaction();
+        auto stmt = db_.prepare("UPDATE faces SET person_id=?1 WHERE id=?2");
+        if (!stmt.valid()) { db_.rollback(); return false; }
+        for (int fid : faceIds) {
+            if (personId > 0) {
+                stmt.bind(1, personId);
+            } else {
+                stmt.bindNull(1);
+            }
+            stmt.bind(2, fid);
+            stmt.execute();
+            stmt.reset();
+        }
+        db_.commit();
+        return true;
+    }
+
+    // Merge persons: move all faces from sourcePersonId to targetPersonId, delete source
+    bool mergePersons(int targetPersonId, int sourcePersonId) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        db_.beginTransaction();
+        auto upd = db_.prepare("UPDATE faces SET person_id=?1 WHERE person_id=?2");
+        if (!upd.valid()) { db_.rollback(); return false; }
+        upd.bind(1, targetPersonId);
+        upd.bind(2, sourcePersonId);
+        if (!upd.execute()) { db_.rollback(); return false; }
+
+        auto del = db_.prepare("DELETE FROM persons WHERE id=?1");
+        if (!del.valid()) { db_.rollback(); return false; }
+        del.bind(1, sourcePersonId);
+        del.execute();
+        db_.commit();
+        return true;
+    }
+
+    // Rename person
+    bool renamePerson(int personId, const string& newName) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE persons SET name=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, newName);
+        stmt.bind(2, personId);
+        return stmt.execute();
+    }
+
+    // Get or create person by name (returns person_id)
+    int getOrCreatePerson(const string& name) {
+        // Try to find existing
+        auto sel = db_.prepare("SELECT id FROM persons WHERE name=?1");
+        if (sel.valid()) {
+            sel.bind(1, name);
+            if (sel.step()) return sel.getInt(0);
+        }
+        // Create new
+        lock_guard<mutex> lock(db_.writeMutex());
+        int64_t now = chrono::duration_cast<chrono::milliseconds>(
+            chrono::system_clock::now().time_since_epoch()).count();
+        auto ins = db_.prepare("INSERT INTO persons (name, created_at) VALUES (?1, ?2)");
+        if (!ins.valid()) return 0;
+        ins.bind(1, name);
+        ins.bind(2, now);
+        if (!ins.execute()) return 0;
+        return (int)sqlite3_last_insert_rowid(db_.rawDb());
+    }
+
+    // Load person id->name mapping
+    unordered_map<int, string> loadPersonIdToName() {
+        unordered_map<int, string> result;
+        auto stmt = db_.prepare("SELECT id, name FROM persons");
+        if (!stmt.valid()) return result;
+        while (stmt.step()) {
+            result[stmt.getInt(0)] = stmt.getText(1);
+        }
+        return result;
+    }
+
+    // Get photo IDs that contain faces with the given person_id
+    vector<string> getPhotoIdsForPerson(int personId) {
+        vector<string> result;
+        auto stmt = db_.prepare(
+            "SELECT DISTINCT photo_id FROM faces WHERE person_id=?1");
+        if (!stmt.valid()) return result;
+        stmt.bind(1, personId);
+        while (stmt.step()) {
+            result.push_back(stmt.getText(0));
+        }
+        return result;
+    }
+
+    // Get photo IDs for a set of face IDs
+    vector<string> getPhotoIdsForFaceIds(const vector<int>& faceIds) {
+        if (faceIds.empty()) return {};
+        unordered_set<string> idSet;
+        auto stmt = db_.prepare("SELECT photo_id FROM faces WHERE id=?1");
+        if (!stmt.valid()) return {};
+        for (int fid : faceIds) {
+            stmt.bind(1, fid);
+            if (stmt.step()) {
+                idSet.insert(stmt.getText(0));
+            }
+            stmt.reset();
+        }
+        return vector<string>(idSet.begin(), idSet.end());
+    }
+
     // --- JSON migration ---
 
     bool migrateFromJson(const string& jsonPath) {

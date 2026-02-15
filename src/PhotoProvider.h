@@ -963,6 +963,215 @@ public:
         return result;
     }
 
+    // --- People View / Clustering ---
+
+    struct FaceCluster {
+        int clusterId = 0;           // negative: auto cluster, positive: person_id
+        string name;                 // person name or "" (unnamed)
+        string suggestedName;        // embedding-based name suggestion
+        int personId = 0;            // DB person_id (0 = unnamed cluster)
+        vector<int> faceIds;         // member face IDs
+        int photoCount = 0;          // unique photo count
+        string repPhotoId;           // representative photo ID
+        float repFaceX = 0, repFaceY = 0, repFaceW = 0, repFaceH = 0;  // rep face bbox
+    };
+
+    // Build clusters from face embeddings
+    vector<FaceCluster> buildFaceClusters(float threshold = 0.45f) {
+        auto allFaces = db_.loadAllFacesWithEmbeddings();
+        if (allFaces.empty()) return {};
+
+        // Load person id->name map
+        auto personNames = loadPersonIdToName();
+
+        // Step 1: Group named faces by person_id
+        unordered_map<int, vector<int>> namedGroups;  // person_id -> face indices
+        vector<int> unnamedIndices;
+
+        for (int i = 0; i < (int)allFaces.size(); i++) {
+            if (allFaces[i].personId > 0) {
+                namedGroups[allFaces[i].personId].push_back(i);
+            } else {
+                unnamedIndices.push_back(i);
+            }
+        }
+
+        vector<FaceCluster> clusters;
+
+        // Step 2: Build named clusters
+        unordered_map<int, vector<float>> namedCentroids;  // person_id -> centroid
+        for (auto& [pid, indices] : namedGroups) {
+            FaceCluster c;
+            c.personId = pid;
+            c.name = personNames.count(pid) ? personNames[pid] : "";
+            c.clusterId = pid;
+
+            unordered_set<string> photoSet;
+            vector<float> centroid;
+            for (int idx : indices) {
+                auto& fi = allFaces[idx];
+                c.faceIds.push_back(fi.faceId);
+                photoSet.insert(fi.photoId);
+                if (centroid.empty()) {
+                    centroid = fi.embedding;
+                } else {
+                    for (int d = 0; d < (int)centroid.size(); d++)
+                        centroid[d] += fi.embedding[d];
+                }
+            }
+            c.photoCount = (int)photoSet.size();
+
+            // Normalize centroid
+            if (!centroid.empty()) {
+                float norm = 0;
+                for (float v : centroid) norm += v * v;
+                norm = sqrtf(norm);
+                if (norm > 0) for (float& v : centroid) v /= norm;
+                namedCentroids[pid] = centroid;
+            }
+
+            // Representative face: first face
+            if (!indices.empty()) {
+                auto& rep = allFaces[indices[0]];
+                c.repPhotoId = rep.photoId;
+                c.repFaceX = rep.x;
+                c.repFaceY = rep.y;
+                c.repFaceW = rep.w;
+                c.repFaceH = rep.h;
+            }
+
+            clusters.push_back(std::move(c));
+        }
+
+        // Sort named clusters by photo count descending
+        sort(clusters.begin(), clusters.end(),
+             [](const FaceCluster& a, const FaceCluster& b) {
+                 return a.photoCount > b.photoCount;
+             });
+
+        // Step 3: Greedy centroid clustering for unnamed faces
+        int nextClusterId = -1;
+        vector<bool> assigned(unnamedIndices.size(), false);
+
+        struct UnnamedCluster {
+            vector<int> memberIndices;  // indices into unnamedIndices
+            vector<float> centroid;
+        };
+        vector<UnnamedCluster> unnamedClusters;
+
+        for (int i = 0; i < (int)unnamedIndices.size(); i++) {
+            if (assigned[i]) continue;
+            auto& seed = allFaces[unnamedIndices[i]];
+            if (seed.embedding.empty()) continue;
+
+            UnnamedCluster uc;
+            uc.centroid = seed.embedding;
+            uc.memberIndices.push_back(i);
+            assigned[i] = true;
+
+            // Find all similar unassigned faces
+            for (int j = i + 1; j < (int)unnamedIndices.size(); j++) {
+                if (assigned[j]) continue;
+                auto& cand = allFaces[unnamedIndices[j]];
+                if (cand.embedding.empty()) continue;
+
+                float sim = cosineSimilarity(uc.centroid, cand.embedding);
+                if (sim > threshold) {
+                    uc.memberIndices.push_back(j);
+                    assigned[j] = true;
+
+                    // Update centroid (running average + normalize)
+                    int n = (int)uc.memberIndices.size();
+                    for (int d = 0; d < (int)uc.centroid.size(); d++) {
+                        uc.centroid[d] = uc.centroid[d] * (n - 1) / n +
+                                         cand.embedding[d] / n;
+                    }
+                    float norm = 0;
+                    for (float v : uc.centroid) norm += v * v;
+                    norm = sqrtf(norm);
+                    if (norm > 0) for (float& v : uc.centroid) v /= norm;
+                }
+            }
+
+            unnamedClusters.push_back(std::move(uc));
+        }
+
+        // Step 4: Build FaceCluster objects for unnamed clusters (skip size=1)
+        for (auto& uc : unnamedClusters) {
+            if ((int)uc.memberIndices.size() < 2) continue;  // skip singletons
+
+            FaceCluster c;
+            c.clusterId = nextClusterId--;
+            c.personId = 0;
+
+            unordered_set<string> photoSet;
+            for (int mi : uc.memberIndices) {
+                auto& fi = allFaces[unnamedIndices[mi]];
+                c.faceIds.push_back(fi.faceId);
+                photoSet.insert(fi.photoId);
+            }
+            c.photoCount = (int)photoSet.size();
+
+            // Representative face
+            auto& rep = allFaces[unnamedIndices[uc.memberIndices[0]]];
+            c.repPhotoId = rep.photoId;
+            c.repFaceX = rep.x;
+            c.repFaceY = rep.y;
+            c.repFaceW = rep.w;
+            c.repFaceH = rep.h;
+
+            // Suggest name by comparing centroid to named centroids
+            float bestSim = 0;
+            string bestName;
+            for (auto& [pid, nc] : namedCentroids) {
+                float sim = cosineSimilarity(uc.centroid, nc);
+                if (sim > bestSim) {
+                    bestSim = sim;
+                    bestName = personNames.count(pid) ? personNames[pid] : "";
+                }
+            }
+            if (bestSim > threshold && !bestName.empty()) {
+                c.suggestedName = bestName;
+            }
+
+            clusters.push_back(std::move(c));
+        }
+
+        logNotice() << "[Clustering] " << clusters.size() << " clusters ("
+                    << namedGroups.size() << " named, "
+                    << (clusters.size() - namedGroups.size()) << " unnamed) from "
+                    << allFaces.size() << " faces";
+        return clusters;
+    }
+
+    // Assign a name to an unnamed cluster (batch update face person_id)
+    int assignNameToCluster(const FaceCluster& cluster, const string& name) {
+        int personId = db_.getOrCreatePerson(name);
+        if (personId <= 0) return 0;
+        db_.batchUpdateFacePersonId(cluster.faceIds, personId);
+        loadFaceCache();
+        return personId;
+    }
+
+    // Get photo IDs for a set of face IDs
+    vector<string> getPhotoIdsForFaceIds(const vector<int>& faceIds) {
+        return db_.getPhotoIdsForFaceIds(faceIds);
+    }
+
+    // Merge two persons
+    bool mergePersons(int targetId, int sourceId) {
+        bool ok = db_.mergePersons(targetId, sourceId);
+        if (ok) loadFaceCache();
+        return ok;
+    }
+
+    // Rename a person
+    bool renamePerson(int personId, const string& newName) {
+        bool ok = db_.renamePerson(personId, newName);
+        if (ok) loadFaceCache();
+        return ok;
+    }
+
     // --- Face Detection Pipeline ---
 
     // Initialize face detection models (SCRFD + ArcFace)
@@ -1606,6 +1815,11 @@ public:
     }
 
 private:
+    // Load person id->name mapping from DB
+    unordered_map<int, string> loadPersonIdToName() {
+        return db_.loadPersonIdToName();
+    }
+
     HttpClient client_;
     PhotoDatabase db_;
     unordered_map<string, PhotoEntry> photos_;

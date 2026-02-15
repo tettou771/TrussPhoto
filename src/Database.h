@@ -186,6 +186,9 @@ public:
     // Write mutex for serializing writes from multiple threads
     mutex& writeMutex() { return writeMutex_; }
 
+    // Raw handle (for sqlite3_last_insert_rowid etc.)
+    sqlite3* rawDb() const { return db_; }
+
 private:
     sqlite3* db_ = nullptr;
     mutex writeMutex_;

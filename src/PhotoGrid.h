@@ -91,6 +91,10 @@ public:
     void setTextMatchIds(const unordered_set<string>& ids) { textMatchIds_ = ids; }
     void clearTextMatchIds() { textMatchIds_.clear(); }
 
+    void setFilterPhotoIds(const unordered_set<string>& ids) { filterPhotoIds_ = ids; }
+    void clearFilterPhotoIds() { filterPhotoIds_.clear(); }
+    bool hasFilterPhotoIds() const { return !filterPhotoIds_.empty(); }
+
     // --- Populate ---
 
     void populate(PhotoProvider& provider) {
@@ -113,6 +117,9 @@ public:
         for (size_t i = 0; i < ids.size(); i++) {
             auto* photo = provider.getPhoto(ids[i]);
             if (!photo) continue;
+
+            // Filter by explicit photo ID set (e.g. from People view)
+            if (!filterPhotoIds_.empty() && filterPhotoIds_.count(ids[i]) == 0) continue;
 
             // Filter by folder path
             if (!filterPath_.empty()) {
@@ -273,6 +280,7 @@ private:
     string textFilter_;
     vector<PhotoProvider::SearchResult> clipResults_;
     unordered_set<string> textMatchIds_;
+    unordered_set<string> filterPhotoIds_;
 
     // --- Pool ---
     vector<PhotoItem::Ptr> pool_;

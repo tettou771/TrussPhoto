@@ -221,6 +221,23 @@ void tcApp::setup() {
     };
     relatedView_->onRedraw = [this]() { redraw(); };
 
+    // 5c3. Create people view
+    peopleView_ = make_shared<PeopleView>();
+    addChild(peopleView_);
+    peopleView_->setActive(false);
+    peopleView_->onPersonClick = [this](const PhotoProvider::FaceCluster& cluster) {
+        // People → Grid (filtered by person's photos)
+        auto photoIds = provider_.getPhotoIdsForFaceIds(cluster.faceIds);
+        exitPeopleView();
+        grid_->clearClipResults();
+        grid_->clearTextMatchIds();
+        grid_->setTextFilter("");
+        grid_->setFilterPhotoIds(unordered_set<string>(photoIds.begin(), photoIds.end()));
+        grid_->populate(provider_);
+        redraw();
+    };
+    peopleView_->onRedraw = [this]() { redraw(); };
+
     // 5d. Create metadata panel (right sidebar)
     metadataPanel_ = make_shared<MetadataPanel>();
     addChild(metadataPanel_);
@@ -638,6 +655,8 @@ void tcApp::draw() {
         // MapView draws itself via Node tree
     } else if (viewMode_ == ViewMode::Related) {
         // RelatedView draws itself via Node tree
+    } else if (viewMode_ == ViewMode::People) {
+        // PeopleView draws itself via Node tree
     } else {
         // Show hint if no images
         if (provider_.getCount() == 0) {
@@ -820,6 +839,11 @@ void tcApp::keyPressed(int key) {
         // G key handles return to grid (mode-independent below)
     } else if (viewMode_ == ViewMode::Related) {
         // G key handles return to grid (mode-independent below)
+    } else if (viewMode_ == ViewMode::People) {
+        // ESC → return to grid
+        if (key == SAPP_KEYCODE_ESCAPE) {
+            exitPeopleView();
+        }
     } else {
         // Grid mode: if search bar is active, only handle ESC
         if (searchBar_ && searchBar_->isActive()) {
@@ -838,10 +862,15 @@ void tcApp::keyPressed(int key) {
             if (searchBar_ && !searchBar_->getQuery().empty()) {
                 searchBar_->clear();
                 grid_->clearClipResults();
+                grid_->clearFilterPhotoIds();
                 grid_->populate(provider_);
             } else if (grid_ && grid_->hasSelection()) {
                 grid_->clearSelection();
                 updateMetadataPanel();
+            } else if (grid_ && grid_->hasFilterPhotoIds()) {
+                // Clear person/face filter
+                grid_->clearFilterPhotoIds();
+                grid_->populate(provider_);
             }
         } else if (key == SAPP_KEYCODE_SLASH) {
             // '/' to activate search
@@ -882,11 +911,23 @@ void tcApp::keyPressed(int key) {
             updateLayout();
         } else if (viewMode_ == ViewMode::Related) {
             exitRelatedView();
+        } else if (viewMode_ == ViewMode::People) {
+            exitPeopleView();
+        }
+    }
+    if (key == 'O' || key == 'o') {
+        if (viewMode_ == ViewMode::People) {
+            exitPeopleView();
+        } else if (viewMode_ == ViewMode::Grid) {
+            enterPeopleView();
         }
     }
     if (key == 'M' || key == 'm') {
         if (viewMode_ == ViewMode::Related) {
             exitRelatedView();
+        }
+        if (viewMode_ == ViewMode::People) {
+            exitPeopleView();
         }
         if (viewMode_ == ViewMode::Single || viewMode_ == ViewMode::Grid) {
             // Clean up single view resources if needed
@@ -972,7 +1013,7 @@ void tcApp::keyReleased(int key) {
 }
 
 void tcApp::mousePressed(Vec2 pos, int button) {
-    if (viewMode_ == ViewMode::Map || viewMode_ == ViewMode::Related) return;  // handled via Node events
+    if (viewMode_ == ViewMode::Map || viewMode_ == ViewMode::Related || viewMode_ == ViewMode::People) return;  // handled via Node events
     if (viewMode_ == ViewMode::Single && button == 0) {
         isDragging_ = true;
         dragStart_ = pos;
@@ -992,7 +1033,7 @@ void tcApp::mouseMoved(Vec2 pos) {
 }
 
 void tcApp::mouseDragged(Vec2 pos, int button) {
-    if (viewMode_ == ViewMode::Map || viewMode_ == ViewMode::Related) return;
+    if (viewMode_ == ViewMode::Map || viewMode_ == ViewMode::Related || viewMode_ == ViewMode::People) return;
     if (viewMode_ == ViewMode::Single && button == 0 && isDragging_) {
         Vec2 delta = pos - dragStart_;
         panOffset_ = panOffset_ + delta;
@@ -1004,8 +1045,8 @@ void tcApp::mouseDragged(Vec2 pos, int button) {
 void tcApp::mouseScrolled(Vec2 delta) {
     redraw();
 
-    // Map/Related view handles its own scroll via Node events
-    if (viewMode_ == ViewMode::Map || viewMode_ == ViewMode::Related) return;
+    // Map/Related/People view handles its own scroll via Node events
+    if (viewMode_ == ViewMode::Map || viewMode_ == ViewMode::Related || viewMode_ == ViewMode::People) return;
     if (viewMode_ != ViewMode::Single) return;
 
     bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
@@ -1088,6 +1129,7 @@ void tcApp::exit() {
 
     if (mapView_) mapView_->shutdown();
     if (relatedView_) relatedView_->shutdown();
+    if (peopleView_) peopleView_->shutdown();
     uploadQueue_.stop();
     if (syncThread_.joinable()) syncThread_.join();
     if (rawLoadThread_.joinable()) rawLoadThread_.join();
@@ -1475,6 +1517,55 @@ void tcApp::exitRelatedView() {
     redraw();
 }
 
+void tcApp::enterPeopleView() {
+    viewMode_ = ViewMode::People;
+    grid_->setActive(false);
+    if (mapView_) mapView_->setActive(false);
+    if (relatedView_ && relatedView_->getActive()) {
+        relatedView_->setActive(false);
+        relatedView_->shutdown();
+    }
+    if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
+
+    peopleView_->populate(provider_);
+    peopleView_->setActive(true);
+
+    // Hide left sidebar in people view
+    leftPaneWidth_ = 0;
+    leftTween_.finish();
+
+    if (metadataPanel_) {
+        metadataPanel_->setPhoto(nullptr);
+        metadataPanel_->clearViewInfo();
+        metadataPanel_->clearThumbnail();
+    }
+
+    updateLayout();
+    redraw();
+}
+
+void tcApp::exitPeopleView() {
+    if (viewMode_ != ViewMode::People) return;
+
+    viewMode_ = ViewMode::Grid;
+    peopleView_->setActive(false);
+    peopleView_->shutdown();
+    grid_->setActive(true);
+
+    // Restore left pane
+    leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
+    leftTween_.finish();
+
+    if (metadataPanel_) {
+        metadataPanel_->clearViewInfo();
+        metadataPanel_->clearThumbnail();
+        updateMetadataPanel();
+    }
+
+    updateLayout();
+    redraw();
+}
+
 void tcApp::drawSingleView() {
     // For RAW: prefer fullTexture, fallback to previewTexture
     bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
@@ -1577,6 +1668,11 @@ void tcApp::updateLayout() {
     if (relatedView_) {
         if (viewMode_ == ViewMode::Related) {
             relatedView_->setRect(contentX, contentY, contentW, contentH);
+        }
+    }
+    if (peopleView_) {
+        if (viewMode_ == ViewMode::People) {
+            peopleView_->setRect(contentX, contentY, contentW, contentH);
         }
     }
 
