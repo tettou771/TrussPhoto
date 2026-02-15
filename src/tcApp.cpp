@@ -63,12 +63,18 @@ void tcApp::setup() {
 
     // 6b. Import from Lightroom Classic catalog (if --import-lrcat specified)
     if (!AppConfig::importLrcatPath.empty()) {
-        auto [entries, stats] = LrcatImporter::import(AppConfig::importLrcatPath);
-        int added = provider_.importReferences(entries);
+        auto result = LrcatImporter::import(AppConfig::importLrcatPath);
+        int added = provider_.importReferences(result.entries);
         if (added > 0) hasLibrary = true;
+
+        // Import faces/persons
+        int facesAdded = provider_.importFaces(result.faces);
+
         logNotice() << "[LrcatImport] imported=" << added
-                    << " total=" << stats.totalImages
-                    << " missing_files=" << stats.missingFile;
+                    << " total=" << result.stats.totalImages
+                    << " missing_files=" << result.stats.missingFile
+                    << " faces=" << facesAdded
+                    << " persons=" << result.stats.persons;
     }
 
     // 7. Save bootstrap (remember catalog path for next launch)

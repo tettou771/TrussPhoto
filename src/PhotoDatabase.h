@@ -14,7 +14,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 6;
+    static constexpr int SCHEMA_VERSION = 7;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -77,6 +77,7 @@ public:
             if (!ok) return false;
 
             if (!createEmbeddingsTable()) return false;
+            if (!createFaceTables()) return false;
 
             db_.setSchemaVersion(SCHEMA_VERSION);
             logNotice() << "[PhotoDatabase] Schema v" << SCHEMA_VERSION << " created";
@@ -159,8 +160,19 @@ public:
                     return false;
                 }
             }
+            version = 6;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v5 -> v6";
+        }
+
+        // v6 -> v7: add faces + persons tables
+        if (version == 6) {
+            if (!createFaceTables()) {
+                logError() << "[PhotoDatabase] Migration v6->v7 failed";
+                return false;
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v5 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v6 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -475,6 +487,138 @@ public:
         return result;
     }
 
+    // --- Faces / Persons ---
+
+    // Insert persons (name -> assigned id). Returns name->id map.
+    unordered_map<string, int> insertPersons(const vector<string>& names) {
+        unordered_map<string, int> result;
+        if (names.empty()) return result;
+
+        lock_guard<mutex> lock(db_.writeMutex());
+        db_.beginTransaction();
+
+        auto ins = db_.prepare(
+            "INSERT OR IGNORE INTO persons (name, created_at) VALUES (?1, ?2)");
+        if (!ins.valid()) { db_.rollback(); return result; }
+
+        int64_t now = chrono::duration_cast<chrono::milliseconds>(
+            chrono::system_clock::now().time_since_epoch()).count();
+
+        for (const auto& name : names) {
+            ins.bind(1, name);
+            ins.bind(2, now);
+            ins.execute();
+            ins.reset();
+        }
+        db_.commit();
+
+        // Read back all persons to get IDs
+        auto sel = db_.prepare("SELECT id, name FROM persons");
+        if (sel.valid()) {
+            while (sel.step()) {
+                result[sel.getText(1)] = sel.getInt(0);
+            }
+        }
+        return result;
+    }
+
+    struct FaceRow {
+        string photoId;
+        int personId = 0;    // 0 = unnamed
+        float x, y, w, h;
+        string source;
+        int lrClusterId = 0;
+    };
+
+    int insertFaces(const vector<FaceRow>& faces) {
+        if (faces.empty()) return 0;
+
+        lock_guard<mutex> lock(db_.writeMutex());
+        db_.beginTransaction();
+
+        auto stmt = db_.prepare(
+            "INSERT INTO faces (photo_id, person_id, x, y, w, h, source, lr_cluster_id, created_at) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
+        if (!stmt.valid()) { db_.rollback(); return 0; }
+
+        int64_t now = chrono::duration_cast<chrono::milliseconds>(
+            chrono::system_clock::now().time_since_epoch()).count();
+
+        int count = 0;
+        for (const auto& f : faces) {
+            stmt.bind(1, f.photoId);
+            if (f.personId > 0) {
+                stmt.bind(2, f.personId);
+            } else {
+                stmt.bindNull(2);
+            }
+            stmt.bind(3, (double)f.x);
+            stmt.bind(4, (double)f.y);
+            stmt.bind(5, (double)f.w);
+            stmt.bind(6, (double)f.h);
+            stmt.bind(7, f.source);
+            stmt.bind(8, f.lrClusterId);
+            stmt.bind(9, now);
+            if (stmt.execute()) count++;
+            stmt.reset();
+        }
+
+        db_.commit();
+        return count;
+    }
+
+    vector<FaceRow> getFacesForPhoto(const string& photoId) {
+        vector<FaceRow> result;
+        auto stmt = db_.prepare(
+            "SELECT f.photo_id, COALESCE(f.person_id, 0), f.x, f.y, f.w, f.h, "
+            "f.source, COALESCE(f.lr_cluster_id, 0), COALESCE(p.name, '') "
+            "FROM faces f LEFT JOIN persons p ON f.person_id = p.id "
+            "WHERE f.photo_id = ?1");
+        if (!stmt.valid()) return result;
+        stmt.bind(1, photoId);
+        while (stmt.step()) {
+            FaceRow row;
+            row.photoId = stmt.getText(0);
+            row.personId = stmt.getInt(1);
+            row.x = (float)stmt.getDouble(2);
+            row.y = (float)stmt.getDouble(3);
+            row.w = (float)stmt.getDouble(4);
+            row.h = (float)stmt.getDouble(5);
+            row.source = stmt.getText(6);
+            row.lrClusterId = stmt.getInt(7);
+            result.push_back(std::move(row));
+        }
+        return result;
+    }
+
+    // Get person list with face count, sorted by count descending
+    vector<pair<string, int>> getPersonList() {
+        vector<pair<string, int>> result;
+        auto stmt = db_.prepare(
+            "SELECT p.name, COUNT(*) as cnt FROM faces f "
+            "JOIN persons p ON f.person_id = p.id "
+            "GROUP BY p.name ORDER BY cnt DESC");
+        if (!stmt.valid()) return result;
+        while (stmt.step()) {
+            result.push_back({stmt.getText(0), stmt.getInt(1)});
+        }
+        return result;
+    }
+
+    int getFaceCount() {
+        auto stmt = db_.prepare("SELECT COUNT(*) FROM faces");
+        if (!stmt.valid()) return 0;
+        if (stmt.step()) return stmt.getInt(0);
+        return 0;
+    }
+
+    int getPersonCount() {
+        auto stmt = db_.prepare("SELECT COUNT(*) FROM persons");
+        if (!stmt.valid()) return 0;
+        if (stmt.step()) return stmt.getInt(0);
+        return 0;
+    }
+
     // --- JSON migration ---
 
     bool migrateFromJson(const string& jsonPath) {
@@ -527,6 +671,40 @@ private:
             "  created_at INTEGER NOT NULL DEFAULT 0,"
             "  PRIMARY KEY (photo_id, model, source)"
             ")");
+    }
+
+    bool createFaceTables() {
+        bool ok = db_.exec(
+            "CREATE TABLE IF NOT EXISTS persons ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  name TEXT NOT NULL UNIQUE,"
+            "  created_at INTEGER NOT NULL DEFAULT 0"
+            ")");
+        if (!ok) return false;
+
+        ok = db_.exec("CREATE INDEX IF NOT EXISTS idx_persons_name ON persons(name)");
+        if (!ok) return false;
+
+        ok = db_.exec(
+            "CREATE TABLE IF NOT EXISTS faces ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  photo_id TEXT NOT NULL,"
+            "  person_id INTEGER,"
+            "  x REAL NOT NULL,"
+            "  y REAL NOT NULL,"
+            "  w REAL NOT NULL,"
+            "  h REAL NOT NULL,"
+            "  source TEXT NOT NULL DEFAULT 'lightroom',"
+            "  lr_cluster_id INTEGER,"
+            "  created_at INTEGER NOT NULL DEFAULT 0"
+            ")");
+        if (!ok) return false;
+
+        ok = db_.exec("CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id)");
+        if (!ok) return false;
+
+        ok = db_.exec("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)");
+        return ok;
     }
 
     static void bindEntry(Database::Statement& stmt, const PhotoEntry& e) {

@@ -136,6 +136,12 @@ public:
             return {data, size};
         }
 
+        void bindNull(int idx) {
+            if (stmt_) sqlite3_bind_null(stmt_, idx);
+        }
+
+        sqlite3_stmt* rawStmt() const { return stmt_; }
+
         void reset() {
             if (stmt_) {
                 sqlite3_reset(stmt_);

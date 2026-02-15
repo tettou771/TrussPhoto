@@ -28,10 +28,21 @@ public:
         int skippedVirtual = 0;
         int missingFile = 0;
         int imported = 0;
+        int faces = 0;
+        int namedFaces = 0;
+        int persons = 0;
+    };
+
+    struct FaceEntry {
+        string photoId;       // filename_filesize
+        string personName;    // "" if unnamed
+        float x, y, w, h;    // normalized 0-1 (top-left + size)
+        int lrClusterId = 0;
     };
 
     struct Result {
         vector<PhotoEntry> entries;
+        vector<FaceEntry> faces;
         Stats stats;
     };
 
@@ -58,14 +69,22 @@ public:
         auto keywordMap = loadKeywords(db);
         logNotice() << "[LrcatImport] Keywords loaded for " << keywordMap.size() << " images";
 
-        // Step 2: Load all photos
-        result = loadPhotos(db, keywordMap);
+        // Step 2: Load all photos (also builds imageIdMap for face import)
+        unordered_map<int64_t, string> imageIdMap;
+        result = loadPhotos(db, keywordMap, imageIdMap);
+
+        // Step 3: Load faces
+        result.faces = loadFaces(db, imageIdMap, result.stats);
+        logNotice() << "[LrcatImport] Faces: " << result.stats.faces
+                    << " (named: " << result.stats.namedFaces
+                    << ", persons: " << result.stats.persons << ")";
 
         sqlite3_close(db);
 
         logNotice() << "[LrcatImport] Done: total=" << result.stats.totalImages
                     << " imported=" << result.stats.imported
-                    << " missing=" << result.stats.missingFile;
+                    << " missing=" << result.stats.missingFile
+                    << " faces=" << result.stats.faces;
         return result;
     }
 
@@ -99,7 +118,8 @@ private:
     }
 
     static Result loadPhotos(sqlite3* db,
-                             const unordered_map<int64_t, vector<string>>& keywordMap) {
+                             const unordered_map<int64_t, vector<string>>& keywordMap,
+                             unordered_map<int64_t, string>& imageIdMap) {
         Result result;
 
         const char* sql =
@@ -179,6 +199,9 @@ private:
 
             string id = filename + "_" + to_string(fileSize);
 
+            // Map LR image id_local -> our photo ID (for face import)
+            imageIdMap[imageIdLocal] = id;
+
             // Check if file exists (skip if not accessible)
             if (!fs::exists(localPath)) {
                 result.stats.missingFile++;
@@ -230,6 +253,65 @@ private:
         }
 
         sqlite3_finalize(stmt);
+        return result;
+    }
+
+    // Load face data from lrcat (AgLibraryFace + AgLibraryKeywordFace + AgLibraryKeyword)
+    static vector<FaceEntry> loadFaces(sqlite3* db,
+                                        const unordered_map<int64_t, string>& imageIdMap,
+                                        Stats& stats) {
+        vector<FaceEntry> result;
+
+        const char* sql =
+            "SELECT f.image, f.tl_x, f.tl_y, f.br_x, f.br_y, "
+            "  CAST(COALESCE(f.cluster, 0) AS INTEGER), "
+            "  k.name AS person_name "
+            "FROM AgLibraryFace f "
+            "LEFT JOIN AgLibraryKeywordFace kf ON kf.face = f.id_local AND kf.userPick = 1 "
+            "LEFT JOIN AgLibraryKeyword k ON kf.tag = k.id_local "
+            "WHERE f.regionType = 1.0";
+
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            logWarning() << "[LrcatImport] Face query failed: " << sqlite3_errmsg(db);
+            return result;
+        }
+
+        unordered_set<string> personNames;
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t imageId = sqlite3_column_int64(stmt, 0);
+
+            // Map LR image id to our photo ID
+            auto it = imageIdMap.find(imageId);
+            if (it == imageIdMap.end()) continue;
+
+            float tlX = (float)sqlite3_column_double(stmt, 1);
+            float tlY = (float)sqlite3_column_double(stmt, 2);
+            float brX = (float)sqlite3_column_double(stmt, 3);
+            float brY = (float)sqlite3_column_double(stmt, 4);
+            int clusterId = sqlite3_column_int(stmt, 5);
+            const char* personName = (const char*)sqlite3_column_text(stmt, 6);
+
+            FaceEntry face;
+            face.photoId = it->second;
+            face.x = tlX;
+            face.y = tlY;
+            face.w = brX - tlX;
+            face.h = brY - tlY;
+            face.lrClusterId = clusterId;
+            if (personName && personName[0] != '\0') {
+                face.personName = personName;
+                personNames.insert(face.personName);
+                stats.namedFaces++;
+            }
+
+            result.push_back(std::move(face));
+            stats.faces++;
+        }
+
+        sqlite3_finalize(stmt);
+        stats.persons = (int)personNames.size();
         return result;
     }
 

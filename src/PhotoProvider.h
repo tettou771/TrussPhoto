@@ -28,6 +28,7 @@ namespace fs = std::filesystem;
 #include "SmartPreview.h"
 #include "ClipEmbedder.h"
 #include "ClipTextEncoder.h"
+#include "LrcatImporter.h"
 
 // Photo provider - manages local + server photos
 class PhotoProvider {
@@ -803,6 +804,57 @@ public:
         logNotice() << "[PhotoProvider] importReferences: " << added
                     << " added (total: " << photos_.size() << ")";
         return added;
+    }
+
+    // --- Faces ---
+
+    // Import face entries from LrcatImporter into DB
+    int importFaces(const vector<LrcatImporter::FaceEntry>& faces) {
+        if (faces.empty()) return 0;
+
+        // Collect unique person names
+        vector<string> names;
+        {
+            unordered_set<string> nameSet;
+            for (const auto& f : faces) {
+                if (!f.personName.empty()) nameSet.insert(f.personName);
+            }
+            names.assign(nameSet.begin(), nameSet.end());
+        }
+
+        // Insert persons and get name->id mapping
+        auto personMap = db_.insertPersons(names);
+
+        // Build FaceRow list for batch insert
+        vector<PhotoDatabase::FaceRow> rows;
+        rows.reserve(faces.size());
+        for (const auto& f : faces) {
+            // Only import faces for photos we actually have
+            if (!photos_.count(f.photoId)) continue;
+
+            PhotoDatabase::FaceRow row;
+            row.photoId = f.photoId;
+            row.x = f.x;
+            row.y = f.y;
+            row.w = f.w;
+            row.h = f.h;
+            row.source = "lightroom";
+            row.lrClusterId = f.lrClusterId;
+
+            if (!f.personName.empty()) {
+                auto it = personMap.find(f.personName);
+                if (it != personMap.end()) {
+                    row.personId = it->second;
+                }
+            }
+
+            rows.push_back(std::move(row));
+        }
+
+        int inserted = db_.insertFaces(rows);
+        logNotice() << "[PhotoProvider] importFaces: " << inserted
+                    << " faces, " << names.size() << " persons";
+        return inserted;
     }
 
     // --- Smart Preview ---
