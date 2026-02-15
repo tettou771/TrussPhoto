@@ -85,6 +85,17 @@ public:
         auto input = preprocess(pixels);
         if (input.empty()) return {};
 
+        return infer(input);
+    }
+
+    // Preprocess pixels to float tensor (thread-safe, can run on multiple threads)
+    vector<float> preprocessPixels(const Pixels& pixels) const {
+        if (!ready_ || !pixels.isAllocated()) return {};
+        return preprocess(pixels);
+    }
+
+    // Run inference on preprocessed tensor (NOT thread-safe, call from single thread)
+    vector<float> infer(const vector<float>& input) {
         vector<int64_t> shape = {1, 3, inputSize_, inputSize_};
         auto output = runner_.run(input, shape);
         if (output.empty()) return {};
@@ -92,6 +103,42 @@ public:
         // L2 normalize
         l2Normalize(output);
         return output;
+    }
+
+    // Batch inference: multiple preprocessed tensors → multiple embeddings
+    // Each input tensor is [3 * inputSize_ * inputSize_] floats
+    vector<vector<float>> inferBatch(const vector<vector<float>>& inputs) {
+        if (inputs.empty()) return {};
+        if (inputs.size() == 1) {
+            auto result = infer(inputs[0]);
+            if (result.empty()) return {};
+            return {std::move(result)};
+        }
+
+        int batchSize = (int)inputs.size();
+        int tensorSize = 3 * inputSize_ * inputSize_;
+
+        // Concatenate into single [N, 3, H, W] tensor
+        vector<float> batched(batchSize * tensorSize);
+        for (int i = 0; i < batchSize; i++) {
+            memcpy(batched.data() + i * tensorSize,
+                   inputs[i].data(), tensorSize * sizeof(float));
+        }
+
+        vector<int64_t> shape = {batchSize, 3, inputSize_, inputSize_};
+        auto output = runner_.run(batched, shape);
+        if (output.empty()) return {};
+
+        // Split output [N, EMBED_DIM] into individual embeddings
+        vector<vector<float>> results;
+        results.reserve(batchSize);
+        for (int i = 0; i < batchSize; i++) {
+            vector<float> emb(output.begin() + i * EMBED_DIM,
+                              output.begin() + (i + 1) * EMBED_DIM);
+            l2Normalize(emb);
+            results.push_back(std::move(emb));
+        }
+        return results;
     }
 
 private:

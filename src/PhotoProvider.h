@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <fstream>
 #include <mutex>
+#include <deque>
+#include <condition_variable>
 #include <sys/stat.h>
 
 using namespace std;
@@ -1400,7 +1402,17 @@ public:
     // Graceful shutdown: signal all threads to stop, then join
     void shutdown() {
         stopping_ = true;
-        if (embThread_.joinable()) embThread_.join();
+        // Wake up any waiting preprocess/inference threads
+        prepQueueCV_.notify_all();
+        prepQueueSpaceCV_.notify_all();
+        for (auto& t : prepThreads_) {
+            if (t.joinable()) t.join();
+        }
+        prepThreads_.clear();
+        for (auto& t : embThreads_) {
+            if (t.joinable()) t.join();
+        }
+        embThreads_.clear();
         if (spThread_.joinable()) spThread_.join();
         if (copyThread_.joinable()) copyThread_.join();
         if (consolidateThread_.joinable()) consolidateThread_.join();
@@ -1482,13 +1494,31 @@ private:
         vector<float> embedding;
     };
 
+    // Preprocessed tensor ready for inference
+    struct PreparedTensor {
+        string photoId;
+        vector<float> tensor;
+    };
+
     mutable mutex embMutex_;
     vector<string> pendingEmbeddings_;
     vector<EmbeddingResult> completedEmbeddings_;
     atomic<bool> embThreadRunning_{false};
     atomic<int> embCompletedCount_{0};
     atomic<int> embTotalCount_{0};
-    thread embThread_;
+    vector<thread> embThreads_;
+    vector<thread> prepThreads_;
+
+    // Queue between preprocess workers and inference thread
+    mutex prepQueueMutex_;
+    condition_variable prepQueueCV_;
+    deque<PreparedTensor> prepQueue_;
+    atomic<int> prepDoneCount_{0};  // how many preprocess workers have finished
+    int prepWorkerCount_ = 0;
+    static constexpr int PREP_QUEUE_MAX = 32;    // limit memory usage
+    static constexpr int INFER_THREAD_COUNT = 4; // parallel inference threads
+    atomic<int> inferThreadsRunning_{0};          // track active inference threads
+    condition_variable prepQueueSpaceCV_;       // signal when queue has space
 
     void startEmbeddingThread() {
         // Called with embMutex_ already held
@@ -1496,56 +1526,126 @@ private:
 
         embThreadRunning_ = true;
         embCompletedCount_ = 0;
-        if (embThread_.joinable()) embThread_.join();
+        for (auto& t : embThreads_) {
+            if (t.joinable()) t.join();
+        }
+        embThreads_.clear();
+        for (auto& t : prepThreads_) {
+            if (t.joinable()) t.join();
+        }
+        prepThreads_.clear();
 
         vector<string> ids = std::move(pendingEmbeddings_);
         pendingEmbeddings_.clear();
         embTotalCount_ = (int)ids.size();
 
-        embThread_ = thread([this, ids = std::move(ids)]() {
-            logNotice() << "[CLIP] Generating embeddings for " << ids.size() << " photos";
-            int done = 0;
-            int skipped = 0;
-            for (const auto& id : ids) {
-                if (stopping_) break;
+        // Clear prep queue state
+        {
+            lock_guard<mutex> lock(prepQueueMutex_);
+            prepQueue_.clear();
+            prepDoneCount_ = 0;
+        }
 
-                // Get thumbnail path for this photo
-                auto it = photos_.find(id);
-                if (it == photos_.end()) continue;
-                auto& photo = it->second;
+        // Split IDs among preprocess workers
+        const int workerCount = min(8, max(1, (int)ids.size()));
+        prepWorkerCount_ = workerCount;
+        int chunkSize = ((int)ids.size() + workerCount - 1) / workerCount;
 
-                // Load thumbnail pixels (U8, small — ideal for CLIP)
-                Pixels thumbPixels;
-                string thumbPath = photo.localThumbnailPath;
-                bool loaded = false;
-
-                if (!thumbPath.empty() && fs::exists(thumbPath)) {
-                    loaded = thumbPixels.load(thumbPath);
-                }
-
-                // Fallback: try to generate thumbnail on the fly
-                if (!loaded) {
-                    loaded = getThumbnail(id, thumbPixels);
-                }
-
-                if (!loaded) {
-                    skipped++;
-                    continue;
-                }
-
-                auto embedding = clipEmbedder_.embed(thumbPixels);
-                if (embedding.empty()) continue;
-
-                {
-                    lock_guard<mutex> lock(embMutex_);
-                    completedEmbeddings_.push_back({id, std::move(embedding)});
-                }
-                embCompletedCount_ = ++done;
+        for (int w = 0; w < workerCount; w++) {
+            int start = w * chunkSize;
+            int end = min(start + chunkSize, (int)ids.size());
+            if (start >= end) {
+                prepDoneCount_++;
+                continue;
             }
-            logNotice() << "[CLIP] Embedding done: " << done << "/" << ids.size()
-                        << (skipped > 0 ? " (skipped " + to_string(skipped) + " without thumbnail)" : "");
-            embThreadRunning_ = false;
-        });
+
+            vector<string> chunk(ids.begin() + start, ids.begin() + end);
+            prepThreads_.emplace_back([this, chunk = std::move(chunk)]() {
+                int skipped = 0;
+                for (const auto& id : chunk) {
+                    if (stopping_) break;
+
+                    // Load thumbnail
+                    auto it = photos_.find(id);
+                    if (it == photos_.end()) continue;
+                    auto& photo = it->second;
+
+                    Pixels thumbPixels;
+                    string thumbPath = photo.localThumbnailPath;
+                    bool loaded = false;
+
+                    if (!thumbPath.empty() && fs::exists(thumbPath)) {
+                        loaded = thumbPixels.load(thumbPath);
+                    }
+                    if (!loaded) {
+                        loaded = getThumbnail(id, thumbPixels);
+                    }
+                    if (!loaded) { skipped++; continue; }
+
+                    // Preprocess to float tensor (thread-safe)
+                    auto tensor = clipEmbedder_.preprocessPixels(thumbPixels);
+                    if (tensor.empty()) continue;
+
+                    // Push to inference queue (bounded)
+                    {
+                        unique_lock<mutex> lock(prepQueueMutex_);
+                        prepQueueSpaceCV_.wait(lock, [this]() {
+                            return (int)prepQueue_.size() < PREP_QUEUE_MAX || stopping_;
+                        });
+                        if (stopping_) break;
+                        prepQueue_.push_back({id, std::move(tensor)});
+                    }
+                    prepQueueCV_.notify_one();
+                }
+                if (skipped > 0) {
+                    logNotice() << "[CLIP] Preprocess worker skipped " << skipped << " (no thumbnail)";
+                }
+                prepDoneCount_++;
+                prepQueueCV_.notify_one();  // wake inference thread to check done
+            });
+        }
+
+        // Inference threads: parallel ONNX inference (Session::Run is thread-safe)
+        logNotice() << "[CLIP] Pipeline started: "
+                    << prepWorkerCount_ << " preprocess workers + "
+                    << INFER_THREAD_COUNT << " inference threads";
+
+        inferThreadsRunning_ = INFER_THREAD_COUNT;
+        for (int t = 0; t < INFER_THREAD_COUNT; t++) {
+            embThreads_.emplace_back([this]() {
+                while (true) {
+                    PreparedTensor item;
+                    {
+                        unique_lock<mutex> lock(prepQueueMutex_);
+                        prepQueueCV_.wait(lock, [this]() {
+                            return !prepQueue_.empty() || (prepDoneCount_ >= prepWorkerCount_) || stopping_;
+                        });
+                        if (stopping_) break;
+                        if (prepQueue_.empty()) {
+                            if (prepDoneCount_ >= prepWorkerCount_) break;
+                            continue;
+                        }
+                        item = std::move(prepQueue_.front());
+                        prepQueue_.pop_front();
+                    }
+                    prepQueueSpaceCV_.notify_one();
+
+                    auto embedding = clipEmbedder_.infer(item.tensor);
+                    if (embedding.empty()) continue;
+
+                    {
+                        lock_guard<mutex> lock(embMutex_);
+                        completedEmbeddings_.push_back({item.photoId, std::move(embedding)});
+                    }
+                    embCompletedCount_++;
+                }
+                if (--inferThreadsRunning_ == 0) {
+                    logNotice() << "[CLIP] Embedding done: " << embCompletedCount_.load()
+                                << "/" << embTotalCount_.load();
+                    embThreadRunning_ = false;
+                }
+            });
+        }
     }
 
     void startSPGenerationThread() {

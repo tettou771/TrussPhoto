@@ -27,7 +27,7 @@ public:
             opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
 #if defined(__APPLE__)
-            // CoreML EP: unsupported ops auto-fallback to CPU
+            // CoreML EP: NeuralNetwork format (ANE uses FP16 internally)
             OrtSessionOptionsAppendExecutionProvider_CoreML(opts, 0);
             logNotice() << "[OnnxRunner] CoreML execution provider enabled";
 #endif

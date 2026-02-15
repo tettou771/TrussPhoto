@@ -10,7 +10,7 @@ Model: llm-jp/waon-siglip2-base-patch16-256
   - XM3600 retrieval: 73.75
 
 Usage:
-  pip install transformers torch sentencepiece protobuf onnx onnxruntime pillow
+  pip install transformers torch sentencepiece protobuf onnx onnxruntime onnxconverter-common pillow
   python scripts/export_siglip2.py
 
 Output (in ~/Library/Application Support/TrussPhoto/models/):
@@ -410,6 +410,7 @@ def main():
     print(f"  Text inputs: input_ids + attention_mask (2 inputs, no position_ids)")
     print(f"  SigLIP2 text format: [tokens..., EOS, PAD, PAD] (no CLS prefix)")
     print(f"  GemmaTokenizer: add_eos_token=True, do_lower_case=True")
+    print(f"  Precision: FP32 (CoreML EP auto-converts to FP16 internally)")
 
 
 if __name__ == "__main__":
