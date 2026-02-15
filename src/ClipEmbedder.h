@@ -60,7 +60,10 @@ public:
                 logError() << "[CLIP] Run: python scripts/export_siglip2.py";
             }
         });
-        initThread_.detach();
+    }
+
+    ~ClipEmbedder() {
+        if (initThread_.joinable()) initThread_.join();
     }
 
     bool isReady() const { return ready_; }

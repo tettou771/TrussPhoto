@@ -201,6 +201,9 @@ public:
     }
 
     // Rebind this item to a different data index and start loading
+    void setClipMatch(bool v) { clipMatch_ = v; }
+    bool isClipMatch() const { return clipMatch_; }
+
     void rebindAndLoad(int dataIndex, const string& label, SyncState syncState,
                        bool selected, Font* font) {
         // Cancel pending load for old data
@@ -268,6 +271,13 @@ public:
                 drawCircle(badgeX, badgeY, badgeSize);
                 break;
         }
+
+        // CLIP similarity match border
+        if (clipMatch_) {
+            setColor(0.4f, 0.7f, 1.0f, 0.7f);  // light blue
+            noFill();
+            drawRect(0, 0, getWidth(), getHeight());
+        }
     }
 
     void setSelected(bool selected) { isSelected_ = selected; }
@@ -314,6 +324,7 @@ private:
     ThumbnailNode::Ptr thumbnail_;
     LabelNode::Ptr label_;
     bool isSelected_ = false;
+    bool clipMatch_ = false;
     bool pastMouseOver = false;
     LoadState loadState_ = LoadState::Unloaded;
     SyncState syncState_ = SyncState::LocalOnly;

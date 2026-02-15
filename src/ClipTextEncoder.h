@@ -46,7 +46,10 @@ public:
                 logError() << "[TextEncoder] Run: python scripts/export_siglip2.py";
             }
         });
-        initThread_.detach();
+    }
+
+    ~ClipTextEncoder() {
+        if (initThread_.joinable()) initThread_.join();
     }
 
     bool isReady() const { return ready_; }

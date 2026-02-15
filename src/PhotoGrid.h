@@ -88,6 +88,9 @@ public:
     }
     void clearClipResults() { clipResults_.clear(); }
 
+    void setTextMatchIds(const unordered_set<string>& ids) { textMatchIds_ = ids; }
+    void clearTextMatchIds() { textMatchIds_.clear(); }
+
     // --- Populate ---
 
     void populate(PhotoProvider& provider) {
@@ -119,7 +122,7 @@ public:
 
             // Filter by text query (only when no CLIP results)
             if (clipResults_.empty() && !textFilter_.empty()
-                && !matchesTextFilter(*photo, textFilter_)) continue;
+                && !matchesTextFilter(*photo, textFilter_, provider.getPersonNames(ids[i]))) continue;
 
             photoIds_.push_back(ids[i]);
         }
@@ -269,6 +272,7 @@ private:
     string filterPath_;
     string textFilter_;
     vector<PhotoProvider::SearchResult> clipResults_;
+    unordered_set<string> textMatchIds_;
 
     // --- Pool ---
     vector<PhotoItem::Ptr> pool_;
@@ -478,6 +482,10 @@ private:
         SyncState sync = photo ? photo->syncState : SyncState::LocalOnly;
         bool selected = selectionSet_.count(dataIdx) > 0;
 
+        // CLIP match = in clip results but NOT a text match
+        bool clipMatch = !clipResults_.empty() && !textMatchIds_.count(photoIds_[dataIdx]);
+        item->setClipMatch(clipMatch);
+
         item->setActive(true);
         item->rebindAndLoad(dataIdx, stem, sync, selected, &labelFont_);
     }
@@ -529,7 +537,8 @@ private:
     // Text filter (unchanged)
     // =========================================================================
 
-    static bool matchesTextFilter(const PhotoEntry& photo, const string& query) {
+    static bool matchesTextFilter(const PhotoEntry& photo, const string& query,
+                                   const vector<string>* personNames = nullptr) {
         string lq = query;
         transform(lq.begin(), lq.end(), lq.begin(), ::tolower);
 
@@ -552,6 +561,13 @@ private:
 
         if (!photo.tags.empty()) {
             if (contains(photo.tags)) return true;
+        }
+
+        // Match person names from face data
+        if (personNames) {
+            for (const auto& name : *personNames) {
+                if (contains(name)) return true;
+            }
         }
 
         return false;

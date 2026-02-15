@@ -120,6 +120,10 @@ public:
             photos_[entry.id] = std::move(entry);
         }
         logNotice() << "[PhotoProvider] Library loaded from DB: " << photos_.size() << " photos";
+
+        // Load face name cache
+        loadFaceCache();
+
         return !photos_.empty();
     }
 
@@ -854,7 +858,84 @@ public:
         int inserted = db_.insertFaces(rows);
         logNotice() << "[PhotoProvider] importFaces: " << inserted
                     << " faces, " << names.size() << " persons";
+
+        // Rebuild cache after import
+        loadFaceCache();
         return inserted;
+    }
+
+    // Load photo_id -> person names cache from DB
+    void loadFaceCache() {
+        faceNameCache_ = db_.loadPersonNamesByPhoto();
+        logNotice() << "[PhotoProvider] Face cache: "
+                    << faceNameCache_.size() << " photos with faces";
+    }
+
+    // Get person names for a photo (empty if none)
+    const vector<string>* getPersonNames(const string& photoId) const {
+        auto it = faceNameCache_.find(photoId);
+        return it != faceNameCache_.end() ? &it->second : nullptr;
+    }
+
+    // Search photos by person name (case-insensitive partial match)
+    vector<string> searchByPersonName(const string& query) const {
+        if (query.empty() || faceNameCache_.empty()) return {};
+
+        string lq = query;
+        transform(lq.begin(), lq.end(), lq.begin(), ::tolower);
+
+        vector<string> result;
+        for (const auto& [photoId, names] : faceNameCache_) {
+            for (const auto& name : names) {
+                string ln = name;
+                transform(ln.begin(), ln.end(), ln.begin(), ::tolower);
+                if (ln.find(lq) != string::npos) {
+                    result.push_back(photoId);
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    // Search photos by text field matching (filename, camera, lens, tags, memo, person names)
+    // Returns photo IDs that match any text field (case-insensitive partial match)
+    vector<string> searchByTextFields(const string& query) const {
+        if (query.empty()) return {};
+
+        string lq = query;
+        transform(lq.begin(), lq.end(), lq.begin(), ::tolower);
+
+        auto contains = [&lq](const string& field) {
+            if (field.empty()) return false;
+            string lf = field;
+            transform(lf.begin(), lf.end(), lf.begin(), ::tolower);
+            return lf.find(lq) != string::npos;
+        };
+
+        vector<string> result;
+        for (const auto& [id, photo] : photos_) {
+            if (contains(fs::path(photo.filename).stem().string()) ||
+                contains(photo.camera) || contains(photo.cameraMake) ||
+                contains(photo.lens) || contains(photo.lensMake) ||
+                contains(photo.memo) || contains(photo.colorLabel) ||
+                contains(photo.creativeStyle) || contains(photo.dateTimeOriginal) ||
+                contains(photo.tags)) {
+                result.push_back(id);
+                continue;
+            }
+            // Check person names
+            auto it = faceNameCache_.find(id);
+            if (it != faceNameCache_.end()) {
+                for (const auto& name : it->second) {
+                    if (contains(name)) {
+                        result.push_back(id);
+                        break;
+                    }
+                }
+            }
+        }
+        return result;
     }
 
     // --- Smart Preview ---
@@ -1316,6 +1397,15 @@ public:
         if (consolidateThread_.joinable()) consolidateThread_.join();
     }
 
+    // Graceful shutdown: signal all threads to stop, then join
+    void shutdown() {
+        stopping_ = true;
+        if (embThread_.joinable()) embThread_.join();
+        if (spThread_.joinable()) spThread_.join();
+        if (copyThread_.joinable()) copyThread_.join();
+        if (consolidateThread_.joinable()) consolidateThread_.join();
+    }
+
 private:
     HttpClient client_;
     PhotoDatabase db_;
@@ -1328,6 +1418,7 @@ private:
     string pendingDir_;
     bool serverReachable_ = false;
     bool serverChecked_ = false;
+    atomic<bool> stopping_{false};
 
     // Background file copy
     struct CopyTask {
@@ -1375,6 +1466,9 @@ private:
     ClipTextEncoder textEncoder_;
     unordered_map<string, vector<float>> embeddingCache_;
 
+    // Face name cache (photo_id -> person names)
+    unordered_map<string, vector<string>> faceNameCache_;
+
     static float cosineSimilarity(const vector<float>& a, const vector<float>& b) {
         if (a.size() != b.size() || a.empty()) return 0;
         float dot = 0;
@@ -1413,6 +1507,8 @@ private:
             int done = 0;
             int skipped = 0;
             for (const auto& id : ids) {
+                if (stopping_) break;
+
                 // Get thumbnail path for this photo
                 auto it = photos_.find(id);
                 if (it == photos_.end()) continue;
@@ -1450,7 +1546,6 @@ private:
                         << (skipped > 0 ? " (skipped " + to_string(skipped) + " without thumbnail)" : "");
             embThreadRunning_ = false;
         });
-        embThread_.detach();
     }
 
     void startSPGenerationThread() {
@@ -1467,6 +1562,8 @@ private:
             logNotice() << "[SmartPreview] Starting generation for " << ids.size() << " photos";
             int done = 0;
             for (const auto& id : ids) {
+                if (stopping_) break;
+
                 // Check photo still exists and has a local path
                 PhotoEntry* photo = nullptr;
                 string localPath;
@@ -1506,7 +1603,6 @@ private:
             logNotice() << "[SmartPreview] Generation done: " << done << "/" << ids.size();
             spThreadRunning_ = false;
         });
-        spThread_.detach();
     }
 
     void startCopyThread() {
@@ -1514,7 +1610,6 @@ private:
         if (pendingCopies_.empty() || copyThreadRunning_) return;
 
         copyThreadRunning_ = true;
-        // Detach previous thread if any
         if (copyThread_.joinable()) copyThread_.join();
 
         // Take ownership of pending copies
@@ -1523,6 +1618,8 @@ private:
 
         copyThread_ = thread([this, tasks = std::move(tasks)]() {
             for (const auto& task : tasks) {
+                if (stopping_) break;
+
                 if (fs::exists(task.destPath)) {
                     // Already exists, just record it
                     lock_guard<mutex> lock(copyMutex_);
@@ -1552,7 +1649,6 @@ private:
             lock_guard<mutex> lock(copyMutex_);
             copyThreadRunning_ = false;
         });
-        copyThread_.detach();
     }
 
     // Supported standard image extensions

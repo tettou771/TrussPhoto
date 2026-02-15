@@ -619,6 +619,20 @@ public:
         return 0;
     }
 
+    // Load all photo_id -> person names mapping (for search)
+    unordered_map<string, vector<string>> loadPersonNamesByPhoto() {
+        unordered_map<string, vector<string>> result;
+        auto stmt = db_.prepare(
+            "SELECT f.photo_id, p.name FROM faces f "
+            "JOIN persons p ON f.person_id = p.id "
+            "ORDER BY f.photo_id");
+        if (!stmt.valid()) return result;
+        while (stmt.step()) {
+            result[stmt.getText(0)].push_back(stmt.getText(1));
+        }
+        return result;
+    }
+
     // --- JSON migration ---
 
     bool migrateFromJson(const string& jsonPath) {

@@ -116,19 +116,40 @@ void tcApp::setup() {
         if (query.empty()) {
             // Clear all filters
             grid_->clearClipResults();
+            grid_->clearTextMatchIds();
             grid_->setTextFilter("");
             grid_->populate(provider_);
         } else if (provider_.isTextEncoderReady()) {
-            // CLIP semantic search
+            // CLIP semantic search + text field matching
             auto results = provider_.searchByText(query);
+
+            // Text matches (filename, camera, tags, person names, etc.) go first
+            auto textMatches = provider_.searchByTextFields(query);
+            int textCount = 0;
+            if (!textMatches.empty()) {
+                unordered_set<string> clipIds;
+                for (const auto& r : results) clipIds.insert(r.photoId);
+                float boostScore = results.empty() ? 1.0f : results.front().score + 0.01f;
+                for (const auto& id : textMatches) {
+                    if (!clipIds.count(id)) {
+                        results.insert(results.begin(), {id, boostScore});
+                        textCount++;
+                    }
+                }
+            }
+
             grid_->clearClipResults();
             grid_->setTextFilter("");
+            grid_->setTextMatchIds(unordered_set<string>(textMatches.begin(), textMatches.end()));
             grid_->setClipResults(results);
             grid_->populate(provider_);
-            logNotice() << "[Search] query=\"" << query << "\" filter set, repopulating grid";
+            logNotice() << "[Search] query=\"" << query
+                        << "\" text=" << textCount
+                        << " clip=" << results.size() - textCount;
         } else {
             // Fallback to text field matching
             grid_->clearClipResults();
+            grid_->clearTextMatchIds();
             grid_->setTextFilter(query);
             grid_->populate(provider_);
         }
@@ -468,7 +489,6 @@ void tcApp::update() {
             syncInProgress_ = false;
             syncCompleted_ = true;
         });
-        syncThread_.detach();
     }
 
     // Process sync completion on main thread
@@ -1029,11 +1049,8 @@ void tcApp::exit() {
     uploadQueue_.stop();
     if (syncThread_.joinable()) syncThread_.join();
     if (rawLoadThread_.joinable()) rawLoadThread_.join();
-    // Wait for consolidation to finish before saving
-    if (provider_.isConsolidateRunning()) {
-        logNotice() << "Waiting for consolidation to finish...";
-    }
-    provider_.joinConsolidate();
+    // Signal all background threads to stop, then join
+    provider_.shutdown();
     provider_.processConsolidateResults();
     // SQLite writes are immediate, no final save needed
     logNotice() << "TrussPhoto exiting";
