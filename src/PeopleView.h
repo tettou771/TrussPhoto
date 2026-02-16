@@ -4,13 +4,15 @@
 // PeopleView.h - People view with face clusters (Lightroom-style)
 // Displays named persons and unnamed face clusters with thumbnail cards.
 // Click a card to show face gallery; click name label to edit name.
+// Uses RecyclerGrid for virtualized scrolling of both card list and gallery.
 // =============================================================================
 
 #include <TrussC.h>
 #include <tcxIME.h>
 #include <optional>
 #include "PhotoProvider.h"
-#include "FolderTree.h"  // for loadJapaneseFont, PlainScrollContainer
+#include "RecyclerGrid.h"
+#include "FolderTree.h"  // for loadJapaneseFont
 
 using namespace std;
 using namespace tc;
@@ -29,20 +31,24 @@ public:
         loadJapaneseFont(fontSmall_, 11);
         loadJapaneseFont(fontLarge_, 16);
 
-        // Left: card list scroll container
-        cardScroll_ = make_shared<PlainScrollContainer>();
-        addChild(cardScroll_);
-        cardContent_ = make_shared<RectNode>();
-        cardScroll_->setContent(cardContent_);
+        // Left: card list (virtualized)
+        cardRecycler_ = make_shared<CardRecycler>();
+        cardRecycler_->fontRef = &font_;
+        cardRecycler_->fontSmallRef = &fontSmall_;
+        cardRecycler_->fontLargeRef = &fontLarge_;
+        cardRecycler_->texturesRef = &textures_;
+        cardRecycler_->onCardClick = [this](int dataIdx) {
+            pendingClickDataIdx_ = dataIdx;
+        };
+        addChild(cardRecycler_);
 
-        // Right: face gallery scroll container (hidden initially)
-        galleryScroll_ = make_shared<PlainScrollContainer>();
-        addChild(galleryScroll_);
-        galleryContent_ = make_shared<RectNode>();
-        galleryScroll_->setContent(galleryContent_);
-        // Keep always active but move offscreen when not visible
-        galleryScroll_->setPos(-9999, -9999);
-        galleryScroll_->setSize(0, 0);
+        // Right: face gallery (virtualized, hidden initially)
+        galleryRecycler_ = make_shared<GalleryRecycler>();
+        galleryRecycler_->texturesRef = &textures_;
+        galleryRecycler_->fontLargeRef = &fontLarge_;
+        addChild(galleryRecycler_);
+        galleryRecycler_->setPos(-9999, -9999);
+        galleryRecycler_->setSize(0, 0);
 
         // Name edit overlay (hidden by default)
         nameOverlay_ = make_shared<NameEditOverlay>();
@@ -62,23 +68,20 @@ public:
 
     void populate(PhotoProvider& provider) {
         provider_ = &provider;
-        editingCard_ = nullptr;
-        selectedCard_ = nullptr;
-        pendingClickCard_ = nullptr;
+        editingClusterId_ = -1;
+        selectedDataIdx_ = -1;
+        pendingClickDataIdx_ = -1;
         clusteringDone_ = false;
         galleryVisible_ = false;
 
         // Clear previous state
-        if (cardContent_) cardContent_->removeAllChildren();
-        if (galleryContent_) galleryContent_->removeAllChildren();
-        allCards_.clear();
-        galleryCrops_.clear();
+        if (galleryRecycler_) {
+            galleryRecycler_->setPos(-9999, -9999);
+            galleryRecycler_->setSize(0, 0);
+        }
         clusters_.clear();
-        if (galleryScroll_) { galleryScroll_->setPos(-9999, -9999);
-        galleryScroll_->setSize(0, 0); }
 
         // Run DB load + clustering in background thread
-        // (SQLite WAL + serialized mode allows reads from any thread)
         if (clusterThread_.joinable()) clusterThread_.join();
         clusterThread_ = thread([this]() {
             logNotice() << "[PeopleView] Loading face data from DB...";
@@ -96,12 +99,11 @@ public:
     }
 
     void update() override {
-        // Process deferred card click → show gallery
-        if (pendingClickCard_) {
-            auto* card = pendingClickCard_;
-            pendingClickCard_ = nullptr;
-            showGallery(card);
-            // Don't return — let layout sync and rebuild run in the same frame
+        // Process deferred card click -> show gallery
+        if (pendingClickDataIdx_ >= 0) {
+            int idx = pendingClickDataIdx_;
+            pendingClickDataIdx_ = -1;
+            showGallery(idx);
         }
 
         // Process clustering completion from background thread
@@ -115,28 +117,28 @@ public:
             if (onRedraw) onRedraw();
         }
 
-        // Sync scroll container layout (do in update, not draw)
+        // Sync scroll container layout
         float w = getWidth(), h = getHeight();
         if (w > 0 && h > 0) {
             float cardListWidth = galleryVisible_ ? w * 0.35f : w;
             float galleryWidth = galleryVisible_ ? w - cardListWidth : 0;
 
-            if (cardScroll_) {
-                cardScroll_->setPos(0, 0);
-                cardScroll_->setSize(cardListWidth, h);
+            if (cardRecycler_) {
+                cardRecycler_->setPos(0, 0);
+                cardRecycler_->setSize(cardListWidth, h);
             }
-            if (galleryScroll_) {
+            if (galleryRecycler_) {
                 if (galleryVisible_) {
-                    galleryScroll_->setPos(cardListWidth, 0);
-                    galleryScroll_->setSize(galleryWidth, h);
+                    galleryRecycler_->setPos(cardListWidth, 0);
+                    galleryRecycler_->setSize(galleryWidth, h);
                 } else {
-                    galleryScroll_->setPos(-9999, -9999);
-                    galleryScroll_->setSize(0, 0);
+                    galleryRecycler_->setPos(-9999, -9999);
+                    galleryRecycler_->setSize(0, 0);
                 }
             }
         }
 
-        // Deferred rebuild (do in update, not draw — addChild during draw is unsafe)
+        // Deferred rebuild
         if (needsRebuild_ && w > 0 && h > 0) {
             needsRebuild_ = false;
             rebuildUI();
@@ -158,34 +160,32 @@ public:
         }
 
         if (anyNew) {
-            // Update texture references on cards
-            for (auto* card : allCards_) {
-                auto it = textures_.find(card->cluster.repPhotoId);
-                card->textureRef = (it != textures_.end() && it->second.isAllocated())
-                    ? &it->second : nullptr;
+            // Update texture references on bound card items
+            if (cardRecycler_) {
+                for (auto& [dataIdx, poolIdx] : cardRecycler_->getPoolMap()) {
+                    auto& item = cardRecycler_->getPool()[poolIdx];
+                    if (dataIdx < (int)cardItems_.size()) {
+                        auto it = textures_.find(cardItems_[dataIdx]->repPhotoId);
+                        item->textureRef = (it != textures_.end() && it->second.isAllocated())
+                            ? &it->second : nullptr;
+                    }
+                }
             }
             // Update gallery crop textures
-            updateGalleryTextures();
+            if (galleryRecycler_ && galleryVisible_) {
+                for (auto& [dataIdx, poolIdx] : galleryRecycler_->getPoolMap()) {
+                    auto& item = galleryRecycler_->getPool()[poolIdx];
+                    auto it = textures_.find(item->photoId);
+                    item->textureRef = (it != textures_.end() && it->second.isAllocated())
+                        ? &it->second : nullptr;
+                }
+            }
             if (onRedraw) onRedraw();
         }
 
         // Start load thread if needed
         if (!pendingLoads_.empty() && !loadThreadRunning_) {
             startLoadThread();
-        }
-
-        // Visibility culling: deactivate offscreen cards to avoid vertex buffer overflow
-        // setActive(false) skips entire subtree (including NameLabel text draws)
-        if (cardScroll_ && !allCards_.empty()) {
-            float scrollY = cardScroll_->getScrollY();
-            float viewH = cardScroll_->getHeight();
-            float margin = CARD_HEIGHT;
-            for (auto* card : allCards_) {
-                float cy = card->getPos().y;
-                bool vis = (cy + CARD_HEIGHT > scrollY - margin)
-                        && (cy < scrollY + viewH + margin);
-                card->setActive(vis);
-            }
         }
     }
 
@@ -229,19 +229,20 @@ public:
     void shutdown() {
         if (clusterThread_.joinable()) clusterThread_.join();
         if (loadThread_.joinable()) loadThread_.join();
-        cardContent_->removeAllChildren();
-        galleryContent_->removeAllChildren();
-        allCards_.clear();
-        selectedCard_ = nullptr;
+        if (cardRecycler_) cardRecycler_->unbindAll();
+        if (galleryRecycler_) galleryRecycler_->unbindAll();
+        selectedDataIdx_ = -1;
         textures_.clear();
         pendingLoads_.clear();
         clusters_.clear();
-        editingCard_ = nullptr;
-        pendingClickCard_ = nullptr;
+        cardItems_.clear();
+        editingClusterId_ = -1;
+        pendingClickDataIdx_ = -1;
         galleryVisible_ = false;
-        galleryScroll_->setPos(-9999, -9999);
-        galleryScroll_->setSize(0, 0);
-        galleryCrops_.clear();
+        if (galleryRecycler_) {
+            galleryRecycler_->setPos(-9999, -9999);
+            galleryRecycler_->setSize(0, 0);
+        }
     }
 
     bool onKeyPress(int key) override {
@@ -258,10 +259,10 @@ public:
         }
 
         // N: edit name of selected card
-        if (key == 'N' && selectedCard_ && !isNameEditing()) {
-            editingCard_ = selectedCard_;
-            string initial = selectedCard_->cluster.name;
-            string placeholder = selectedCard_->cluster.suggestedName;
+        if (key == 'N' && selectedDataIdx_ >= 0 && !isNameEditing()) {
+            editingClusterId_ = cardItems_[selectedDataIdx_]->clusterId;
+            string initial = cardItems_[selectedDataIdx_]->name;
+            string placeholder = cardItems_[selectedDataIdx_]->suggestedName;
             if (nameOverlay_) {
                 nameOverlay_->setPos(0, 0);
                 nameOverlay_->setSize(getWidth(), getHeight());
@@ -285,15 +286,16 @@ private:
     vector<PhotoProvider::FaceCluster> pendingClusters_;
     atomic<bool> clusteringDone_{false};
 
-    // UI components
-    PlainScrollContainer::Ptr cardScroll_;
-    RectNode::Ptr cardContent_;
-    PlainScrollContainer::Ptr galleryScroll_;
-    RectNode::Ptr galleryContent_;
+    // UI fonts
     Font font_, fontSmall_, fontLarge_;
 
     // Gallery state
     bool galleryVisible_ = false;
+
+    // Selection
+    int selectedDataIdx_ = -1;
+    int pendingClickDataIdx_ = -1;
+    int editingClusterId_ = -1;
 
     // Layout constants
     static constexpr float CARD_WIDTH = 180.0f;
@@ -304,7 +306,12 @@ private:
     static constexpr float CROP_SIZE = 80.0f;
     static constexpr float CROP_SPACING = 6.0f;
     static constexpr int MAX_GALLERY_FACES = 200;
-    static constexpr int MAX_CARD_TEXTURES = 300;  // limit textures for card list
+    static constexpr int MAX_CARD_TEXTURES = 300;
+
+    // Flat list of cluster pointers for card recycler
+    // (named first, then unnamed — matches display order)
+    vector<const PhotoProvider::FaceCluster*> cardItems_;
+    int namedCount_ = 0;
 
     // =========================================================================
     // Inner node: NameLabel (child of PersonCard)
@@ -317,8 +324,6 @@ private:
         int photoCount = 0;
         Font* fontRef = nullptr;
         Font* fontSmallRef = nullptr;
-
-        // Display-only node — no events (clicks pass through to PersonCard)
 
         void draw() override {
             float textX = 4;
@@ -347,10 +352,12 @@ private:
     };
 
     // =========================================================================
-    // Inner node: PersonCard
+    // Inner node: PersonCard (pool item for CardRecycler)
     // =========================================================================
     class PersonCard : public RectNode {
     public:
+        using Ptr = shared_ptr<PersonCard>;
+
         PhotoProvider::FaceCluster cluster;
         bool selected = false;
 
@@ -359,25 +366,18 @@ private:
         Font* fontRef = nullptr;
         Font* fontSmallRef = nullptr;
 
-        // Callbacks
-        function<void(PersonCard*)> onCardClick;   // card click → gallery
+        // Callback (set by CardRecycler)
+        function<void()> onClick;
 
         shared_ptr<NameLabel> nameLabel;
 
         void setup() override {
             enableEvents();
 
-            // Create name label as child node
             nameLabel = make_shared<NameLabel>();
             nameLabel->fontRef = fontRef;
             nameLabel->fontSmallRef = fontSmallRef;
-            nameLabel->name = cluster.name;
-            nameLabel->suggestedName = cluster.suggestedName;
-            nameLabel->faceCount = (int)cluster.faceIds.size();
-            nameLabel->photoCount = cluster.photoCount;
 
-            // Position name label correctly from the start
-            // (default RectNode size is 100x100 which overlaps the face thumbnail area)
             float thumbSize = getHeight() - 12;
             float labelX = 6 + thumbSize + 4;
             float labelW = getWidth() - labelX - 4;
@@ -385,6 +385,17 @@ private:
             nameLabel->setSize(max(1.0f, labelW), max(1.0f, getHeight() - 16));
 
             addChild(nameLabel);
+        }
+
+        void bindCluster(const PhotoProvider::FaceCluster& c, bool sel) {
+            cluster = c;
+            selected = sel;
+            if (nameLabel) {
+                nameLabel->name = c.name;
+                nameLabel->suggestedName = c.suggestedName;
+                nameLabel->faceCount = (int)c.faceIds.size();
+                nameLabel->photoCount = c.photoCount;
+            }
         }
 
         void draw() override {
@@ -416,20 +427,17 @@ private:
                 float fw = cluster.repFaceW * imgW;
                 float fh = cluster.repFaceH * imgH;
 
-                // Expand crop for some margin
                 float margin = max(fw, fh) * 0.3f;
                 float sx = fx - margin;
                 float sy = fy - margin;
                 float sw = fw + margin * 2;
                 float sh = fh + margin * 2;
 
-                // Clamp to image bounds
                 sx = max(0.0f, sx);
                 sy = max(0.0f, sy);
                 if (sx + sw > imgW) sw = imgW - sx;
                 if (sy + sh > imgH) sh = imgH - sy;
 
-                // Fit into square
                 float fitScale = min(thumbSize / sw, thumbSize / sh);
                 float dw = sw * fitScale;
                 float dh = sh * fitScale;
@@ -439,13 +447,12 @@ private:
                 setColor(1, 1, 1);
                 textureRef->drawSubsection(dx, dy, dw, dh, sx, sy, sw, sh);
             } else {
-                // Placeholder
                 setColor(0.2f, 0.2f, 0.22f);
                 fill();
                 drawRect(thumbX, thumbY, thumbSize, thumbSize);
             }
 
-            // Position name label to the right of thumbnail
+            // Position name label
             float labelX = thumbX + thumbSize + 4;
             float labelW = w - labelX - 4;
             if (nameLabel) {
@@ -457,13 +464,13 @@ private:
         bool onMousePress(Vec2 pos, int button) override {
             (void)pos;
             if (button != 0) return false;
-            if (onCardClick) onCardClick(this);
+            if (onClick) onClick();
             return true;
         }
     };
 
     // =========================================================================
-    // Inner node: SectionHeader
+    // Inner node: SectionHeader (non-recycled, stays in content)
     // =========================================================================
     class SectionHeader : public RectNode {
     public:
@@ -476,7 +483,6 @@ private:
             fill();
             drawRect(0, 0, w, h);
 
-            // Bottom line
             setColor(0.25f, 0.25f, 0.28f);
             fill();
             drawRect(0, h - 1, w, 1);
@@ -488,10 +494,12 @@ private:
     };
 
     // =========================================================================
-    // Inner node: FaceCropNode (face crop in gallery)
+    // Inner node: FaceCropNode (pool item for GalleryRecycler)
     // =========================================================================
     class FaceCropNode : public RectNode {
     public:
+        using Ptr = shared_ptr<FaceCropNode>;
+
         Texture* textureRef = nullptr;
         float faceX = 0, faceY = 0, faceW = 0, faceH = 0;
         string photoId;
@@ -507,20 +515,17 @@ private:
                 float fw = faceW * imgW;
                 float fh = faceH * imgH;
 
-                // Expand crop for margin
                 float margin = max(fw, fh) * 0.3f;
                 float sx = fx - margin;
                 float sy = fy - margin;
                 float sw = fw + margin * 2;
                 float sh = fh + margin * 2;
 
-                // Clamp
                 sx = max(0.0f, sx);
                 sy = max(0.0f, sy);
                 if (sx + sw > imgW) sw = imgW - sx;
                 if (sy + sh > imgH) sh = imgH - sy;
 
-                // Fit into square
                 float fitScale = min(w / sw, h / sh);
                 float dw = sw * fitScale;
                 float dh = sh * fitScale;
@@ -530,13 +535,11 @@ private:
                 setColor(1, 1, 1);
                 textureRef->drawSubsection(dx, dy, dw, dh, sx, sy, sw, sh);
             } else {
-                // Placeholder
                 setColor(0.15f, 0.15f, 0.18f);
                 fill();
                 drawRect(0, 0, w, h);
             }
 
-            // Border
             setColor(0.2f, 0.2f, 0.22f);
             noFill();
             drawRect(0, 0, w, h);
@@ -544,7 +547,7 @@ private:
     };
 
     // =========================================================================
-    // Inner node: GalleryHeader
+    // Inner node: GalleryHeader (non-recycled, stays in gallery content)
     // =========================================================================
     class GalleryHeader : public RectNode {
     public:
@@ -599,7 +602,6 @@ private:
         }
 
         void update() override {
-            // Cursor blink
             bool cursorOn = fmod(getElapsedTimef(), 1.0f) < 0.5f;
             if (cursorOn != lastCursorOn_) {
                 lastCursorOn_ = cursorOn;
@@ -610,12 +612,10 @@ private:
         void draw() override {
             float w = getWidth(), h = getHeight();
 
-            // Dimmed background
             setColor(0, 0, 0, 0.6f);
             fill();
             drawRect(0, 0, w, h);
 
-            // Dialog box
             float dlgW = 320, dlgH = 100;
             float dlgX = (w - dlgW) / 2;
             float dlgY = (h - dlgH) / 2;
@@ -628,12 +628,10 @@ private:
             noFill();
             drawRect(dlgX, dlgY, dlgW, dlgH);
 
-            // Label
             setColor(0.7f, 0.7f, 0.75f);
             if (fontRef) fontRef->drawString("Name:", dlgX + 12, dlgY + 24,
                 Direction::Left, Direction::Center);
 
-            // Input field background
             float inputX = dlgX + 12;
             float inputY = dlgY + 40;
             float inputW = dlgW - 24;
@@ -647,7 +645,6 @@ private:
             noFill();
             drawRect(inputX, inputY, inputW, inputH);
 
-            // Draw IME text
             string text = const_cast<tcxIME&>(ime_).getString();
             if (text.empty() && !placeholder.empty()) {
                 setColor(0.4f, 0.4f, 0.45f);
@@ -659,7 +656,6 @@ private:
             setColor(1, 1, 1);
             ime_.draw(inputX + 6, inputY + 4);
 
-            // Hint
             setColor(0.4f, 0.4f, 0.45f);
             if (fontRef) fontRef->drawString("Enter to confirm, ESC to cancel",
                 dlgX + dlgW / 2, dlgY + dlgH - 12,
@@ -668,7 +664,7 @@ private:
 
         bool onMousePress(Vec2 pos, int button) override {
             (void)pos; (void)button;
-            return true;  // Consume all clicks
+            return true;
         }
 
         bool onKeyPress(int key) override {
@@ -690,22 +686,357 @@ private:
     };
 
     // =========================================================================
-    // Card management
+    // CardRecycler - RecyclerGrid<PersonCard> with section layout
     // =========================================================================
+    class CardRecycler : public RecyclerGrid<PersonCard> {
+    public:
+        using Ptr = shared_ptr<CardRecycler>;
 
-    vector<PersonCard*> allCards_;
-    PersonCard* selectedCard_ = nullptr;
-    PersonCard* editingCard_ = nullptr;
+        // External references (set by PeopleView before setup)
+        Font* fontRef = nullptr;
+        Font* fontSmallRef = nullptr;
+        Font* fontLargeRef = nullptr;
+        unordered_map<string, Texture>* texturesRef = nullptr;
+        function<void(int dataIdx)> onCardClick;
+
+        // Data
+        vector<const PhotoProvider::FaceCluster*> items;
+        int namedCount = 0;
+        int selectedIdx = -1;
+
+        void setData(const vector<const PhotoProvider::FaceCluster*>& newItems, int named) {
+            items = newItems;
+            namedCount = named;
+        }
+
+        void draw() override {
+            // Transparent - PeopleView draws the background
+        }
+
+    protected:
+        int getDataCount() const override { return (int)items.size(); }
+
+        ItemPtr createPoolItem(int poolIdx) override {
+            auto card = make_shared<PersonCard>();
+            card->fontRef = fontRef;
+            card->fontSmallRef = fontSmallRef;
+            card->setSize(CARD_WIDTH, CARD_HEIGHT);
+
+            int pi = poolIdx;
+            card->onClick = [this, pi]() {
+                int dataIdx = getReverseMap()[pi];
+                if (dataIdx >= 0 && onCardClick) onCardClick(dataIdx);
+            };
+
+            return card;
+        }
+
+        void onBind(int dataIdx, ItemPtr& item) override {
+            if (dataIdx >= (int)items.size()) return;
+            auto* cluster = items[dataIdx];
+            bool sel = (dataIdx == selectedIdx);
+            item->bindCluster(*cluster, sel);
+
+            // Texture reference
+            if (texturesRef) {
+                auto it = texturesRef->find(cluster->repPhotoId);
+                item->textureRef = (it != texturesRef->end() && it->second.isAllocated())
+                    ? &it->second : nullptr;
+            }
+        }
+
+        void onUnbind(int dataIdx, ItemPtr& item) override {
+            (void)dataIdx;
+            item->textureRef = nullptr;
+        }
+
+        // Section-aware layout
+        int calcColumns() override {
+            float contentWidth = getWidth() - scrollBarWidth_;
+            if (contentWidth <= 0) return 1;
+            return max(1, (int)((contentWidth - PADDING * 2 + CARD_SPACING)
+                                / (CARD_WIDTH + CARD_SPACING)));
+        }
+
+        float calcRowHeight() override {
+            return CARD_HEIGHT + CARD_SPACING;
+        }
+
+        float calcContentHeight() override {
+            float h = PADDING;
+            if (namedCount > 0) {
+                h += SECTION_HEADER_HEIGHT + CARD_SPACING;
+                int rows = (namedCount + columns_ - 1) / columns_;
+                h += rows * (CARD_HEIGHT + CARD_SPACING);
+                h += PADDING;
+            }
+            int unnamedCount = (int)items.size() - namedCount;
+            if (unnamedCount > 0) {
+                h += SECTION_HEADER_HEIGHT + CARD_SPACING;
+                int rows = (unnamedCount + columns_ - 1) / columns_;
+                h += rows * (CARD_HEIGHT + CARD_SPACING);
+                h += PADDING;
+            }
+            return h;
+        }
+
+        Vec2 getItemPosition(int dataIdx) override {
+            int col, row;
+            float baseY;
+            if (dataIdx < namedCount) {
+                col = dataIdx % columns_;
+                row = dataIdx / columns_;
+                baseY = namedStartY_;
+            } else {
+                int localIdx = dataIdx - namedCount;
+                col = localIdx % columns_;
+                row = localIdx / columns_;
+                baseY = unnamedStartY_;
+            }
+            float x = PADDING + col * (CARD_WIDTH + CARD_SPACING);
+            float y = baseY + row * (CARD_HEIGHT + CARD_SPACING);
+            return {x, y};
+        }
+
+        pair<int, int> calcVisibleDataRange(float scrollY) override {
+            float viewTop = scrollY - (CARD_HEIGHT + CARD_SPACING) * 2;
+            float viewBottom = scrollY + getHeight() + (CARD_HEIGHT + CARD_SPACING) * 2;
+            int startIdx = getDataCount(), endIdx = 0;
+
+            // Named section
+            if (namedCount > 0) {
+                int rows = (namedCount + columns_ - 1) / columns_;
+                float top = namedStartY_;
+                float bot = top + rows * (CARD_HEIGHT + CARD_SPACING);
+                if (bot > viewTop && top < viewBottom) {
+                    int r0 = max(0, (int)((viewTop - top) / (CARD_HEIGHT + CARD_SPACING)));
+                    int r1 = min(rows - 1, (int)((viewBottom - top) / (CARD_HEIGHT + CARD_SPACING)));
+                    startIdx = min(startIdx, r0 * columns_);
+                    endIdx = max(endIdx, min((r1 + 1) * columns_, namedCount));
+                }
+            }
+            // Unnamed section
+            int unnamedCount = (int)items.size() - namedCount;
+            if (unnamedCount > 0) {
+                int rows = (unnamedCount + columns_ - 1) / columns_;
+                float top = unnamedStartY_;
+                float bot = top + rows * (CARD_HEIGHT + CARD_SPACING);
+                if (bot > viewTop && top < viewBottom) {
+                    int r0 = max(0, (int)((viewTop - top) / (CARD_HEIGHT + CARD_SPACING)));
+                    int r1 = min(rows - 1, (int)((viewBottom - top) / (CARD_HEIGHT + CARD_SPACING)));
+                    startIdx = min(startIdx, namedCount + r0 * columns_);
+                    endIdx = max(endIdx, namedCount + min((r1 + 1) * columns_, unnamedCount));
+                }
+            }
+            if (endIdx <= startIdx) return {0, 0};
+            return {startIdx, endIdx};
+        }
+
+        void onSetup() override {
+            // Section headers (non-recycled, permanent children of content_)
+            namedHeader_ = make_shared<SectionHeader>();
+            namedHeader_->fontRef = fontLargeRef;
+            content_->addChild(namedHeader_);
+            namedHeader_->setActive(false);
+
+            unnamedHeader_ = make_shared<SectionHeader>();
+            unnamedHeader_->fontRef = fontLargeRef;
+            content_->addChild(unnamedHeader_);
+            unnamedHeader_->setActive(false);
+        }
+
+        void onPoolRebuilt() override {
+            // Re-add section headers (rebuildPool removes pool items individually,
+            // but headers were removed when content was cleared on first rebuild)
+            // Headers are permanent children — just ensure they're in the tree
+            if (namedHeader_ && !namedHeader_->getParent()) {
+                content_->addChild(namedHeader_);
+            }
+            if (unnamedHeader_ && !unnamedHeader_->getParent()) {
+                content_->addChild(unnamedHeader_);
+            }
+            updateSectionHeaders();
+        }
+
+    private:
+        friend class PeopleView;
+
+        // Section Y positions (computed in recalcLayout via updateSectionHeaders)
+        float namedStartY_ = 0;
+        float unnamedStartY_ = 0;
+
+        shared_ptr<SectionHeader> namedHeader_;
+        shared_ptr<SectionHeader> unnamedHeader_;
+
+        static constexpr float CARD_WIDTH = 180.0f;
+        static constexpr float CARD_HEIGHT = 72.0f;
+        static constexpr float CARD_SPACING = 8.0f;
+        static constexpr float SECTION_HEADER_HEIGHT = 32.0f;
+        static constexpr float PADDING = 16.0f;
+
+        void updateSectionHeaders() {
+            float contentWidth = getWidth() - scrollBarWidth_;
+            float y = PADDING;
+
+            if (namedCount > 0) {
+                namedHeader_->setActive(true);
+                namedHeader_->text = format("Known People ({})", namedCount);
+                namedHeader_->setPos(PADDING, y);
+                namedHeader_->setSize(contentWidth - PADDING * 2, SECTION_HEADER_HEIGHT);
+                y += SECTION_HEADER_HEIGHT + CARD_SPACING;
+                namedStartY_ = y;
+
+                int rows = (namedCount + columns_ - 1) / columns_;
+                y += rows * (CARD_HEIGHT + CARD_SPACING);
+                y += PADDING;
+            } else {
+                namedHeader_->setActive(false);
+                namedStartY_ = y;
+            }
+
+            int uCount = (int)items.size() - namedCount;
+            if (uCount > 0) {
+                unnamedHeader_->setActive(true);
+                unnamedHeader_->text = format("Unknown Faces ({})", uCount);
+                unnamedHeader_->setPos(PADDING, y);
+                unnamedHeader_->setSize(contentWidth - PADDING * 2, SECTION_HEADER_HEIGHT);
+                y += SECTION_HEADER_HEIGHT + CARD_SPACING;
+                unnamedStartY_ = y;
+            } else {
+                unnamedHeader_->setActive(false);
+                unnamedStartY_ = y;
+            }
+        }
+    };
+
+    // =========================================================================
+    // GalleryRecycler - RecyclerGrid<FaceCropNode> (uniform grid)
+    // =========================================================================
+    class GalleryRecycler : public RecyclerGrid<FaceCropNode> {
+    public:
+        using Ptr = shared_ptr<GalleryRecycler>;
+
+        // External references
+        unordered_map<string, Texture>* texturesRef = nullptr;
+        Font* fontLargeRef = nullptr;
+
+        // Data
+        vector<PhotoDatabase::FaceBrief> faces;
+        string headerText;
+
+        void setData(const vector<PhotoDatabase::FaceBrief>& newFaces,
+                     const string& header) {
+            faces = newFaces;
+            headerText = header;
+            itemWidth_ = CROP_SIZE;
+            itemHeight_ = CROP_SIZE;
+            spacing_ = CROP_SPACING;
+            padding_ = PADDING;
+        }
+
+        void draw() override {
+            // Transparent - PeopleView draws the background
+        }
+
+    protected:
+        int getDataCount() const override { return (int)faces.size(); }
+
+        ItemPtr createPoolItem(int poolIdx) override {
+            (void)poolIdx;
+            auto crop = make_shared<FaceCropNode>();
+            crop->setSize(CROP_SIZE, CROP_SIZE);
+            return crop;
+        }
+
+        void onBind(int dataIdx, ItemPtr& item) override {
+            if (dataIdx >= (int)faces.size()) return;
+            auto& fb = faces[dataIdx];
+            item->photoId = fb.photoId;
+            item->faceX = fb.x;
+            item->faceY = fb.y;
+            item->faceW = fb.w;
+            item->faceH = fb.h;
+
+            if (texturesRef) {
+                auto it = texturesRef->find(fb.photoId);
+                item->textureRef = (it != texturesRef->end() && it->second.isAllocated())
+                    ? &it->second : nullptr;
+            }
+        }
+
+        void onUnbind(int dataIdx, ItemPtr& item) override {
+            (void)dataIdx;
+            item->textureRef = nullptr;
+        }
+
+        // Override content height to account for gallery header
+        float calcContentHeight() override {
+            float h = PADDING + SECTION_HEADER_HEIGHT + CROP_SPACING;
+            if (totalRows_ > 0) {
+                h += totalRows_ * rowHeight_ - spacing_;
+            }
+            h += PADDING;
+            return h;
+        }
+
+        Vec2 getItemPosition(int dataIdx) override {
+            int col = dataIdx % columns_;
+            int row = dataIdx / columns_;
+            float x = padding_ + col * (CROP_SIZE + CROP_SPACING);
+            float y = headerBaseY_ + row * rowHeight_;
+            return {x, y};
+        }
+
+        pair<int, int> calcVisibleDataRange(float scrollY) override {
+            if (totalRows_ == 0) return {0, 0};
+            float viewTop = scrollY;
+            float viewBottom = scrollY + getHeight();
+            int firstRow = max(0, (int)((viewTop - headerBaseY_) / rowHeight_) - 2);
+            int lastRow = min(totalRows_ - 1, (int)((viewBottom - headerBaseY_) / rowHeight_) + 2);
+            int startIdx = firstRow * columns_;
+            int endIdx = min((lastRow + 1) * columns_, getDataCount());
+            return {startIdx, endIdx};
+        }
+
+        void onSetup() override {
+            galleryHeader_ = make_shared<GalleryHeader>();
+            galleryHeader_->fontRef = fontLargeRef;
+            content_->addChild(galleryHeader_);
+        }
+
+        void onPoolRebuilt() override {
+            if (galleryHeader_ && !galleryHeader_->getParent()) {
+                content_->addChild(galleryHeader_);
+            }
+            headerBaseY_ = PADDING + SECTION_HEADER_HEIGHT + CROP_SPACING;
+            if (galleryHeader_) {
+                galleryHeader_->setActive(true);
+                galleryHeader_->text = headerText;
+                float contentWidth = getWidth() - scrollBarWidth_;
+                galleryHeader_->setPos(PADDING, PADDING);
+                galleryHeader_->setSize(contentWidth - PADDING * 2, SECTION_HEADER_HEIGHT);
+            }
+        }
+
+    private:
+        static constexpr float CROP_SIZE = 80.0f;
+        static constexpr float CROP_SPACING = 6.0f;
+        static constexpr float PADDING = 16.0f;
+        static constexpr float SECTION_HEADER_HEIGHT = 32.0f;
+
+        float headerBaseY_ = 0;
+        shared_ptr<GalleryHeader> galleryHeader_;
+    };
+
+    // =========================================================================
+    // Recycler instances
+    // =========================================================================
+    shared_ptr<CardRecycler> cardRecycler_;
+    shared_ptr<GalleryRecycler> galleryRecycler_;
     shared_ptr<NameEditOverlay> nameOverlay_;
-
-    // Deferred actions (avoid destroying nodes during their own callbacks)
-    PersonCard* pendingClickCard_ = nullptr;
 
     // Textures keyed by photoId
     unordered_map<string, Texture> textures_;
-
-    // Gallery face crop nodes (kept alive as long as gallery is visible)
-    vector<shared_ptr<FaceCropNode>> galleryCrops_;
 
     // Background thumbnail loading
     struct LoadResult {
@@ -723,40 +1054,41 @@ private:
     // =========================================================================
 
     void rebuildUI() {
-        int prevSelectedClusterId = selectedCard_ ? selectedCard_->cluster.clusterId : INT_MIN;
-        cardContent_->removeAllChildren();
-        allCards_.clear();
-        selectedCard_ = nullptr;
+        int prevSelectedClusterId = -1;
+        if (selectedDataIdx_ >= 0 && selectedDataIdx_ < (int)cardItems_.size()) {
+            prevSelectedClusterId = cardItems_[selectedDataIdx_]->clusterId;
+        }
 
-        float y = PADDING;
-        float cardListWidth = galleryVisible_ ? getWidth() * 0.35f : getWidth();
-        float contentWidth = cardListWidth - PADDING * 2;
-        int cols = max(1, (int)((contentWidth + CARD_SPACING) / (CARD_WIDTH + CARD_SPACING)));
-
-        // Separate named and unnamed clusters
+        // Build flat list: named first, then unnamed
+        cardItems_.clear();
+        namedCount_ = 0;
         vector<const PhotoProvider::FaceCluster*> named, unnamed;
         for (auto& c : clusters_) {
             if (c.personId > 0) named.push_back(&c);
             else unnamed.push_back(&c);
         }
+        for (auto* p : named) cardItems_.push_back(p);
+        namedCount_ = (int)named.size();
+        for (auto* p : unnamed) cardItems_.push_back(p);
 
-        // Known People section
-        if (!named.empty()) {
-            y = addSectionHeader(format("Known People ({})", named.size()), y, contentWidth);
-            y = addCards(named, y, cols, prevSelectedClusterId);
-            y += PADDING;
+        // Restore selection by cluster ID
+        selectedDataIdx_ = -1;
+        if (prevSelectedClusterId >= 0) {
+            for (int i = 0; i < (int)cardItems_.size(); i++) {
+                if (cardItems_[i]->clusterId == prevSelectedClusterId) {
+                    selectedDataIdx_ = i;
+                    break;
+                }
+            }
         }
 
-        // Unknown Faces section
-        if (!unnamed.empty()) {
-            y = addSectionHeader(format("Unknown Faces ({})", unnamed.size()), y, contentWidth);
-            y = addCards(unnamed, y, cols, prevSelectedClusterId);
-            y += PADDING;
+        // Update card recycler
+        if (cardRecycler_) {
+            cardRecycler_->setData(cardItems_, namedCount_);
+            cardRecycler_->selectedIdx = selectedDataIdx_;
+            cardRecycler_->resetScroll();
+            cardRecycler_->rebuild();
         }
-
-        // Set content height for scrolling
-        cardContent_->setSize(cardListWidth, y);
-        if (cardScroll_) cardScroll_->updateScrollBounds();
 
         // Queue thumbnail loads (limit to avoid exhausting texture pool)
         unordered_set<string> neededIds;
@@ -772,71 +1104,23 @@ private:
         if (onRedraw) onRedraw();
     }
 
-    float addSectionHeader(const string& text, float y, float width) {
-        auto header = make_shared<SectionHeader>();
-        header->text = text;
-        header->fontRef = &fontLarge_;
-        header->setPos(PADDING, y);
-        header->setSize(width, SECTION_HEADER_HEIGHT);
-        cardContent_->addChild(header);
-        return y + SECTION_HEADER_HEIGHT + CARD_SPACING;
-    }
-
-    float addCards(const vector<const PhotoProvider::FaceCluster*>& items,
-                   float startY, int cols, int selectedClusterId = INT_MIN) {
-        float y = startY;
-        int col = 0;
-
-        for (auto* clusterPtr : items) {
-            float x = PADDING + col * (CARD_WIDTH + CARD_SPACING);
-
-            auto card = make_shared<PersonCard>();
-            card->cluster = *clusterPtr;
-            card->fontRef = &font_;
-            card->fontSmallRef = &fontSmall_;
-
-            // Texture reference
-            auto texIt = textures_.find(clusterPtr->repPhotoId);
-            card->textureRef = (texIt != textures_.end() && texIt->second.isAllocated())
-                ? &texIt->second : nullptr;
-
-            card->onCardClick = [this](PersonCard* c) {
-                // Defer to update() to avoid node destruction during callback
-                pendingClickCard_ = c;
-            };
-
-            card->setPos(x, y);
-            card->setSize(CARD_WIDTH, CARD_HEIGHT);
-            cardContent_->addChild(card);
-            allCards_.push_back(card.get());
-
-            // Restore selection by cluster ID
-            if (selectedClusterId != INT_MIN && clusterPtr->clusterId == selectedClusterId) {
-                card->selected = true;
-                selectedCard_ = card.get();
-            }
-
-            col++;
-            if (col >= cols) {
-                col = 0;
-                y += CARD_HEIGHT + CARD_SPACING;
-            }
-        }
-
-        // Advance y if last row was partial
-        if (col > 0) y += CARD_HEIGHT + CARD_SPACING;
-        return y;
-    }
-
     // =========================================================================
     // Gallery
     // =========================================================================
 
-    void showGallery(PersonCard* card) {
-        // Select this card
-        if (selectedCard_) selectedCard_->selected = false;
-        card->selected = true;
-        selectedCard_ = card;
+    void showGallery(int dataIdx) {
+        if (dataIdx < 0 || dataIdx >= (int)cardItems_.size()) return;
+
+        // Update selection
+        selectedDataIdx_ = dataIdx;
+
+        // Update bound cards' selection state
+        if (cardRecycler_) {
+            cardRecycler_->selectedIdx = selectedDataIdx_;
+            for (auto& [di, pi] : cardRecycler_->getPoolMap()) {
+                cardRecycler_->getPool()[pi]->selected = (di == selectedDataIdx_);
+            }
+        }
 
         galleryVisible_ = true;
 
@@ -844,19 +1128,25 @@ private:
         needsRebuild_ = true;
 
         // Build gallery content
-        rebuildGallery(card->cluster);
+        rebuildGallery(*cardItems_[dataIdx]);
 
         if (onRedraw) onRedraw();
     }
 
     void hideGallery() {
-        if (selectedCard_) selectedCard_->selected = false;
-        selectedCard_ = nullptr;
+        selectedDataIdx_ = -1;
+        if (cardRecycler_) {
+            cardRecycler_->selectedIdx = -1;
+            for (auto& [di, pi] : cardRecycler_->getPoolMap()) {
+                cardRecycler_->getPool()[pi]->selected = false;
+            }
+        }
         galleryVisible_ = false;
-        galleryScroll_->setPos(-9999, -9999);
-        galleryScroll_->setSize(0, 0);
-        galleryContent_->removeAllChildren();
-        galleryCrops_.clear();
+        if (galleryRecycler_) {
+            galleryRecycler_->unbindAll();
+            galleryRecycler_->setPos(-9999, -9999);
+            galleryRecycler_->setSize(0, 0);
+        }
 
         // Rebuild card list at full width
         needsRebuild_ = true;
@@ -864,18 +1154,15 @@ private:
     }
 
     void rebuildGallery(const PhotoProvider::FaceCluster& cluster) {
-        galleryContent_->removeAllChildren();
-        galleryCrops_.clear();
-
         if (!provider_) {
             logWarning() << "[PeopleView] rebuildGallery: no provider!";
             return;
         }
 
-        // Clean up textures not needed by card list (free pool slots)
+        // Clean up textures not needed by card list
         cleanupUnusedTextures();
 
-        // Get face details (limited to MAX_GALLERY_FACES)
+        // Get face details (limited)
         int totalFaces = (int)cluster.faceIds.size();
         vector<int> limitedIds;
         if (totalFaces > MAX_GALLERY_FACES) {
@@ -886,10 +1173,7 @@ private:
         }
         auto briefs = provider_->getFaceBriefs(limitedIds);
 
-        float galleryWidth = getWidth() * 0.65f;
-        float y = PADDING;
-
-        // Header
+        // Header text
         string headerText;
         if (cluster.name.empty()) {
             headerText = format("Cluster ({} faces)", totalFaces);
@@ -900,66 +1184,18 @@ private:
             headerText += format("  showing first {}", MAX_GALLERY_FACES);
         }
 
-        auto header = make_shared<GalleryHeader>();
-        header->text = headerText;
-        header->fontRef = &fontLarge_;
-        header->setPos(PADDING, y);
-        header->setSize(galleryWidth - PADDING * 2, SECTION_HEADER_HEIGHT);
-        galleryContent_->addChild(header);
-        y += SECTION_HEADER_HEIGHT + CROP_SPACING;
-
-        // Face crop grid
-        float contentWidth = galleryWidth - PADDING * 2;
-        int cols = max(1, (int)((contentWidth + CROP_SPACING) / (CROP_SIZE + CROP_SPACING)));
-        int col = 0;
-
-        // Queue missing thumbnails for gallery
+        // Queue missing thumbnails
         unordered_set<string> neededIds;
         for (auto& fb : briefs) {
             neededIds.insert(fb.photoId);
         }
         queueMissingThumbnails(neededIds);
 
-        for (auto& fb : briefs) {
-            float x = PADDING + col * (CROP_SIZE + CROP_SPACING);
-
-            auto crop = make_shared<FaceCropNode>();
-            crop->photoId = fb.photoId;
-            crop->faceX = fb.x;
-            crop->faceY = fb.y;
-            crop->faceW = fb.w;
-            crop->faceH = fb.h;
-
-            // Texture reference
-            auto texIt = textures_.find(fb.photoId);
-            crop->textureRef = (texIt != textures_.end() && texIt->second.isAllocated())
-                ? &texIt->second : nullptr;
-
-            crop->setPos(x, y);
-            crop->setSize(CROP_SIZE, CROP_SIZE);
-            galleryContent_->addChild(crop);
-            galleryCrops_.push_back(crop);
-
-            col++;
-            if (col >= cols) {
-                col = 0;
-                y += CROP_SIZE + CROP_SPACING;
-            }
-        }
-
-        if (col > 0) y += CROP_SIZE + CROP_SPACING;
-        y += PADDING;
-
-        galleryContent_->setSize(galleryWidth, y);
-        if (galleryScroll_) galleryScroll_->updateScrollBounds();
-
-    }
-
-    void updateGalleryTextures() {
-        for (auto& crop : galleryCrops_) {
-            auto it = textures_.find(crop->photoId);
-            crop->textureRef = (it != textures_.end() && it->second.isAllocated())
-                ? &it->second : nullptr;
+        // Set data and rebuild
+        if (galleryRecycler_) {
+            galleryRecycler_->setData(briefs, headerText);
+            galleryRecycler_->resetScroll();
+            galleryRecycler_->rebuild();
         }
     }
 
@@ -968,14 +1204,22 @@ private:
     // =========================================================================
 
     void handleNameConfirm(const string& name) {
-        if (!editingCard_ || !provider_) return;
+        if (editingClusterId_ < 0 || !provider_) return;
 
-        if (editingCard_->cluster.personId > 0) {
-            // Rename existing person
-            provider_->renamePerson(editingCard_->cluster.personId, name);
+        // Find the cluster by ID
+        const PhotoProvider::FaceCluster* editCluster = nullptr;
+        for (auto& c : clusters_) {
+            if (c.clusterId == editingClusterId_) {
+                editCluster = &c;
+                break;
+            }
+        }
+        if (!editCluster) { hideNameOverlay(); return; }
+
+        if (editCluster->personId > 0) {
+            provider_->renamePerson(editCluster->personId, name);
         } else {
-            // Assign name to unnamed cluster
-            provider_->assignNameToCluster(editingCard_->cluster, name);
+            provider_->assignNameToCluster(*editCluster, name);
         }
 
         hideNameOverlay();
@@ -983,17 +1227,18 @@ private:
         // Rebuild clusters
         clusters_ = provider_->buildFaceClusters();
         galleryVisible_ = false;
-        galleryScroll_->setPos(-9999, -9999);
-        galleryScroll_->setSize(0, 0);
-        galleryContent_->removeAllChildren();
-        galleryCrops_.clear();
-        selectedCard_ = nullptr;
+        if (galleryRecycler_) {
+            galleryRecycler_->unbindAll();
+            galleryRecycler_->setPos(-9999, -9999);
+            galleryRecycler_->setSize(0, 0);
+        }
+        selectedDataIdx_ = -1;
         rebuildUI();
     }
 
     void hideNameOverlay() {
         if (nameOverlay_) nameOverlay_->hide();
-        editingCard_ = nullptr;
+        editingClusterId_ = -1;
         if (onRedraw) onRedraw();
     }
 
@@ -1001,14 +1246,16 @@ private:
     // Thumbnail loading
     // =========================================================================
 
-    // Remove textures not used by current card list or gallery
     void cleanupUnusedTextures() {
         unordered_set<string> needed;
         for (auto& c : clusters_) {
             needed.insert(c.repPhotoId);
         }
-        for (auto& crop : galleryCrops_) {
-            needed.insert(crop->photoId);
+        // Also keep gallery face textures
+        if (galleryRecycler_ && galleryVisible_) {
+            for (auto& fb : galleryRecycler_->faces) {
+                needed.insert(fb.photoId);
+            }
         }
         for (auto it = textures_.begin(); it != textures_.end(); ) {
             if (needed.count(it->first) == 0) {
@@ -1022,7 +1269,6 @@ private:
     void queueMissingThumbnails(const unordered_set<string>& neededIds) {
         for (const auto& id : neededIds) {
             if (textures_.count(id) == 0) {
-                // Avoid duplicate entries in pendingLoads_
                 bool alreadyQueued = false;
                 for (const auto& p : pendingLoads_) {
                     if (p == id) { alreadyQueued = true; break; }
