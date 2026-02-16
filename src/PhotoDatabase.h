@@ -859,6 +859,36 @@ public:
         return result;
     }
 
+    // Brief face info for gallery display (face ID, photo, bbox)
+    struct FaceBrief {
+        int faceId;
+        string photoId;
+        float x, y, w, h;
+    };
+
+    vector<FaceBrief> getFaceBriefs(const vector<int>& faceIds) {
+        vector<FaceBrief> result;
+        if (faceIds.empty()) return result;
+        auto stmt = db_.prepare(
+            "SELECT id, photo_id, x, y, w, h FROM faces WHERE id=?1");
+        if (!stmt.valid()) return result;
+        for (int fid : faceIds) {
+            stmt.bind(1, fid);
+            if (stmt.step()) {
+                FaceBrief fb;
+                fb.faceId = stmt.getInt(0);
+                fb.photoId = stmt.getText(1);
+                fb.x = (float)stmt.getDouble(2);
+                fb.y = (float)stmt.getDouble(3);
+                fb.w = (float)stmt.getDouble(4);
+                fb.h = (float)stmt.getDouble(5);
+                result.push_back(std::move(fb));
+            }
+            stmt.reset();
+        }
+        return result;
+    }
+
     // Get photo IDs for a set of face IDs
     vector<string> getPhotoIdsForFaceIds(const vector<int>& faceIds) {
         if (faceIds.empty()) return {};

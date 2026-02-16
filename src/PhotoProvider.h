@@ -993,7 +993,7 @@ public:
     static vector<FaceCluster> clusterFaces(
             const vector<PhotoDatabase::FaceInfo>& allFaces,
             const unordered_map<int, string>& personNames,
-            float threshold = 0.45f) {
+            float threshold = 0.60f) {
         if (allFaces.empty()) return {};
 
         // Step 1: Group named faces by person_id
@@ -1063,8 +1063,21 @@ public:
              });
 
         // Step 3: Greedy centroid clustering for unnamed faces
+        // Use projection-sorted windowed approach for O(n * W) instead of O(n²)
+        static constexpr int CLUSTER_WINDOW = 600;
+
         int nextClusterId = -1;
-        vector<bool> assigned(unnamedIndices.size(), false);
+        int unnamedCount = (int)unnamedIndices.size();
+        vector<bool> assigned(unnamedCount, false);
+
+        // Determine embedding dimension
+        int embDim = 0;
+        for (int idx : unnamedIndices) {
+            if (!allFaces[idx].embedding.empty()) {
+                embDim = (int)allFaces[idx].embedding.size();
+                break;
+            }
+        }
 
         struct UnnamedCluster {
             vector<int> memberIndices;  // indices into unnamedIndices
@@ -1072,41 +1085,78 @@ public:
         };
         vector<UnnamedCluster> unnamedClusters;
 
-        for (int i = 0; i < (int)unnamedIndices.size(); i++) {
-            if (assigned[i]) continue;
-            auto& seed = allFaces[unnamedIndices[i]];
-            if (seed.embedding.empty()) continue;
+        if (embDim > 0 && unnamedCount > 0) {
+            // Sort unnamed faces by embedding projection for spatial locality
+            // Use sum of first 8 components as a simple projection
+            auto projection = [&](int unnamedIdx) -> float {
+                auto& emb = allFaces[unnamedIndices[unnamedIdx]].embedding;
+                if (emb.empty()) return 0.0f;
+                float sum = 0;
+                int dims = min(8, (int)emb.size());
+                for (int d = 0; d < dims; d++) sum += emb[d];
+                return sum;
+            };
 
-            UnnamedCluster uc;
-            uc.centroid = seed.embedding;
-            uc.memberIndices.push_back(i);
-            assigned[i] = true;
+            // Create sorted index array
+            vector<int> sortedOrder(unnamedCount);
+            iota(sortedOrder.begin(), sortedOrder.end(), 0);
+            sort(sortedOrder.begin(), sortedOrder.end(),
+                 [&](int a, int b) { return projection(a) < projection(b); });
 
-            // Find all similar unassigned faces
-            for (int j = i + 1; j < (int)unnamedIndices.size(); j++) {
-                if (assigned[j]) continue;
-                auto& cand = allFaces[unnamedIndices[j]];
-                if (cand.embedding.empty()) continue;
+            // Remap assigned array to sorted order
+            // sortedOrder[i] = original index into unnamedIndices
+            // We need assigned to track by sorted position
 
-                float sim = cosineSimilarity(uc.centroid, cand.embedding);
-                if (sim > threshold) {
-                    uc.memberIndices.push_back(j);
-                    assigned[j] = true;
+            logNotice() << "[Clustering] " << unnamedCount
+                        << " unnamed faces, window=" << CLUSTER_WINDOW;
 
-                    // Update centroid (running average + normalize)
-                    int n = (int)uc.memberIndices.size();
-                    for (int d = 0; d < (int)uc.centroid.size(); d++) {
-                        uc.centroid[d] = uc.centroid[d] * (n - 1) / n +
-                                         cand.embedding[d] / n;
+            int assignedCount = 0;
+            for (int si = 0; si < unnamedCount; si++) {
+                int origI = sortedOrder[si];
+                if (assigned[origI]) continue;
+                auto& seed = allFaces[unnamedIndices[origI]];
+                if (seed.embedding.empty()) { assigned[origI] = true; assignedCount++; continue; }
+
+                UnnamedCluster uc;
+                uc.centroid = seed.embedding;
+                uc.memberIndices.push_back(origI);
+                assigned[origI] = true;
+                assignedCount++;
+
+                // Only check within the window in sorted order
+                int windowEnd = min(si + CLUSTER_WINDOW, unnamedCount);
+                for (int sj = si + 1; sj < windowEnd; sj++) {
+                    int origJ = sortedOrder[sj];
+                    if (assigned[origJ]) continue;
+                    auto& cand = allFaces[unnamedIndices[origJ]];
+                    if (cand.embedding.empty()) continue;
+
+                    float sim = cosineSimilarity(uc.centroid, cand.embedding);
+                    if (sim > threshold) {
+                        uc.memberIndices.push_back(origJ);
+                        assigned[origJ] = true;
+                        assignedCount++;
+
+                        // Update centroid (running average + normalize)
+                        int n = (int)uc.memberIndices.size();
+                        for (int d = 0; d < embDim; d++) {
+                            uc.centroid[d] = uc.centroid[d] * (n - 1) / n +
+                                             cand.embedding[d] / n;
+                        }
+                        float norm = 0;
+                        for (float v : uc.centroid) norm += v * v;
+                        norm = sqrtf(norm);
+                        if (norm > 0) for (float& v : uc.centroid) v /= norm;
                     }
-                    float norm = 0;
-                    for (float v : uc.centroid) norm += v * v;
-                    norm = sqrtf(norm);
-                    if (norm > 0) for (float& v : uc.centroid) v /= norm;
+                }
+
+                unnamedClusters.push_back(std::move(uc));
+
+                if (unnamedClusters.size() % 5000 == 0) {
+                    logNotice() << "[Clustering] progress: " << unnamedClusters.size()
+                                << " clusters, " << assignedCount << "/" << unnamedCount;
                 }
             }
-
-            unnamedClusters.push_back(std::move(uc));
         }
 
         // Step 4: Build FaceCluster objects for unnamed clusters (skip size=1)
@@ -1159,7 +1209,7 @@ public:
     }
 
     // Convenience: load data + cluster in one call (main thread only)
-    vector<FaceCluster> buildFaceClusters(float threshold = 0.45f) {
+    vector<FaceCluster> buildFaceClusters(float threshold = 0.60f) {
         auto input = loadFaceClusterData();
         return clusterFaces(input.allFaces, input.personNames, threshold);
     }
@@ -1171,6 +1221,11 @@ public:
         db_.batchUpdateFacePersonId(cluster.faceIds, personId);
         loadFaceCache();
         return personId;
+    }
+
+    // Get face briefs (id, photo_id, bbox) for gallery display
+    vector<PhotoDatabase::FaceBrief> getFaceBriefs(const vector<int>& faceIds) {
+        return db_.getFaceBriefs(faceIds);
     }
 
     // Get photo IDs for a set of face IDs

@@ -225,17 +225,6 @@ void tcApp::setup() {
     peopleView_ = make_shared<PeopleView>();
     addChild(peopleView_);
     peopleView_->setActive(false);
-    peopleView_->onPersonClick = [this](const PhotoProvider::FaceCluster& cluster) {
-        // People → Grid (filtered by person's photos)
-        auto photoIds = provider_.getPhotoIdsForFaceIds(cluster.faceIds);
-        exitPeopleView();
-        grid_->clearClipResults();
-        grid_->clearTextMatchIds();
-        grid_->setTextFilter("");
-        grid_->setFilterPhotoIds(unordered_set<string>(photoIds.begin(), photoIds.end()));
-        grid_->populate(provider_);
-        redraw();
-    };
     peopleView_->onRedraw = [this]() { redraw(); };
 
     // 5d. Create metadata panel (right sidebar)
@@ -840,9 +829,12 @@ void tcApp::keyPressed(int key) {
     } else if (viewMode_ == ViewMode::Related) {
         // G key handles return to grid (mode-independent below)
     } else if (viewMode_ == ViewMode::People) {
-        // ESC → return to grid
+        // ESC: gallery/name-edit handled by PeopleView node events first
+        // Only exit people view if no gallery or overlay is open
         if (key == SAPP_KEYCODE_ESCAPE) {
-            exitPeopleView();
+            if (peopleView_ && !peopleView_->hasGallery() && !peopleView_->isNameEditing()) {
+                exitPeopleView();
+            }
         }
     } else {
         // Grid mode: if search bar is active, only handle ESC
