@@ -1266,6 +1266,13 @@ public:
         return ok;
     }
 
+    // Assign faces to an existing person
+    bool assignFacesToPerson(const vector<int>& faceIds, int personId) {
+        bool ok = db_.batchUpdateFacePersonId(faceIds, personId);
+        if (ok) loadFaceCache();
+        return ok;
+    }
+
     // Rename a person
     bool renamePerson(int personId, const string& newName) {
         bool ok = db_.renamePerson(personId, newName);

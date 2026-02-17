@@ -227,6 +227,7 @@ void tcApp::setup() {
     auto peopleView = viewManager_->peopleView();
     peopleView->onRedraw = [this]() { redraw(); };
     peopleView->cmdDownRef = &cmdDown_;
+    peopleView->shiftDownRef = &shiftDown_;
     peopleView->onFaceSelect = [this](const string& photoId) {
         auto* e = provider_.getPhoto(photoId);
         if (e && metadataPanel_) {
@@ -785,7 +786,7 @@ void tcApp::keyPressed(int key) {
         singleView->updateMetadata();
     } else if (viewMode() == ViewMode::People) {
         if (key == SAPP_KEYCODE_ESCAPE) {
-            if (!peopleView->hasGallery() && !peopleView->isNameEditing()) {
+            if (!peopleView->hasSelection() && !peopleView->isNameEditing()) {
                 viewManager_->switchTo(ViewMode::Grid);
                 leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
                 leftTween_.finish();

@@ -29,6 +29,7 @@ public:
 
     // Modifier key state (set by tcApp)
     bool* cmdDownRef = nullptr;
+    bool* shiftDownRef = nullptr;
 
     void setup() override {
         enableEvents();
@@ -55,9 +56,10 @@ public:
         galleryRecycler_->onFaceClick = [this](int dataIdx) {
             pendingFaceClickIdx_ = dataIdx;
         };
+        galleryRecycler_->onDragStart = [this](Vec2 sp) { handleDragStart(sp); };
+        galleryRecycler_->onDragMove = [this](Vec2 sp) { handleDragMove(sp); };
+        galleryRecycler_->onDragEnd = [this](Vec2 sp) { handleDragEnd(sp); };
         addChild(galleryRecycler_);
-        galleryRecycler_->setPos(-9999, -9999);
-        galleryRecycler_->setSize(0, 0);
 
         // Name edit overlay (hidden by default)
         nameOverlay_ = make_shared<NameEditOverlay>();
@@ -72,7 +74,7 @@ public:
         nameOverlay_->setActive(false);
     }
 
-    bool hasGallery() const { return galleryVisible_; }
+    bool hasSelection() const { return selectedDataIdx_ >= 0; }
     bool isNameEditing() const { return nameOverlay_ && nameOverlay_->getActive(); }
 
     void populate(PhotoProvider& provider) {
@@ -81,15 +83,14 @@ public:
         selectedDataIdx_ = -1;
         pendingClickDataIdx_ = -1;
         clusteringDone_ = false;
-        galleryVisible_ = false;
         maxFaces_ = 1000;
         hasMoreFaces_ = false;
         totalUnnamedFaces_ = 0;
 
         // Clear previous state
         if (galleryRecycler_) {
-            galleryRecycler_->setPos(-9999, -9999);
-            galleryRecycler_->setSize(0, 0);
+            galleryRecycler_->selectedSet.clear();
+            galleryRecycler_->unbindAll();
         }
         clusters_.clear();
 
@@ -133,24 +134,19 @@ public:
             if (onRedraw) onRedraw();
         }
 
-        // Sync scroll container layout
+        // Sync scroll container layout (top/bottom split)
         float w = getWidth(), h = getHeight();
         if (w > 0 && h > 0) {
-            float cardListWidth = galleryVisible_ ? w * 0.35f : w;
-            float galleryWidth = galleryVisible_ ? w - cardListWidth : 0;
+            float galleryH = h * 0.25f;
+            float cardH = h - galleryH;
 
             if (cardRecycler_) {
                 cardRecycler_->setPos(0, 0);
-                cardRecycler_->setSize(cardListWidth, h);
+                cardRecycler_->setSize(w, cardH);
             }
             if (galleryRecycler_) {
-                if (galleryVisible_) {
-                    galleryRecycler_->setPos(cardListWidth, 0);
-                    galleryRecycler_->setSize(galleryWidth, h);
-                } else {
-                    galleryRecycler_->setPos(-9999, -9999);
-                    galleryRecycler_->setSize(0, 0);
-                }
+                galleryRecycler_->setPos(0, cardH);
+                galleryRecycler_->setSize(w, galleryH);
             }
         }
 
@@ -188,7 +184,7 @@ public:
                 }
             }
             // Update gallery crop textures
-            if (galleryRecycler_ && galleryVisible_) {
+            if (galleryRecycler_ && selectedDataIdx_ >= 0) {
                 for (auto& [dataIdx, poolIdx] : galleryRecycler_->getPoolMap()) {
                     auto& item = galleryRecycler_->getPool()[poolIdx];
                     auto it = textures_.find(item->photoId);
@@ -220,12 +216,19 @@ public:
                 Direction::Center, Direction::Center);
         }
 
-        // Gallery separator line
-        if (galleryVisible_) {
-            float cardListWidth = w * 0.35f;
-            setColor(0.25f, 0.25f, 0.28f);
-            fill();
-            drawRect(cardListWidth, 0, 1, h);
+        // Gallery separator line (horizontal, between cards and gallery)
+        float galleryH = h * 0.25f;
+        float cardH = h - galleryH;
+        setColor(0.25f, 0.25f, 0.28f);
+        fill();
+        drawRect(0, cardH, w, 1);
+
+        // Placeholder when no card selected
+        if (selectedDataIdx_ < 0) {
+            setColor(0.4f, 0.4f, 0.45f);
+            font_.drawString("Select a person to view faces",
+                w / 2, cardH + galleryH / 2,
+                Direction::Center, Direction::Center);
         }
 
         // Status bar at bottom
@@ -243,6 +246,35 @@ public:
         }
         fontSmall_.drawString(statusText,
             14, h - 18, Direction::Left, Direction::Center);
+    }
+
+    void drawChildren() override {
+        Node::drawChildren();
+
+        // Draw drag ghost on top of everything
+        if (isDragging_ && dragFaceCount_ > 0) {
+            float lx, ly;
+            globalToLocal(dragGhostPos_.x, dragGhostPos_.y, lx, ly);
+            float gx = lx + 14;
+            float gy = ly - 6;
+            float gw = 80, gh = 28;
+
+            // Ghost card background
+            setColor(0.2f, 0.4f, 0.8f, 0.8f);
+            fill();
+            drawRect(gx, gy, gw, gh);
+
+            // Ghost card border
+            setColor(0.4f, 0.6f, 1.0f);
+            noFill();
+            drawRect(gx, gy, gw, gh);
+
+            // Face count text
+            setColor(1, 1, 1);
+            string text = format("{} face{}", dragFaceCount_, dragFaceCount_ > 1 ? "s" : "");
+            fontSmall_.drawString(text, gx + gw / 2, gy + gh / 2,
+                Direction::Center, Direction::Center);
+        }
     }
 
     // ViewContainer lifecycle
@@ -273,11 +305,9 @@ public:
         pendingClickDataIdx_ = -1;
         pendingFaceClickIdx_ = -1;
         lastFaceClickIdx_ = -1;
-        galleryVisible_ = false;
         if (galleryRecycler_) {
             galleryRecycler_->selectedSet.clear();
-            galleryRecycler_->setPos(-9999, -9999);
-            galleryRecycler_->setSize(0, 0);
+            galleryRecycler_->unbindAll();
         }
     }
 
@@ -288,16 +318,37 @@ public:
                 hideNameOverlay();
                 return true;
             }
-            if (galleryVisible_) {
-                hideGallery();
+            if (selectedDataIdx_ >= 0) {
+                clearGallerySelection();
                 return true;
             }
         }
 
         // Delete/Backspace: unassign selected faces from person
         if ((key == 259 /* BACKSPACE */ || key == 261 /* DELETE */) &&
-            galleryVisible_ && galleryRecycler_ && !galleryRecycler_->selectedSet.empty()) {
+            selectedDataIdx_ >= 0 && galleryRecycler_ && !galleryRecycler_->selectedSet.empty()) {
             handleDeleteSelectedFaces();
+            return true;
+        }
+
+        // Cmd+A / Cmd+Shift+A: select all / deselect all gallery faces
+        if ((key == 'A' || key == 'a') && cmdDownRef && *cmdDownRef &&
+            selectedDataIdx_ >= 0 && galleryRecycler_) {
+            bool shiftHeld = shiftDownRef ? *shiftDownRef : false;
+            if (shiftHeld) {
+                galleryRecycler_->selectedSet.clear();
+            } else {
+                int count = (int)galleryRecycler_->faces.size();
+                for (int i = 0; i < count; i++) {
+                    galleryRecycler_->selectedSet.insert(i);
+                }
+            }
+            // Update visual selection on bound items
+            for (auto& [di, pi] : galleryRecycler_->getPoolMap()) {
+                galleryRecycler_->getPool()[pi]->selected =
+                    galleryRecycler_->selectedSet.count(di) > 0;
+            }
+            if (onRedraw) onRedraw();
             return true;
         }
 
@@ -337,9 +388,6 @@ private:
     // UI fonts
     Font font_, fontSmall_, fontLarge_;
 
-    // Gallery state
-    bool galleryVisible_ = false;
-
     // Selection
     int selectedDataIdx_ = -1;
     int pendingClickDataIdx_ = -1;
@@ -349,6 +397,12 @@ private:
     // Face gallery double-click detection
     chrono::steady_clock::time_point lastFaceClickTime_;
     int lastFaceClickIdx_ = -1;
+
+    // Drag & drop state
+    bool isDragging_ = false;
+    int dragFaceCount_ = 0;
+    Vec2 dragGhostPos_;
+    int dropTargetDataIdx_ = -1;
 
     // Layout constants
     static constexpr float CARD_WIDTH = 144.0f;
@@ -415,6 +469,7 @@ private:
 
         PhotoProvider::FaceCluster cluster;
         bool selected = false;
+        bool dropHighlight = false;
         bool isLoadMoreButton = false;
         string loadMoreText;
 
@@ -475,7 +530,10 @@ private:
                 noFill();
                 drawRect(0, 0, w, h);
                 setColor(0.5f, 0.7f, 0.95f);
-                if (fontRef) fontRef->drawString(loadMoreText, w / 2, h / 2,
+                if (fontRef) fontRef->drawString("Load more", w / 2, h / 2 - 8,
+                    Direction::Center, Direction::Center);
+                setColor(0.4f, 0.55f, 0.75f);
+                if (fontSmallRef) fontSmallRef->drawString(loadMoreText, w / 2, h / 2 + 8,
                     Direction::Center, Direction::Center);
                 return;
             }
@@ -490,9 +548,16 @@ private:
             drawRect(0, 0, w, h);
 
             // Border
-            setColor(selected ? Color(0.4f, 0.6f, 0.9f) : Color(0.2f, 0.2f, 0.22f));
-            noFill();
-            drawRect(0, 0, w, h);
+            if (dropHighlight) {
+                setColor(0.3f, 0.6f, 1.0f);
+                noFill();
+                drawRect(0, 0, w, h);
+                drawRect(1, 1, w - 2, h - 2);
+            } else {
+                setColor(selected ? Color(0.4f, 0.6f, 0.9f) : Color(0.2f, 0.2f, 0.22f));
+                noFill();
+                drawRect(0, 0, w, h);
+            }
 
             // Face thumbnail (cropped from photo thumbnail)
             float thumbSize = h - 12;
@@ -585,8 +650,11 @@ private:
         int faceId = 0;
         bool selected = false;
 
-        // Callback (set by GalleryRecycler)
+        // Callbacks (set by GalleryRecycler)
         function<void()> onClick;
+        function<void(Vec2 screenPos)> onDragStart;
+        function<void(Vec2 screenPos)> onDragMove;
+        function<void(Vec2 screenPos)> onDragEnd;
 
         void setup() override {
             enableEvents();
@@ -642,11 +710,52 @@ private:
         }
 
         bool onMousePress(Vec2 pos, int button) override {
-            (void)pos;
             if (button != 0) return false;
-            if (onClick) onClick();
+            float gx, gy;
+            localToGlobal(pos.x, pos.y, gx, gy);
+            mouseDownPos_ = {gx, gy};
+            isDragging_ = false;
+            mouseDown_ = true;
             return true;
         }
+
+        bool onMouseDrag(Vec2 pos, int button) override {
+            if (button != 0 || !mouseDown_) return false;
+            float gx, gy;
+            localToGlobal(pos.x, pos.y, gx, gy);
+            Vec2 screenPos{gx, gy};
+            if (!isDragging_) {
+                float dist = screenPos.distance(mouseDownPos_);
+                if (dist > 5.0f) {
+                    isDragging_ = true;
+                    if (onDragStart) onDragStart(screenPos);
+                }
+            }
+            if (isDragging_) {
+                if (onDragMove) onDragMove(screenPos);
+            }
+            return isDragging_;
+        }
+
+        bool onMouseRelease(Vec2 pos, int button) override {
+            if (button != 0) return false;
+            float gx, gy;
+            localToGlobal(pos.x, pos.y, gx, gy);
+            Vec2 screenPos{gx, gy};
+            if (isDragging_) {
+                if (onDragEnd) onDragEnd(screenPos);
+            } else {
+                if (onClick) onClick();
+            }
+            isDragging_ = false;
+            mouseDown_ = false;
+            return true;
+        }
+
+    private:
+        Vec2 mouseDownPos_;
+        bool mouseDown_ = false;
+        bool isDragging_ = false;
     };
 
     // =========================================================================
@@ -850,7 +959,7 @@ private:
             // "Load more" button
             if (hasMore && dataIdx == (int)items.size()) {
                 item->isLoadMoreButton = true;
-                item->loadMoreText = format("Load more ({} remaining)", remainingCount);
+                item->loadMoreText = format("{} remaining", remainingCount);
                 item->textureRef = nullptr;
                 item->selected = false;
                 if (item->nameLabel) item->nameLabel->setActive(false);
@@ -1070,6 +1179,9 @@ private:
 
         // Callbacks
         function<void(int dataIdx)> onFaceClick;
+        function<void(Vec2 screenPos)> onDragStart;
+        function<void(Vec2 screenPos)> onDragMove;
+        function<void(Vec2 screenPos)> onDragEnd;
 
         // Data
         vector<PhotoDatabase::FaceBrief> faces;
@@ -1104,6 +1216,9 @@ private:
                 int dataIdx = getReverseMap()[pi];
                 if (dataIdx >= 0 && onFaceClick) onFaceClick(dataIdx);
             };
+            crop->onDragStart = [this](Vec2 sp) { if (onDragStart) onDragStart(sp); };
+            crop->onDragMove = [this](Vec2 sp) { if (onDragMove) onDragMove(sp); };
+            crop->onDragEnd = [this](Vec2 sp) { if (onDragEnd) onDragEnd(sp); };
             return crop;
         }
 
@@ -1288,18 +1403,13 @@ private:
             }
         }
 
-        galleryVisible_ = true;
-
-        // Rebuild card list with new widths
-        needsRebuild_ = true;
-
-        // Build gallery content
+        // Build gallery content (no need to rebuild card list — width unchanged)
         rebuildGallery(*cardItems_[dataIdx]);
 
         if (onRedraw) onRedraw();
     }
 
-    void hideGallery() {
+    void clearGallerySelection() {
         selectedDataIdx_ = -1;
         lastFaceClickIdx_ = -1;
         if (cardRecycler_) {
@@ -1308,16 +1418,10 @@ private:
                 cardRecycler_->getPool()[pi]->selected = false;
             }
         }
-        galleryVisible_ = false;
         if (galleryRecycler_) {
             galleryRecycler_->selectedSet.clear();
             galleryRecycler_->unbindAll();
-            galleryRecycler_->setPos(-9999, -9999);
-            galleryRecycler_->setSize(0, 0);
         }
-
-        // Rebuild card list at full width
-        needsRebuild_ = true;
         if (onRedraw) onRedraw();
     }
 
@@ -1447,8 +1551,8 @@ private:
             clusters_[clusterIdx].photoCount = (int)provider_->getPhotoIdsForFaceIds(cFaceIds).size();
 
             if (cFaceIds.empty()) {
-                // Cluster is now empty — hide gallery and rebuild
-                hideGallery();
+                // Cluster is now empty — clear selection and rebuild
+                clearGallerySelection();
                 clusters_.erase(clusters_.begin() + clusterIdx);
                 rebuildUI();
             } else {
@@ -1499,11 +1603,9 @@ private:
         clusters_ = std::move(cr.clusters);
         totalUnnamedFaces_ = cr.totalUnnamed;
         hasMoreFaces_ = cr.processedUnnamed < cr.totalUnnamed;
-        galleryVisible_ = false;
         if (galleryRecycler_) {
+            galleryRecycler_->selectedSet.clear();
             galleryRecycler_->unbindAll();
-            galleryRecycler_->setPos(-9999, -9999);
-            galleryRecycler_->setSize(0, 0);
         }
         selectedDataIdx_ = -1;
         rebuildUI();
@@ -1532,6 +1634,113 @@ private:
     }
 
     // =========================================================================
+    // Drag & drop
+    // =========================================================================
+
+    void handleDragStart(Vec2 screenPos) {
+        if (!galleryRecycler_ || selectedDataIdx_ < 0) return;
+
+        // Ensure the dragged face is in the selection
+        // (if nothing selected yet, the click handler hasn't fired, so check)
+        auto& sel = galleryRecycler_->selectedSet;
+        if (sel.empty()) {
+            // Select all faces in current gallery
+            int count = (int)galleryRecycler_->faces.size();
+            for (int i = 0; i < count; i++) sel.insert(i);
+        }
+
+        isDragging_ = true;
+        dragFaceCount_ = (int)sel.size();
+        dragGhostPos_ = screenPos;
+        if (onRedraw) onRedraw();
+    }
+
+    void handleDragMove(Vec2 screenPos) {
+        if (!isDragging_) return;
+        dragGhostPos_ = screenPos;
+        updateDropHighlight(screenPos);
+        if (onRedraw) onRedraw();
+    }
+
+    void handleDragEnd(Vec2 screenPos) {
+        if (!isDragging_) return;
+
+        if (dropTargetDataIdx_ >= 0) {
+            performDrop(dropTargetDataIdx_);
+        }
+
+        isDragging_ = false;
+        dragFaceCount_ = 0;
+        dropTargetDataIdx_ = -1;
+        clearDropHighlight();
+        if (onRedraw) onRedraw();
+    }
+
+    void updateDropHighlight(Vec2 screenPos) {
+        if (!cardRecycler_) return;
+
+        int newTarget = -1;
+
+        for (auto& [dataIdx, poolIdx] : cardRecycler_->getPoolMap()) {
+            auto& card = cardRecycler_->getPool()[poolIdx];
+            if (card->isLoadMoreButton) {
+                card->dropHighlight = false;
+                continue;
+            }
+
+            // Only named cards (personId > 0) and not the source card
+            if (dataIdx < (int)cardItems_.size() &&
+                cardItems_[dataIdx]->personId > 0 &&
+                dataIdx != selectedDataIdx_) {
+
+                float lx, ly;
+                card->globalToLocal(screenPos.x, screenPos.y, lx, ly);
+                float cw = card->getWidth(), ch = card->getHeight();
+                if (lx >= 0 && lx < cw && ly >= 0 && ly < ch) {
+                    newTarget = dataIdx;
+                    card->dropHighlight = true;
+                } else {
+                    card->dropHighlight = false;
+                }
+            } else {
+                card->dropHighlight = false;
+            }
+        }
+        dropTargetDataIdx_ = newTarget;
+    }
+
+    void clearDropHighlight() {
+        if (!cardRecycler_) return;
+        for (auto& [di, pi] : cardRecycler_->getPoolMap()) {
+            cardRecycler_->getPool()[pi]->dropHighlight = false;
+        }
+    }
+
+    void performDrop(int targetCardIdx) {
+        if (!provider_ || !galleryRecycler_) return;
+        if (targetCardIdx < 0 || targetCardIdx >= (int)cardItems_.size()) return;
+
+        auto* targetCluster = cardItems_[targetCardIdx];
+        if (targetCluster->personId <= 0) return;
+
+        // Collect selected face IDs
+        vector<int> faceIds;
+        for (int di : galleryRecycler_->selectedSet) {
+            if (di >= 0 && di < (int)galleryRecycler_->faces.size()) {
+                faceIds.push_back(galleryRecycler_->faces[di].faceId);
+            }
+        }
+        if (faceIds.empty()) return;
+
+        // Assign faces to target person
+        provider_->assignFacesToPerson(faceIds, targetCluster->personId);
+
+        // Clear selection and re-cluster
+        galleryRecycler_->selectedSet.clear();
+        runClustering();
+    }
+
+    // =========================================================================
     // Thumbnail loading
     // =========================================================================
 
@@ -1541,7 +1750,7 @@ private:
             needed.insert(c.repPhotoId);
         }
         // Also keep gallery face textures
-        if (galleryRecycler_ && galleryVisible_) {
+        if (galleryRecycler_ && selectedDataIdx_ >= 0) {
             for (auto& fb : galleryRecycler_->faces) {
                 needed.insert(fb.photoId);
             }
