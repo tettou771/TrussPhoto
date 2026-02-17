@@ -174,6 +174,8 @@ void tcApp::setup() {
         if (!entry) return;
         if (metadataPanel_) {
             metadataPanel_->setPhoto(entry);
+            metadataPanel_->setStyleProfileStatus(
+                viewManager_->singleView()->hasProfileFor(entry->camera, entry->creativeStyle));
             Pixels thumbPixels;
             if (provider_.getThumbnail(photoId, thumbPixels)) {
                 Texture tex;
@@ -199,6 +201,8 @@ void tcApp::setup() {
         if (!entry) return;
         if (metadataPanel_) {
             metadataPanel_->setPhoto(entry);
+            metadataPanel_->setStyleProfileStatus(
+                viewManager_->singleView()->hasProfileFor(entry->camera, entry->creativeStyle));
             Pixels thumbPixels;
             if (provider_.getThumbnail(photoId, thumbPixels)) {
                 Texture tex;
@@ -232,6 +236,8 @@ void tcApp::setup() {
         auto* e = provider_.getPhoto(photoId);
         if (e && metadataPanel_) {
             metadataPanel_->setPhoto(e);
+            metadataPanel_->setStyleProfileStatus(
+                viewManager_->singleView()->hasProfileFor(e->camera, e->creativeStyle));
             Pixels thumbPixels;
             if (provider_.getThumbnail(photoId, thumbPixels)) {
                 Texture tex;
@@ -779,6 +785,8 @@ void tcApp::keyPressed(int key) {
                 if (metadataPanel_) {
                     auto* entry = provider_.getPhoto(photoId);
                     metadataPanel_->setPhoto(entry);
+                    if (entry) metadataPanel_->setStyleProfileStatus(
+                        viewManager_->singleView()->hasProfileFor(entry->camera, entry->creativeStyle));
                     metadataPanel_->clearViewInfo();
                     metadataPanel_->clearThumbnail();
                 }
@@ -851,6 +859,8 @@ void tcApp::keyPressed(int key) {
                     if (metadataPanel_) {
                         auto* entry = provider_.getPhoto(ids[0]);
                         metadataPanel_->setPhoto(entry);
+                        if (entry) metadataPanel_->setStyleProfileStatus(
+                            viewManager_->singleView()->hasProfileFor(entry->camera, entry->creativeStyle));
                         metadataPanel_->clearViewInfo();
                         metadataPanel_->clearThumbnail();
                     }
@@ -1097,7 +1107,8 @@ void tcApp::configureServer(const string& url, const string& key) {
 void tcApp::repairLibrary() {
     int missing = provider_.validateLibrary();
     int added = provider_.scanLibraryFolder();
-    logNotice() << "[Repair] Missing: " << missing << ", Added: " << added;
+    int styles = provider_.refreshCreativeStyles();
+    logNotice() << "[Repair] Missing: " << missing << ", Added: " << added << ", Styles: " << styles;
     if (missing > 0 || added > 0) {
         grid()->populate(provider_);
         rebuildFolderTree();
@@ -1285,6 +1296,8 @@ void tcApp::updateMetadataPanel() {
             if (!ids.empty()) {
                 auto* e = provider_.getPhoto(ids[0]);
                 metadataPanel_->setPhoto(e);
+                if (e) metadataPanel_->setStyleProfileStatus(
+                    viewManager_->singleView()->hasProfileFor(e->camera, e->creativeStyle));
             }
         } else {
             metadataPanel_->setPhoto(nullptr);

@@ -231,6 +231,27 @@ public:
         return relinked;
     }
 
+    // Re-extract creativeStyle for photos that have empty style and accessible files
+    int refreshCreativeStyles() {
+        int updated = 0;
+        for (auto& [id, photo] : photos_) {
+            if (!photo.creativeStyle.empty()) continue;
+            if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
+
+            PhotoEntry temp;
+            extractExifMetadata(photo.localPath, temp);
+            if (!temp.creativeStyle.empty()) {
+                photo.creativeStyle = temp.creativeStyle;
+                db_.updatePhoto(photo);
+                updated++;
+            }
+        }
+        if (updated > 0) {
+            logNotice() << "[RefreshStyles] Updated " << updated << " photos";
+        }
+        return updated;
+    }
+
     // Scan library folder for unregistered files, returns count of added
     int scanLibraryFolder() {
         if (rawStoragePath_.empty() || !fs::exists(rawStoragePath_)) return 0;
@@ -2514,6 +2535,79 @@ private:
         return deg + min / 60.0 + sec / 3600.0;
     }
 
+    // Parse Sigma MakerNote to extract color mode (tag 0x003d)
+    // Sigma MakerNote: "SIGMA\0" (6B) + 4B unknown + IFD (little-endian)
+    // IFD value offsets are TIFF-absolute, not MakerNote-relative.
+    // We calculate the base offset from the min external valOff.
+    static string extractSigmaColorMode(const Exiv2::ExifData& exif) {
+        auto it = exif.findKey(Exiv2::ExifKey("Exif.Photo.MakerNote"));
+        if (it == exif.end()) return "";
+
+        auto& value = it->value();
+        size_t size = value.size();
+        if (size < 14) return "";
+
+        vector<uint8_t> data(size);
+        value.copy((Exiv2::byte*)data.data(), Exiv2::invalidByteOrder);
+
+        if (memcmp(data.data(), "SIGMA", 5) != 0) return "";
+
+        uint16_t numEntries = data[10] | (data[11] << 8);
+        if (numEntries == 0 || numEntries > 500) return "";
+        size_t ifdStart = 12;
+        size_t ifdEnd = ifdStart + (size_t)numEntries * 12;
+        if (ifdEnd > size) return "";
+
+        // Calculate base offset: IFD value offsets are TIFF-absolute.
+        // The data area starts right after the IFD entries at MakerNote byte ifdEnd.
+        // Find the minimum external valOff to determine the TIFF base.
+        uint32_t minExtVal = UINT32_MAX;
+        static const uint8_t typeSizes[] = {0,1,1,2,4,8,1,1,2,4,8};
+        for (int i = 0; i < numEntries; i++) {
+            size_t off = ifdStart + i * 12;
+            uint16_t typ = data[off + 2] | (data[off + 3] << 8);
+            uint32_t cnt = data[off + 4] | (data[off + 5] << 8) |
+                           (data[off + 6] << 16) | (data[off + 7] << 24);
+            uint32_t ts = (typ < sizeof(typeSizes)) ? typeSizes[typ] : 1;
+            if ((uint64_t)cnt * ts > 4) {
+                uint32_t vo = data[off + 8] | (data[off + 9] << 8) |
+                              (data[off + 10] << 16) | (data[off + 11] << 24);
+                if (vo < minExtVal) minExtVal = vo;
+            }
+        }
+        // base = minExtVal - ifdEnd (MakerNote's TIFF offset)
+        uint32_t baseOff = (minExtVal != UINT32_MAX && minExtVal >= ifdEnd)
+                           ? minExtVal - (uint32_t)ifdEnd : 0;
+
+        // Now find tag 0x003d
+        for (int i = 0; i < numEntries; i++) {
+            size_t off = ifdStart + i * 12;
+            uint16_t tag = data[off] | (data[off + 1] << 8);
+            if (tag != 0x003d) continue;
+
+            uint16_t type = data[off + 2] | (data[off + 3] << 8);
+            uint32_t count = data[off + 4] | (data[off + 5] << 8) |
+                             (data[off + 6] << 16) | (data[off + 7] << 24);
+            if (type != 2 || count == 0) break;
+
+            const char* str;
+            if (count <= 4) {
+                str = (const char*)&data[off + 8];
+            } else {
+                uint32_t valOff = data[off + 8] | (data[off + 9] << 8) |
+                                  (data[off + 10] << 16) | (data[off + 11] << 24);
+                // Convert TIFF-absolute to MakerNote-relative
+                size_t mnOff = (valOff >= baseOff) ? valOff - baseOff : 0;
+                if (mnOff + count > size) break;
+                str = (const char*)&data[mnOff];
+            }
+            string result(str, strnlen(str, count));
+            logNotice() << "[Sigma] ColorMode: \"" << result << "\"";
+            return result;
+        }
+        return "";
+    }
+
     // Extract EXIF/MakerNote metadata using exiv2
     static void extractExifMetadata(const string& path, PhotoEntry& photo) {
         try {
@@ -2565,8 +2659,13 @@ private:
                 }
             }
 
-            // Sony MakerNote: Creative Style
+            // Creative Style / Color Mode
+            // Sony: parsed by exiv2 natively
             string style = getString("Exif.Sony2.CreativeStyle");
+            // Sigma: exiv2 doesn't parse Sigma MakerNote, read tag 0x003d from raw binary
+            if (style.empty()) {
+                style = extractSigmaColorMode(exif);
+            }
             if (!style.empty()) {
                 photo.creativeStyle = style;
             }

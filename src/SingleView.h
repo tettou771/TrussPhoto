@@ -45,6 +45,11 @@ public:
         lensCorrector_.loadDatabase(lensfunDir);
     }
 
+    // Check if a profile exists for a given camera/style combo
+    bool hasProfileFor(const string& camera, const string& style) const {
+        return !profileManager_.findProfile(camera, style).empty();
+    }
+
     // Open a specific photo by grid index
     void show(int index) {
         if (!ctx_) return;
@@ -150,6 +155,8 @@ public:
             if (ctx_->metadataPanel) {
                 ctx_->metadataPanel->clearThumbnail();
                 ctx_->metadataPanel->setPhoto(entry);
+                ctx_->metadataPanel->setStyleProfileStatus(!profileManager_.findProfile(
+                    entry->camera, entry->creativeStyle).empty());
                 ctx_->metadataPanel->setViewInfo(zoomLevel_, profileEnabled_, profileBlend_,
                     hasProfileLut_, lensEnabled_, isSmartPreview_);
             }
@@ -414,7 +421,11 @@ public:
         if (selectedIndex_ >= (int)ctx_->grid->getPhotoIdCount()) return;
         const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
         auto* e = ctx_->provider->getPhoto(pid);
-        if (e && ctx_->metadataPanel) ctx_->metadataPanel->setPhoto(e);
+        if (e && ctx_->metadataPanel) {
+            ctx_->metadataPanel->setPhoto(e);
+            ctx_->metadataPanel->setStyleProfileStatus(!profileManager_.findProfile(
+                e->camera, e->creativeStyle).empty());
+        }
         updateViewInfo();
     }
 

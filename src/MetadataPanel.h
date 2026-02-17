@@ -46,6 +46,13 @@ public:
             hasPhoto_ = false;
         }
         overlays_.clear();
+        styleHasProfile_ = false;  // reset until caller sets it
+        needsRedraw_ = true;
+    }
+
+    // Whether the current photo's creativeStyle has a matching .cube profile
+    void setStyleProfileStatus(bool hasProfile) {
+        styleHasProfile_ = hasProfile;
         needsRedraw_ = true;
     }
 
@@ -133,6 +140,7 @@ private:
     bool hasPhoto_ = false;
     bool hasViewInfo_ = false;
     bool needsRedraw_ = false;
+    bool styleHasProfile_ = false;
 
     // Thumbnail (for map pin preview)
     Texture thumbnail_;
@@ -377,7 +385,10 @@ private:
             }
 
             if (!e.creativeStyle.empty()) {
-                drawValue(e.creativeStyle, y, Color(0.6f, 0.6f, 0.65f));
+                Color styleColor = styleHasProfile_
+                    ? Color(0.5f, 0.75f, 0.5f)   // green: profile found
+                    : Color(0.9f, 0.3f, 0.3f);    // red: no matching profile
+                drawValue(e.creativeStyle, y, styleColor);
             }
             y += sectionGap_;
         }
