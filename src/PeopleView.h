@@ -23,6 +23,11 @@ public:
 
     // Callbacks
     function<void()> onRedraw;
+    function<void(const string& photoId)> onFaceSelect;
+    function<void(const string& photoId)> onFaceDoubleClick;
+
+    // Modifier key state (set by tcApp)
+    bool* cmdDownRef = nullptr;
 
     void setup() override {
         enableEvents();
@@ -46,6 +51,9 @@ public:
         galleryRecycler_ = make_shared<GalleryRecycler>();
         galleryRecycler_->texturesRef = &textures_;
         galleryRecycler_->fontLargeRef = &fontLarge_;
+        galleryRecycler_->onFaceClick = [this](int dataIdx) {
+            pendingFaceClickIdx_ = dataIdx;
+        };
         addChild(galleryRecycler_);
         galleryRecycler_->setPos(-9999, -9999);
         galleryRecycler_->setSize(0, 0);
@@ -104,6 +112,13 @@ public:
             int idx = pendingClickDataIdx_;
             pendingClickDataIdx_ = -1;
             showGallery(idx);
+        }
+
+        // Process deferred face click (from GalleryRecycler)
+        if (pendingFaceClickIdx_ >= 0) {
+            int idx = pendingFaceClickIdx_;
+            pendingFaceClickIdx_ = -1;
+            handleFaceClick(idx);
         }
 
         // Process clustering completion from background thread
@@ -226,9 +241,18 @@ public:
             14, h - 18, Direction::Left, Direction::Center);
     }
 
-    void shutdown() {
+    // Check if this view has state that can be restored
+    bool hasState() const { return !clusters_.empty(); }
+
+    // Suspend: stop threads but keep data (for temporary exit)
+    void suspend() {
         if (clusterThread_.joinable()) clusterThread_.join();
         if (loadThread_.joinable()) loadThread_.join();
+        loadThreadRunning_ = false;
+    }
+
+    void shutdown() {
+        suspend();
         if (cardRecycler_) cardRecycler_->unbindAll();
         if (galleryRecycler_) galleryRecycler_->unbindAll();
         selectedDataIdx_ = -1;
@@ -238,8 +262,11 @@ public:
         cardItems_.clear();
         editingClusterId_ = -1;
         pendingClickDataIdx_ = -1;
+        pendingFaceClickIdx_ = -1;
+        lastFaceClickIdx_ = -1;
         galleryVisible_ = false;
         if (galleryRecycler_) {
+            galleryRecycler_->selectedSet.clear();
             galleryRecycler_->setPos(-9999, -9999);
             galleryRecycler_->setSize(0, 0);
         }
@@ -256,6 +283,13 @@ public:
                 hideGallery();
                 return true;
             }
+        }
+
+        // Delete/Backspace: unassign selected faces from person
+        if ((key == 259 /* BACKSPACE */ || key == 261 /* DELETE */) &&
+            galleryVisible_ && galleryRecycler_ && !galleryRecycler_->selectedSet.empty()) {
+            handleDeleteSelectedFaces();
+            return true;
         }
 
         // N: edit name of selected card
@@ -295,7 +329,12 @@ private:
     // Selection
     int selectedDataIdx_ = -1;
     int pendingClickDataIdx_ = -1;
+    int pendingFaceClickIdx_ = -1;
     int editingClusterId_ = -1;
+
+    // Face gallery double-click detection
+    chrono::steady_clock::time_point lastFaceClickTime_;
+    int lastFaceClickIdx_ = -1;
 
     // Layout constants
     static constexpr float CARD_WIDTH = 144.0f;
@@ -513,6 +552,15 @@ private:
         Texture* textureRef = nullptr;
         float faceX = 0, faceY = 0, faceW = 0, faceH = 0;
         string photoId;
+        int faceId = 0;
+        bool selected = false;
+
+        // Callback (set by GalleryRecycler)
+        function<void()> onClick;
+
+        void setup() override {
+            enableEvents();
+        }
 
         void draw() override {
             float w = getWidth(), h = getHeight();
@@ -550,9 +598,24 @@ private:
                 drawRect(0, 0, w, h);
             }
 
-            setColor(0.2f, 0.2f, 0.22f);
-            noFill();
-            drawRect(0, 0, w, h);
+            // Border: highlight when selected
+            if (selected) {
+                setColor(0.4f, 0.7f, 1.0f);
+                noFill();
+                drawRect(0, 0, w, h);
+                drawRect(1, 1, w - 2, h - 2);
+            } else {
+                setColor(0.2f, 0.2f, 0.22f);
+                noFill();
+                drawRect(0, 0, w, h);
+            }
+        }
+
+        bool onMousePress(Vec2 pos, int button) override {
+            (void)pos;
+            if (button != 0) return false;
+            if (onClick) onClick();
+            return true;
         }
     };
 
@@ -930,14 +993,21 @@ private:
         unordered_map<string, Texture>* texturesRef = nullptr;
         Font* fontLargeRef = nullptr;
 
+        // Callbacks
+        function<void(int dataIdx)> onFaceClick;
+
         // Data
         vector<PhotoDatabase::FaceBrief> faces;
         string headerText;
+
+        // Selection (dataIdx-based)
+        unordered_set<int> selectedSet;
 
         void setData(const vector<PhotoDatabase::FaceBrief>& newFaces,
                      const string& header) {
             faces = newFaces;
             headerText = header;
+            selectedSet.clear();
             itemWidth_ = CROP_SIZE;
             itemHeight_ = CROP_SIZE;
             spacing_ = CROP_SPACING;
@@ -952,9 +1022,13 @@ private:
         int getDataCount() const override { return (int)faces.size(); }
 
         ItemPtr createPoolItem(int poolIdx) override {
-            (void)poolIdx;
             auto crop = make_shared<FaceCropNode>();
             crop->setSize(CROP_SIZE, CROP_SIZE);
+            int pi = poolIdx;
+            crop->onClick = [this, pi]() {
+                int dataIdx = getReverseMap()[pi];
+                if (dataIdx >= 0 && onFaceClick) onFaceClick(dataIdx);
+            };
             return crop;
         }
 
@@ -962,10 +1036,12 @@ private:
             if (dataIdx >= (int)faces.size()) return;
             auto& fb = faces[dataIdx];
             item->photoId = fb.photoId;
+            item->faceId = fb.faceId;
             item->faceX = fb.x;
             item->faceY = fb.y;
             item->faceW = fb.w;
             item->faceH = fb.h;
+            item->selected = selectedSet.count(dataIdx) > 0;
 
             if (texturesRef) {
                 auto it = texturesRef->find(fb.photoId);
@@ -977,6 +1053,7 @@ private:
         void onUnbind(int dataIdx, ItemPtr& item) override {
             (void)dataIdx;
             item->textureRef = nullptr;
+            item->selected = false;
         }
 
         // Override content height to account for gallery header
@@ -1145,6 +1222,7 @@ private:
 
     void hideGallery() {
         selectedDataIdx_ = -1;
+        lastFaceClickIdx_ = -1;
         if (cardRecycler_) {
             cardRecycler_->selectedIdx = -1;
             for (auto& [di, pi] : cardRecycler_->getPoolMap()) {
@@ -1153,6 +1231,7 @@ private:
         }
         galleryVisible_ = false;
         if (galleryRecycler_) {
+            galleryRecycler_->selectedSet.clear();
             galleryRecycler_->unbindAll();
             galleryRecycler_->setPos(-9999, -9999);
             galleryRecycler_->setSize(0, 0);
@@ -1197,6 +1276,118 @@ private:
             galleryRecycler_->resetScroll();
             galleryRecycler_->rebuild();
         }
+    }
+
+    // =========================================================================
+    // Face click / selection / delete handling
+    // =========================================================================
+
+    void handleFaceClick(int dataIdx) {
+        if (!galleryRecycler_ || dataIdx < 0 || dataIdx >= (int)galleryRecycler_->faces.size())
+            return;
+
+        auto now = chrono::steady_clock::now();
+        bool isDoubleClick = (dataIdx == lastFaceClickIdx_ &&
+            chrono::duration_cast<chrono::milliseconds>(now - lastFaceClickTime_).count() < 300);
+        lastFaceClickTime_ = now;
+        lastFaceClickIdx_ = dataIdx;
+
+        if (isDoubleClick) {
+            // Double-click: open in single view
+            const string& photoId = galleryRecycler_->faces[dataIdx].photoId;
+            if (onFaceDoubleClick) onFaceDoubleClick(photoId);
+            return;
+        }
+
+        // Check modifier for multi-select
+        bool cmdHeld = cmdDownRef ? *cmdDownRef : false;
+
+        if (cmdHeld) {
+            // Toggle selection
+            if (galleryRecycler_->selectedSet.count(dataIdx)) {
+                galleryRecycler_->selectedSet.erase(dataIdx);
+            } else {
+                galleryRecycler_->selectedSet.insert(dataIdx);
+            }
+        } else {
+            // Single select
+            galleryRecycler_->selectedSet.clear();
+            galleryRecycler_->selectedSet.insert(dataIdx);
+        }
+
+        // Update visual selection on bound items
+        for (auto& [di, pi] : galleryRecycler_->getPoolMap()) {
+            galleryRecycler_->getPool()[pi]->selected =
+                galleryRecycler_->selectedSet.count(di) > 0;
+        }
+
+        // Notify callback with selected photo
+        const string& photoId = galleryRecycler_->faces[dataIdx].photoId;
+        if (onFaceSelect) onFaceSelect(photoId);
+
+        if (onRedraw) onRedraw();
+    }
+
+    void handleDeleteSelectedFaces() {
+        if (!galleryRecycler_ || !provider_) return;
+        if (galleryRecycler_->selectedSet.empty()) return;
+        if (selectedDataIdx_ < 0 || selectedDataIdx_ >= (int)cardItems_.size()) return;
+
+        // Collect face IDs to unassign
+        vector<int> faceIdsToRemove;
+        vector<int> dataIndicesToRemove;
+        for (int di : galleryRecycler_->selectedSet) {
+            if (di >= 0 && di < (int)galleryRecycler_->faces.size()) {
+                faceIdsToRemove.push_back(galleryRecycler_->faces[di].faceId);
+                dataIndicesToRemove.push_back(di);
+            }
+        }
+
+        if (faceIdsToRemove.empty()) return;
+
+        // Unassign in DB
+        provider_->unassignFaces(faceIdsToRemove);
+        galleryRecycler_->selectedSet.clear();
+
+        // Update the cluster's faceIds in-place
+        int clusterIdx = -1;
+        for (int i = 0; i < (int)clusters_.size(); i++) {
+            if (cardItems_[selectedDataIdx_] == &clusters_[i]) {
+                clusterIdx = i;
+                break;
+            }
+        }
+
+        if (clusterIdx >= 0) {
+            auto& cFaceIds = clusters_[clusterIdx].faceIds;
+            unordered_set<int> removeSet(faceIdsToRemove.begin(), faceIdsToRemove.end());
+            cFaceIds.erase(
+                remove_if(cFaceIds.begin(), cFaceIds.end(),
+                    [&](int id) { return removeSet.count(id) > 0; }),
+                cFaceIds.end());
+            clusters_[clusterIdx].photoCount = (int)provider_->getPhotoIdsForFaceIds(cFaceIds).size();
+
+            if (cFaceIds.empty()) {
+                // Cluster is now empty — hide gallery and rebuild
+                hideGallery();
+                clusters_.erase(clusters_.begin() + clusterIdx);
+                rebuildUI();
+            } else {
+                // Rebuild gallery with updated face list
+                rebuildGallery(clusters_[clusterIdx]);
+                // Update card display
+                if (cardRecycler_) {
+                    for (auto& [di, pi] : cardRecycler_->getPoolMap()) {
+                        if (di == selectedDataIdx_) {
+                            cardRecycler_->getPool()[pi]->bindCluster(
+                                clusters_[clusterIdx], true);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (onRedraw) onRedraw();
     }
 
     // =========================================================================

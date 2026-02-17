@@ -1240,6 +1240,13 @@ public:
         return ok;
     }
 
+    // Unassign faces from their person (set person_id = NULL)
+    bool unassignFaces(const vector<int>& faceIds) {
+        bool ok = db_.unassignFaces(faceIds);
+        if (ok) loadFaceCache();
+        return ok;
+    }
+
     // Rename a person
     bool renamePerson(int personId, const string& newName) {
         bool ok = db_.renamePerson(personId, newName);

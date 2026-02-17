@@ -226,6 +226,30 @@ void tcApp::setup() {
     addChild(peopleView_);
     peopleView_->setActive(false);
     peopleView_->onRedraw = [this]() { redraw(); };
+    peopleView_->cmdDownRef = &cmdDown_;
+    peopleView_->onFaceSelect = [this](const string& photoId) {
+        auto* e = provider_.getPhoto(photoId);
+        if (e && metadataPanel_) {
+            metadataPanel_->setPhoto(e);
+            // Load thumbnail for metadata panel
+            Pixels thumbPixels;
+            if (provider_.getThumbnail(photoId, thumbPixels)) {
+                Texture tex;
+                tex.allocate(thumbPixels, TextureUsage::Immutable, false);
+                metadataPanel_->setThumbnail(std::move(tex));
+            }
+        }
+        redraw();
+    };
+    peopleView_->onFaceDoubleClick = [this](const string& photoId) {
+        // Find photo index in grid, then open single view
+        for (int i = 0; i < (int)grid_->getPhotoIdCount(); i++) {
+            if (grid_->getPhotoId(i) == photoId) {
+                showFullImage(i);
+                return;
+            }
+        }
+    };
 
     // 5d. Create metadata panel (right sidebar)
     metadataPanel_ = make_shared<MetadataPanel>();
@@ -805,6 +829,10 @@ void tcApp::keyPressed(int key) {
             }
         }
 
+        if (key == SAPP_KEYCODE_ESCAPE) {
+            exitFullImage();
+        }
+
         if (key == 'V' || key == 'v') {
             // Enter related view from single view
             if (selectedIndex_ >= 0 && selectedIndex_ < (int)grid_->getPhotoIdCount()) {
@@ -894,7 +922,7 @@ void tcApp::keyPressed(int key) {
     // Mode-independent keys
     if (key == 'G' || key == 'g') {
         if (viewMode_ == ViewMode::Single) {
-            exitFullImage();
+            exitFullImage(false);  // G always returns to grid
         } else if (viewMode_ == ViewMode::Map) {
             viewMode_ = ViewMode::Grid;
             mapView_->setActive(false);
@@ -1383,12 +1411,14 @@ void tcApp::showFullImage(int index) {
 
     if (loaded) {
         selectedIndex_ = index;
+        previousViewMode_ = viewMode_;
         viewMode_ = ViewMode::Single;
         zoomLevel_ = 1.0f;
         panOffset_ = {0, 0};
         grid_->setActive(false);
         if (mapView_) mapView_->setActive(false);
         if (relatedView_) relatedView_->setActive(false);
+        if (peopleView_) peopleView_->setActive(false);
         if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
         leftPaneWidth_ = 0;  // hide left pane in single view (no animation)
         leftTween_.finish();
@@ -1415,9 +1445,7 @@ void tcApp::reprocessImage() {
     fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
 }
 
-void tcApp::exitFullImage() {
-    viewMode_ = ViewMode::Grid;
-
+void tcApp::exitFullImage(bool returnToPrevious) {
     // Wait for background load to finish
     if (rawLoadThread_.joinable()) {
         rawLoadThread_.join();
@@ -1446,6 +1474,13 @@ void tcApp::exitFullImage() {
     profileLut_.clear();
     currentProfilePath_.clear();
 
+    // Return to previous view mode (ESC) or always grid (G)
+    if (returnToPrevious && previousViewMode_ == ViewMode::People) {
+        enterPeopleView();
+        return;
+    }
+
+    viewMode_ = ViewMode::Grid;
     grid_->setActive(true);
 
     // Restore left pane width (no animation)
@@ -1519,8 +1554,13 @@ void tcApp::enterPeopleView() {
     }
     if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
 
-    peopleView_->populate(provider_);
-    peopleView_->setActive(true);
+    if (peopleView_->hasState()) {
+        // Restore: just reactivate (data + scroll + selection preserved)
+        peopleView_->setActive(true);
+    } else {
+        peopleView_->populate(provider_);
+        peopleView_->setActive(true);
+    }
 
     // Hide left sidebar in people view
     leftPaneWidth_ = 0;
@@ -1541,7 +1581,7 @@ void tcApp::exitPeopleView() {
 
     viewMode_ = ViewMode::Grid;
     peopleView_->setActive(false);
-    peopleView_->shutdown();
+    peopleView_->suspend();
     grid_->setActive(true);
 
     // Restore left pane

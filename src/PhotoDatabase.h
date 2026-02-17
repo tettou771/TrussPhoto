@@ -787,6 +787,11 @@ public:
         return true;
     }
 
+    // Unassign faces from their person (set person_id = NULL)
+    bool unassignFaces(const vector<int>& faceIds) {
+        return batchUpdateFacePersonId(faceIds, 0);
+    }
+
     // Merge persons: move all faces from sourcePersonId to targetPersonId, delete source
     bool mergePersons(int targetPersonId, int sourcePersonId) {
         lock_guard<mutex> lock(db_.writeMutex());

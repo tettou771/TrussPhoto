@@ -75,6 +75,7 @@ private:
     PaneToggle::Ptr rightToggle_;
     UploadQueue uploadQueue_;
     ViewMode viewMode_ = ViewMode::Grid;
+    ViewMode previousViewMode_ = ViewMode::Grid;
     bool needsServerSync_ = false;
     atomic<bool> syncInProgress_{false};
     atomic<bool> syncCompleted_{false};
@@ -152,7 +153,7 @@ private:
     void exitPeopleView();
     void deleteSelectedPhotos();
     void reprocessImage();   // re-apply lens correction from rawPixels_ cache
-    void exitFullImage();
+    void exitFullImage(bool returnToPrevious = true);
     void drawSingleView();
     void enqueueLocalOnlyPhotos();
     void configureServer(const string& url, const string& key = "");
