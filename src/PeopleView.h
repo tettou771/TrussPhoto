@@ -298,14 +298,13 @@ private:
     int editingClusterId_ = -1;
 
     // Layout constants
-    static constexpr float CARD_WIDTH = 180.0f;
-    static constexpr float CARD_HEIGHT = 72.0f;
-    static constexpr float CARD_SPACING = 8.0f;
+    static constexpr float CARD_WIDTH = 144.0f;
+    static constexpr float CARD_HEIGHT = 58.0f;
+    static constexpr float CARD_SPACING = 6.0f;
     static constexpr float SECTION_HEADER_HEIGHT = 32.0f;
     static constexpr float PADDING = 16.0f;
     static constexpr float CROP_SIZE = 80.0f;
     static constexpr float CROP_SPACING = 6.0f;
-    static constexpr int MAX_GALLERY_FACES = 200;
     static constexpr int MAX_CARD_TEXTURES = 300;
 
     // Flat list of cluster pointers for card recycler
@@ -343,11 +342,14 @@ private:
                     Direction::Left, Direction::Top);
             }
 
-            // Counts
-            string countStr = format("{} photos, {} faces", photoCount, faceCount);
+            // Counts (two lines)
             setColor(0.45f, 0.45f, 0.5f);
-            if (fontSmallRef) fontSmallRef->drawString(countStr, textX, textY + 18,
-                Direction::Left, Direction::Top);
+            if (fontSmallRef) {
+                fontSmallRef->drawString(format("{} photos", photoCount),
+                    textX, textY + 16, Direction::Left, Direction::Top);
+                fontSmallRef->drawString(format("{} faces", faceCount),
+                    textX, textY + 28, Direction::Left, Direction::Top);
+            }
         }
     };
 
@@ -876,9 +878,9 @@ private:
         shared_ptr<SectionHeader> namedHeader_;
         shared_ptr<SectionHeader> unnamedHeader_;
 
-        static constexpr float CARD_WIDTH = 180.0f;
-        static constexpr float CARD_HEIGHT = 72.0f;
-        static constexpr float CARD_SPACING = 8.0f;
+        static constexpr float CARD_WIDTH = 144.0f;
+        static constexpr float CARD_HEIGHT = 58.0f;
+        static constexpr float CARD_SPACING = 6.0f;
         static constexpr float SECTION_HEADER_HEIGHT = 32.0f;
         static constexpr float PADDING = 16.0f;
 
@@ -1170,16 +1172,9 @@ private:
         // Clean up textures not needed by card list
         cleanupUnusedTextures();
 
-        // Get face details (limited)
+        // Get face details
         int totalFaces = (int)cluster.faceIds.size();
-        vector<int> limitedIds;
-        if (totalFaces > MAX_GALLERY_FACES) {
-            limitedIds.assign(cluster.faceIds.begin(),
-                              cluster.faceIds.begin() + MAX_GALLERY_FACES);
-        } else {
-            limitedIds = cluster.faceIds;
-        }
-        auto briefs = provider_->getFaceBriefs(limitedIds);
+        auto briefs = provider_->getFaceBriefs(cluster.faceIds);
 
         // Header text
         string headerText;
@@ -1187,9 +1182,6 @@ private:
             headerText = format("Cluster ({} faces)", totalFaces);
         } else {
             headerText = format("{} ({} faces)", cluster.name, totalFaces);
-        }
-        if (totalFaces > MAX_GALLERY_FACES) {
-            headerText += format("  showing first {}", MAX_GALLERY_FACES);
         }
 
         // Queue missing thumbnails
