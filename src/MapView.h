@@ -222,31 +222,8 @@ public:
             }
         }
 
-        // Draw pins
-        for (const auto& pin : pins_) {
-            auto px = latLonToPixel(pin.lat, pin.lon, zoom_);
-            float sx = px.x - left;
-            float sy = px.y - top;
-
-            // Skip if off screen
-            if (sx < -PIN_RADIUS || sx > w + PIN_RADIUS ||
-                sy < -PIN_RADIUS || sy > h + PIN_RADIUS) continue;
-
-            // Pin shadow
-            setColor(0.0f, 0.0f, 0.0f, 0.3f);
-            fill();
-            drawCircle(sx + 1, sy + 1, PIN_RADIUS);
-
-            // Pin body
-            setColor(0.9f, 0.2f, 0.2f);
-            fill();
-            drawCircle(sx, sy, PIN_RADIUS);
-
-            // Pin center dot
-            setColor(1.0f, 1.0f, 1.0f);
-            fill();
-            drawCircle(sx, sy, 3);
-        }
+        // Draw pins (with grid-based clustering to avoid vertex buffer overflow)
+        drawPins(left, top, w, h);
 
         setClipping(false);
 
@@ -278,39 +255,40 @@ public:
     bool onMousePress(Vec2 pos, int button) override {
         if (button != 0) return false;
 
-        // Check pin clicks
-        float w = getWidth();
-        float h = getHeight();
-        auto centerPx = latLonToPixel(centerLat_, centerLon_, zoom_);
-        float left = centerPx.x - w / 2.0f;
-        float top = centerPx.y - h / 2.0f;
+        // Hit test against cached clusters (much faster than iterating all pins)
+        for (const auto& cluster : lastClusters_) {
+            float r = PIN_RADIUS;
+            if (cluster.count >= 1000) r = PIN_RADIUS + 6;
+            else if (cluster.count >= 100) r = PIN_RADIUS + 4;
+            float dx = pos.x - cluster.cx;
+            float dy = pos.y - cluster.cy;
+            if (dx * dx + dy * dy > r * r) continue;
 
-        float bestDist = PIN_RADIUS * 2;
-        int bestPinIdx = -1;
+            if (cluster.count == 1) {
+                // Single pin: fire click/double-click
+                auto& pin = pins_[cluster.firstPinIdx];
+                auto now = chrono::steady_clock::now();
+                bool isDouble = (pin.photoIndex == lastPinClickIndex_ &&
+                    chrono::duration_cast<chrono::milliseconds>(now - lastPinClickTime_).count() < 400);
+                lastPinClickTime_ = now;
+                lastPinClickIndex_ = pin.photoIndex;
 
-        for (size_t i = 0; i < pins_.size(); i++) {
-            auto px = latLonToPixel(pins_[i].lat, pins_[i].lon, zoom_);
-            float sx = px.x - left;
-            float sy = px.y - top;
-            float dist = sqrt((pos.x - sx) * (pos.x - sx) + (pos.y - sy) * (pos.y - sy));
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestPinIdx = (int)i;
-            }
-        }
-
-        if (bestPinIdx >= 0) {
-            auto& pin = pins_[bestPinIdx];
-            auto now = chrono::steady_clock::now();
-            bool isDouble = (pin.photoIndex == lastPinClickIndex_ &&
-                chrono::duration_cast<chrono::milliseconds>(now - lastPinClickTime_).count() < 400);
-            lastPinClickTime_ = now;
-            lastPinClickIndex_ = pin.photoIndex;
-
-            if (isDouble && onPinDoubleClick) {
-                onPinDoubleClick(pin.photoIndex, pin.photoId);
-            } else if (onPinClick) {
-                onPinClick(pin.photoIndex, pin.photoId);
+                if (isDouble && onPinDoubleClick) {
+                    onPinDoubleClick(pin.photoIndex, pin.photoId);
+                } else if (onPinClick) {
+                    onPinClick(pin.photoIndex, pin.photoId);
+                }
+            } else {
+                // Cluster: zoom in to cluster center
+                auto [lat, lon] = pixelToLatLon(
+                    cluster.cx + (latLonToPixel(centerLat_, centerLon_, zoom_).x - getWidth() / 2.0f),
+                    cluster.cy + (latLonToPixel(centerLat_, centerLon_, zoom_).y - getHeight() / 2.0f),
+                    zoom_);
+                centerLat_ = clamp(lat, -85.0, 85.0);
+                centerLon_ = lon;
+                zoom_ = min(zoom_ + 2.0, 19.0);
+                evictOldTiles();
+                if (onRedraw) onRedraw();
             }
             return true;
         }
@@ -404,6 +382,7 @@ public:
 
 private:
     static constexpr float PIN_RADIUS = 8.0f;
+    inline static const Color PIN_COLOR = Color(0.9f, 0.2f, 0.2f);
 
     // Map state
     double centerLat_ = 35.68;  // Tokyo default
@@ -437,6 +416,14 @@ private:
     };
     vector<Pin> pins_;
 
+    // Pin cluster (for grid-based clustering)
+    struct Cluster {
+        float cx, cy;      // average screen position
+        int count;
+        int firstPinIdx;   // index into pins_ for single-pin click
+    };
+    vector<Cluster> lastClusters_;
+
     // Drag state
     bool dragging_ = false;
     Vec2 dragStart_;
@@ -463,6 +450,86 @@ private:
     thread tileThread_;
     atomic<bool> tileThreadRunning_{false};
     atomic<bool> tileThreadStop_{false};
+
+    // --- Pin clustering and drawing ---
+
+    static constexpr float CLUSTER_CELL = 24.0f;  // grid cell size in pixels
+
+    void drawPins(float left, float top, float w, float h) {
+        // Build grid-based clusters
+        std::map<pair<int,int>, Cluster> grid;
+
+        for (size_t i = 0; i < pins_.size(); i++) {
+            auto px = latLonToPixel(pins_[i].lat, pins_[i].lon, zoom_);
+            float sx = px.x - left;
+            float sy = px.y - top;
+
+            // Skip off screen
+            if (sx < -CLUSTER_CELL || sx > w + CLUSTER_CELL ||
+                sy < -CLUSTER_CELL || sy > h + CLUSTER_CELL) continue;
+
+            int gx = (int)floor(sx / CLUSTER_CELL);
+            int gy = (int)floor(sy / CLUSTER_CELL);
+            auto key = make_pair(gx, gy);
+            auto it = grid.find(key);
+            if (it == grid.end()) {
+                grid[key] = {sx, sy, 1, (int)i};
+            } else {
+                // Running average position
+                auto& c = it->second;
+                c.cx = (c.cx * c.count + sx) / (c.count + 1);
+                c.cy = (c.cy * c.count + sy) / (c.count + 1);
+                c.count++;
+            }
+        }
+
+        // Draw clusters
+        for (const auto& [key, cluster] : grid) {
+            float sx = cluster.cx;
+            float sy = cluster.cy;
+
+            // Radius: small for <=99, step up per digit count
+            float r = PIN_RADIUS;
+            string label;
+            if (cluster.count >= 1000) {
+                r = PIN_RADIUS + 6;  // "1k" etc
+                label = format("{:.0f}k", cluster.count / 1000.0f);
+            } else if (cluster.count >= 100) {
+                r = PIN_RADIUS + 4;  // 3 digits
+                label = to_string(cluster.count);
+            } else if (cluster.count > 1) {
+                label = to_string(cluster.count);
+            }
+
+            // Shadow
+            setColor(0.0f, 0.0f, 0.0f, 0.3f);
+            fill();
+            drawCircle(sx + 1, sy + 1, r);
+
+            // Body
+            setColor(PIN_COLOR);
+            fill();
+            drawCircle(sx, sy, r);
+
+            if (cluster.count == 1) {
+                // Center dot for single pin
+                setColor(1.0f, 1.0f, 1.0f);
+                fill();
+                drawCircle(sx, sy, 3);
+            } else {
+                // Count label
+                setColor(1.0f, 1.0f, 1.0f);
+                fontSmall_.drawString(label, sx, sy + 2,
+                    Direction::Center, Direction::Center);
+            }
+        }
+
+        // Store clusters for hit testing
+        lastClusters_.clear();
+        for (const auto& [key, cluster] : grid) {
+            lastClusters_.push_back(cluster);
+        }
+    }
 
     // --- Mercator projection ---
 
