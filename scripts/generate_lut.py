@@ -43,7 +43,7 @@ def process_raw(raw_path: Path) -> np.ndarray:
             output_color=rawpy.ColorSpace.sRGB,
             output_bps=8,
             no_auto_bright=False,
-            # half_size=False for full quality
+            user_flip=0,  # no EXIF rotation - match embedded preview orientation
         )
     return rgb
 
@@ -99,7 +99,12 @@ def align_images(src: np.ndarray, target: np.ndarray) -> tuple:
 
 
 def build_3d_lut(src: np.ndarray, target: np.ndarray, lut_size: int = 33) -> np.ndarray:
-    """Build a 3D LUT from source→target pixel correspondence.
+    """Build a 3D LUT using per-channel tone curves + 3x3 color matrix.
+
+    Two-stage approach for robustness:
+      1. Fit a 3x3 color matrix via least-squares (cross-channel color shifts)
+      2. Build per-channel 1D tone curves from residuals (tone/contrast)
+      3. Combine into a 3D LUT
 
     Args:
         src: Source image (RAW rendered) as float32 [0,1], shape (H, W, 3)
@@ -109,78 +114,69 @@ def build_3d_lut(src: np.ndarray, target: np.ndarray, lut_size: int = 33) -> np.
     Returns:
         3D LUT array of shape (lut_size, lut_size, lut_size, 3)
     """
-    # Flatten pixels
-    src_flat = src.reshape(-1, 3)    # (N, 3)
-    tgt_flat = target.reshape(-1, 3)  # (N, 3)
+    src_flat = src.reshape(-1, 3)
+    tgt_flat = target.reshape(-1, 3)
 
-    # Initialize LUT accumulation
-    lut_sum = np.zeros((lut_size, lut_size, lut_size, 3), dtype=np.float64)
-    lut_count = np.zeros((lut_size, lut_size, lut_size), dtype=np.float64)
+    # Subsample for matrix fitting (full image is too large)
+    n = src_flat.shape[0]
+    step = max(1, n // 500000)
+    src_sub = src_flat[::step]
+    tgt_sub = tgt_flat[::step]
 
-    # Quantize source pixels to LUT grid indices
-    # Each source pixel (r,g,b) maps to a cell in the LUT
+    # Stage 1: Fit 3x3 color matrix (least squares: tgt = src @ M.T)
+    # Solve: M = (src^T src)^-1 src^T tgt
+    M, _, _, _ = np.linalg.lstsq(src_sub, tgt_sub, rcond=None)
+    print(f"    Color matrix:\n{M}")
+
+    # Stage 2: Per-channel 1D tone curves on the residual
+    # Apply matrix to source, then build 1D curves for remaining correction
+    src_corrected = src_flat @ M
+    src_corrected = np.clip(src_corrected, 0, 1)
+
     scale = lut_size - 1
-    indices = np.clip(src_flat * scale, 0, scale).astype(np.int32)
+    curves = np.zeros((3, lut_size), dtype=np.float64)
+    counts = np.zeros((3, lut_size), dtype=np.float64)
 
-    # Accumulate target values per LUT cell
-    # Use np.add.at for unbuffered accumulation
-    ri, gi, bi = indices[:, 0], indices[:, 1], indices[:, 2]
-    np.add.at(lut_sum, (ri, gi, bi), tgt_flat)
-    np.add.at(lut_count, (ri, gi, bi), 1)
+    for ch in range(3):
+        idx = np.clip((src_corrected[:, ch] * scale).astype(np.int32), 0, int(scale))
+        np.add.at(curves[ch], idx, tgt_flat[:, ch])
+        np.add.at(counts[ch], idx, 1)
 
-    # Average
-    mask = lut_count > 0
-    for c in range(3):
-        lut_sum[:, :, :, c][mask] /= lut_count[mask]
+    # Average and fill empty bins with identity
+    for ch in range(3):
+        for i in range(lut_size):
+            if counts[ch, i] > 0:
+                curves[ch, i] /= counts[ch, i]
+            else:
+                curves[ch, i] = i / scale
 
-    # For cells with no samples, use identity (input = output)
-    # Create identity LUT
-    identity = np.zeros((lut_size, lut_size, lut_size, 3), dtype=np.float64)
-    for r in range(lut_size):
-        for g in range(lut_size):
-            for b in range(lut_size):
-                identity[r, g, b] = [r / scale, g / scale, b / scale]
+    # Enforce monotonicity
+    for ch in range(3):
+        for i in range(1, lut_size):
+            if curves[ch, i] < curves[ch, i - 1]:
+                curves[ch, i] = curves[ch, i - 1]
 
-    # Fill empty cells with identity
-    empty = ~mask
-    lut_sum[empty] = identity[empty]
+    # Stage 3: Combine into 3D LUT
+    # For each input (r,g,b): apply matrix, then look up tone curves
+    lut = np.zeros((lut_size, lut_size, lut_size, 3), dtype=np.float32)
+    for ri in range(lut_size):
+        for gi in range(lut_size):
+            for bi in range(lut_size):
+                rgb_in = np.array([ri / scale, gi / scale, bi / scale])
+                # Apply color matrix
+                rgb_mat = rgb_in @ M
+                rgb_mat = np.clip(rgb_mat, 0, 1)
+                # Apply per-channel tone curves (linear interpolation)
+                out = np.zeros(3)
+                for ch in range(3):
+                    v = rgb_mat[ch] * scale
+                    lo = int(v)
+                    hi = min(lo + 1, int(scale))
+                    frac = v - lo
+                    out[ch] = curves[ch, lo] * (1 - frac) + curves[ch, hi] * frac
+                lut[ri, gi, bi] = np.clip(out, 0, 1)
 
-    # Smooth the LUT to reduce noise from sparse sampling
-    lut = smooth_lut(lut_sum, lut_count, iterations=3)
-
-    return lut.astype(np.float32)
-
-
-def smooth_lut(lut: np.ndarray, counts: np.ndarray, iterations: int = 3) -> np.ndarray:
-    """Smooth LUT using iterative averaging, weighted by sample count.
-    Cells with many samples keep their values; empty/sparse cells
-    are filled by averaging neighbors."""
-    size = lut.shape[0]
-    result = lut.copy()
-
-    # Weight: high for well-sampled cells, low for sparse
-    weight = np.minimum(counts / max(counts.max(), 1) * 10, 1.0)
-
-    for _ in range(iterations):
-        smoothed = result.copy()
-        for r in range(size):
-            for g in range(size):
-                for b in range(size):
-                    if weight[r, g, b] > 0.8:
-                        continue  # well-sampled, keep as is
-
-                    # Average of existing value + 6 neighbors
-                    total = result[r, g, b].copy()
-                    n = 1.0
-                    for dr, dg, db in [(-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1)]:
-                        nr, ng, nb = r+dr, g+dg, b+db
-                        if 0 <= nr < size and 0 <= ng < size and 0 <= nb < size:
-                            total += result[nr, ng, nb]
-                            n += 1.0
-                    smoothed[r, g, b] = total / n
-                result = smoothed
-
-    return result
+    return lut
 
 
 def write_cube(lut: np.ndarray, output_path: Path, title: str = ""):
@@ -194,10 +190,10 @@ def write_cube(lut: np.ndarray, output_path: Path, title: str = ""):
         f.write(f'DOMAIN_MAX 1.0 1.0 1.0\n')
         f.write('\n')
 
-        # .cube format: B changes fastest, then G, then R
-        for r in range(size):
+        # .cube format: R changes fastest, then G, then B (slowest)
+        for b in range(size):
             for g in range(size):
-                for b in range(size):
+                for r in range(size):
                     val = lut[r, g, b]
                     f.write(f'{val[0]:.6f} {val[1]:.6f} {val[2]:.6f}\n')
 
