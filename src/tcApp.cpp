@@ -748,6 +748,20 @@ void tcApp::keyPressed(int key) {
             updateLayout();
         }
 
+        if ((key == 'O' || key == 'o') && viewManager_->previousView() == ViewMode::People) {
+            // O: go back to People view (with state restore)
+            viewManager_->goBack();
+            leftPaneWidth_ = 0;
+            leftTween_.finish();
+            if (metadataPanel_) {
+                metadataPanel_->clearViewInfo();
+                metadataPanel_->clearThumbnail();
+            }
+            updateLayout();
+            redraw();
+            return;
+        }
+
         if (key == 'V' || key == 'v') {
             string photoId = singleView->currentPhotoId();
             if (!photoId.empty() && singleView->hasEmbedding()) {
