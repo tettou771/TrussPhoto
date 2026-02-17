@@ -34,6 +34,7 @@ public:
                 pins_.push_back({photos[i].latitude, photos[i].longitude, (int)i, ids[i]});
             }
         }
+        clusterZoom_ = -999;  // invalidate cluster cache
     }
 
     // Set tile disk cache directory
@@ -255,13 +256,21 @@ public:
     bool onMousePress(Vec2 pos, int button) override {
         if (button != 0) return false;
 
-        // Hit test against cached clusters (much faster than iterating all pins)
-        for (const auto& cluster : lastClusters_) {
+        // Hit test against cached clusters (world coords → screen coords)
+        double qZoom = quantizeZoom(zoom_);
+        double sf = pow(2.0, zoom_ - qZoom);
+        auto centerPxQ = latLonToPixel(centerLat_, centerLon_, qZoom);
+        float qLeft = centerPxQ.x * (float)sf - getWidth() / 2.0f;
+        float qTop  = centerPxQ.y * (float)sf - getHeight() / 2.0f;
+
+        for (const auto& cluster : cachedClusters_) {
+            float sx = cluster.wx * (float)sf - qLeft;
+            float sy = cluster.wy * (float)sf - qTop;
             float r = PIN_RADIUS;
             if (cluster.count >= 1000) r = PIN_RADIUS + 6;
             else if (cluster.count >= 100) r = PIN_RADIUS + 4;
-            float dx = pos.x - cluster.cx;
-            float dy = pos.y - cluster.cy;
+            float dx = pos.x - sx;
+            float dy = pos.y - sy;
             if (dx * dx + dy * dy > r * r) continue;
 
             if (cluster.count == 1) {
@@ -279,16 +288,9 @@ public:
                     onPinClick(pin.photoIndex, pin.photoId);
                 }
             } else {
-                // Cluster: zoom in to cluster center
-                auto [lat, lon] = pixelToLatLon(
-                    cluster.cx + (latLonToPixel(centerLat_, centerLon_, zoom_).x - getWidth() / 2.0f),
-                    cluster.cy + (latLonToPixel(centerLat_, centerLon_, zoom_).y - getHeight() / 2.0f),
-                    zoom_);
-                centerLat_ = clamp(lat, -85.0, 85.0);
-                centerLon_ = lon;
-                zoom_ = min(zoom_ + 2.0, 19.0);
-                evictOldTiles();
-                if (onRedraw) onRedraw();
+                // Cluster: show first pin's metadata
+                auto& pin = pins_[cluster.firstPinIdx];
+                if (onPinClick) onPinClick(pin.photoIndex, pin.photoId);
             }
             return true;
         }
@@ -416,13 +418,14 @@ private:
     };
     vector<Pin> pins_;
 
-    // Pin cluster (for grid-based clustering)
+    // Pin cluster (for grid-based clustering in world coordinates)
     struct Cluster {
-        float cx, cy;      // average screen position
+        float wx, wy;      // average world pixel position (stable across pans)
         int count;
         int firstPinIdx;   // index into pins_ for single-pin click
     };
-    vector<Cluster> lastClusters_;
+    vector<Cluster> cachedClusters_;
+    double clusterZoom_ = -999;  // quantized zoom at which clusters were computed
 
     // Drag state
     bool dragging_ = false;
@@ -453,49 +456,77 @@ private:
 
     // --- Pin clustering and drawing ---
 
-    static constexpr float CLUSTER_CELL = 24.0f;  // grid cell size in pixels
+    static constexpr float CLUSTER_CELL = 24.0f;  // grid cell size in world pixels
+    static constexpr double CLUSTER_ZOOM_STEP = 0.2;  // quantization step
 
-    void drawPins(float left, float top, float w, float h) {
-        // Build grid-based clusters
+    // Quantize zoom to 0.2 steps
+    static double quantizeZoom(double z) {
+        return floor(z / CLUSTER_ZOOM_STEP) * CLUSTER_ZOOM_STEP;
+    }
+
+    void rebuildClusters(double qZoom) {
+        cachedClusters_.clear();
+        clusterZoom_ = qZoom;
+
         std::map<pair<int,int>, Cluster> grid;
 
         for (size_t i = 0; i < pins_.size(); i++) {
-            auto px = latLonToPixel(pins_[i].lat, pins_[i].lon, zoom_);
-            float sx = px.x - left;
-            float sy = px.y - top;
+            auto px = latLonToPixel(pins_[i].lat, pins_[i].lon, qZoom);
+            float wx = px.x;
+            float wy = px.y;
 
-            // Skip off screen
-            if (sx < -CLUSTER_CELL || sx > w + CLUSTER_CELL ||
-                sy < -CLUSTER_CELL || sy > h + CLUSTER_CELL) continue;
-
-            int gx = (int)floor(sx / CLUSTER_CELL);
-            int gy = (int)floor(sy / CLUSTER_CELL);
+            // Grid in world pixel coords (anchored to map, not viewport)
+            int gx = (int)floor(wx / CLUSTER_CELL);
+            int gy = (int)floor(wy / CLUSTER_CELL);
             auto key = make_pair(gx, gy);
             auto it = grid.find(key);
             if (it == grid.end()) {
-                grid[key] = {sx, sy, 1, (int)i};
+                grid[key] = {wx, wy, 1, (int)i};
             } else {
-                // Running average position
                 auto& c = it->second;
-                c.cx = (c.cx * c.count + sx) / (c.count + 1);
-                c.cy = (c.cy * c.count + sy) / (c.count + 1);
+                c.wx = (c.wx * c.count + wx) / (c.count + 1);
+                c.wy = (c.wy * c.count + wy) / (c.count + 1);
                 c.count++;
             }
         }
 
-        // Draw clusters
+        cachedClusters_.reserve(grid.size());
         for (const auto& [key, cluster] : grid) {
-            float sx = cluster.cx;
-            float sy = cluster.cy;
+            cachedClusters_.push_back(cluster);
+        }
+    }
+
+    void drawPins(float left, float top, float w, float h) {
+        // Rebuild clusters only when quantized zoom changes
+        double qZoom = quantizeZoom(zoom_);
+        if (qZoom != clusterZoom_) {
+            rebuildClusters(qZoom);
+        }
+
+        // Scale factor: cached clusters are at qZoom, display is at zoom_
+        double scaleFactor = pow(2.0, zoom_ - qZoom);
+
+        // Viewport center in qZoom world coords
+        auto centerPxQ = latLonToPixel(centerLat_, centerLon_, qZoom);
+        float qLeft = centerPxQ.x * (float)scaleFactor - w / 2.0f;
+        float qTop  = centerPxQ.y * (float)scaleFactor - h / 2.0f;
+
+        // Draw cached clusters, converting world→screen
+        for (const auto& cluster : cachedClusters_) {
+            float sx = cluster.wx * (float)scaleFactor - qLeft;
+            float sy = cluster.wy * (float)scaleFactor - qTop;
+
+            // Skip off screen
+            if (sx < -30 || sx > w + 30 || sy < -30 || sy > h + 30) continue;
 
             // Radius: small for <=99, step up per digit count
             float r = PIN_RADIUS;
             string label;
             if (cluster.count >= 1000) {
-                r = PIN_RADIUS + 6;  // "1k" etc
+                r = PIN_RADIUS + 6;
                 label = format("{:.0f}k", cluster.count / 1000.0f);
             } else if (cluster.count >= 100) {
-                r = PIN_RADIUS + 4;  // 3 digits
+                r = PIN_RADIUS + 4;
                 label = to_string(cluster.count);
             } else if (cluster.count > 1) {
                 label = to_string(cluster.count);
@@ -512,22 +543,14 @@ private:
             drawCircle(sx, sy, r);
 
             if (cluster.count == 1) {
-                // Center dot for single pin
                 setColor(1.0f, 1.0f, 1.0f);
                 fill();
                 drawCircle(sx, sy, 3);
             } else {
-                // Count label
                 setColor(1.0f, 1.0f, 1.0f);
                 fontSmall_.drawString(label, sx, sy + 2,
                     Direction::Center, Direction::Center);
             }
-        }
-
-        // Store clusters for hit testing
-        lastClusters_.clear();
-        for (const auto& [key, cluster] : grid) {
-            lastClusters_.push_back(cluster);
         }
     }
 
