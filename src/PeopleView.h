@@ -82,6 +82,9 @@ public:
         pendingClickDataIdx_ = -1;
         clusteringDone_ = false;
         galleryVisible_ = false;
+        maxFaces_ = 1000;
+        hasMoreFaces_ = false;
+        totalUnnamedFaces_ = 0;
 
         // Clear previous state
         if (galleryRecycler_) {
@@ -90,29 +93,24 @@ public:
         }
         clusters_.clear();
 
-        // Run DB load + clustering in background thread
-        if (clusterThread_.joinable()) clusterThread_.join();
-        clusterThread_ = thread([this]() {
-            logNotice() << "[PeopleView] Loading face data from DB...";
-            auto input = provider_->loadFaceClusterData();
-            logNotice() << "[PeopleView] Loaded " << input.allFaces.size()
-                        << " faces, clustering...";
-            auto result = PhotoProvider::clusterFaces(
-                input.allFaces, input.personNames);
-            {
-                lock_guard<mutex> lock(clusterMutex_);
-                pendingClusters_ = std::move(result);
-            }
-            clusteringDone_ = true;
-        });
+        runClustering();
+    }
+
+    void loadMore() {
+        maxFaces_ += 200;
+        runClustering();
     }
 
     void update() override {
-        // Process deferred card click -> show gallery
+        // Process deferred card click -> show gallery or name edit
         if (pendingClickDataIdx_ >= 0) {
             int idx = pendingClickDataIdx_;
             pendingClickDataIdx_ = -1;
-            showGallery(idx);
+            if (idx == selectedDataIdx_ && !isNameEditing()) {
+                startNameEdit(idx);  // Re-click selected card -> name edit
+            } else {
+                showGallery(idx);
+            }
         }
 
         // Process deferred face click (from GalleryRecycler)
@@ -127,7 +125,9 @@ public:
             clusteringDone_ = false;
             {
                 lock_guard<mutex> lock(clusterMutex_);
-                clusters_ = std::move(pendingClusters_);
+                clusters_ = std::move(pendingClusterResult_.clusters);
+                totalUnnamedFaces_ = pendingClusterResult_.totalUnnamed;
+                hasMoreFaces_ = pendingClusterResult_.processedUnnamed < pendingClusterResult_.totalUnnamed;
             }
             needsRebuild_ = true;
             if (onRedraw) onRedraw();
@@ -231,14 +231,17 @@ public:
         // Status bar at bottom
         setColor(0, 0, 0, 0.5f);
         fill();
-        drawRect(8, h - 28, 200, 20);
+        drawRect(8, h - 28, 300, 20);
         setColor(0.7f, 0.7f, 0.75f);
         int namedCount = 0, unnamedCount = 0;
         for (auto& c : clusters_) {
             if (c.personId > 0) namedCount++; else unnamedCount++;
         }
-        fontSmall_.drawString(
-            format("People  {} named, {} clusters", namedCount, unnamedCount),
+        string statusText = format("People  {} named, {} clusters", namedCount, unnamedCount);
+        if (hasMoreFaces_) {
+            statusText += format("  ({}/{} unnamed loaded)", maxFaces_, totalUnnamedFaces_);
+        }
+        fontSmall_.drawString(statusText,
             14, h - 18, Direction::Left, Direction::Center);
     }
 
@@ -320,10 +323,15 @@ private:
     vector<PhotoProvider::FaceCluster> clusters_;
     bool needsRebuild_ = false;
 
+    // Incremental clustering
+    int maxFaces_ = 1000;
+    bool hasMoreFaces_ = false;
+    int totalUnnamedFaces_ = 0;
+
     // Background clustering
     thread clusterThread_;
     mutex clusterMutex_;
-    vector<PhotoProvider::FaceCluster> pendingClusters_;
+    PhotoProvider::ClusterResult pendingClusterResult_;
     atomic<bool> clusteringDone_{false};
 
     // UI fonts
@@ -407,6 +415,8 @@ private:
 
         PhotoProvider::FaceCluster cluster;
         bool selected = false;
+        bool isLoadMoreButton = false;
+        string loadMoreText;
 
         // Borrowed pointers
         Texture* textureRef = nullptr;
@@ -455,6 +465,20 @@ private:
 
         void draw() override {
             float w = getWidth(), h = getHeight();
+
+            // "Load more" button mode
+            if (isLoadMoreButton) {
+                setColor(0.15f, 0.18f, 0.22f);
+                fill();
+                drawRect(0, 0, w, h);
+                setColor(0.35f, 0.5f, 0.7f);
+                noFill();
+                drawRect(0, 0, w, h);
+                setColor(0.5f, 0.7f, 0.95f);
+                if (fontRef) fontRef->drawString(loadMoreText, w / 2, h / 2,
+                    Direction::Center, Direction::Center);
+                return;
+            }
 
             // Background
             if (selected) {
@@ -669,7 +693,7 @@ private:
             placeholder = placeholderText;
             ime_.clear();
             if (!initialText.empty()) {
-                // IME doesn't have a setText, so we just show placeholder
+                ime_.setString(initialText);
             }
             ime_.enable();
             setActive(true);
@@ -782,6 +806,9 @@ private:
         vector<const PhotoProvider::FaceCluster*> items;
         int namedCount = 0;
         int selectedIdx = -1;
+        bool hasMore = false;
+        int remainingCount = 0;
+        function<void()> onLoadMore;
 
         void setData(const vector<const PhotoProvider::FaceCluster*>& newItems, int named) {
             items = newItems;
@@ -793,7 +820,9 @@ private:
         }
 
     protected:
-        int getDataCount() const override { return (int)items.size(); }
+        int getDataCount() const override {
+            return (int)items.size() + (hasMore ? 1 : 0);
+        }
 
         ItemPtr createPoolItem(int poolIdx) override {
             auto card = make_shared<PersonCard>();
@@ -804,13 +833,33 @@ private:
             int pi = poolIdx;
             card->onClick = [this, pi]() {
                 int dataIdx = getReverseMap()[pi];
-                if (dataIdx >= 0 && onCardClick) onCardClick(dataIdx);
+                if (dataIdx >= 0) {
+                    // "Load more" button is the last item
+                    if (hasMore && dataIdx == (int)items.size()) {
+                        if (onLoadMore) onLoadMore();
+                    } else if (onCardClick) {
+                        onCardClick(dataIdx);
+                    }
+                }
             };
 
             return card;
         }
 
         void onBind(int dataIdx, ItemPtr& item) override {
+            // "Load more" button
+            if (hasMore && dataIdx == (int)items.size()) {
+                item->isLoadMoreButton = true;
+                item->loadMoreText = format("Load more ({} remaining)", remainingCount);
+                item->textureRef = nullptr;
+                item->selected = false;
+                if (item->nameLabel) item->nameLabel->setActive(false);
+                return;
+            }
+
+            item->isLoadMoreButton = false;
+            if (item->nameLabel) item->nameLabel->setActive(true);
+
             if (dataIdx >= (int)items.size()) return;
             auto* cluster = items[dataIdx];
             bool sel = (dataIdx == selectedIdx);
@@ -827,6 +876,7 @@ private:
         void onUnbind(int dataIdx, ItemPtr& item) override {
             (void)dataIdx;
             item->textureRef = nullptr;
+            item->isLoadMoreButton = false;
         }
 
         // Section-aware layout
@@ -850,16 +900,26 @@ private:
                 h += PADDING;
             }
             int unnamedCount = (int)items.size() - namedCount;
-            if (unnamedCount > 0) {
+            if (unnamedCount > 0 || hasMore) {
                 h += SECTION_HEADER_HEIGHT + CARD_SPACING;
                 int rows = (unnamedCount + columns_ - 1) / columns_;
                 h += rows * (CARD_HEIGHT + CARD_SPACING);
+                // "Load more" button row
+                if (hasMore) h += CARD_HEIGHT + CARD_SPACING;
                 h += PADDING;
             }
             return h;
         }
 
         Vec2 getItemPosition(int dataIdx) override {
+            // "Load more" button: full-width centered below unnamed cards
+            if (hasMore && dataIdx == (int)items.size()) {
+                int unnamedCount = (int)items.size() - namedCount;
+                int unnamedRows = (unnamedCount > 0) ? (unnamedCount + columns_ - 1) / columns_ : 0;
+                float y = unnamedStartY_ + unnamedRows * (CARD_HEIGHT + CARD_SPACING);
+                return {PADDING, y};
+            }
+
             int col, row;
             float baseY;
             if (dataIdx < namedCount) {
@@ -894,17 +954,26 @@ private:
                     endIdx = max(endIdx, min((r1 + 1) * columns_, namedCount));
                 }
             }
-            // Unnamed section
+            // Unnamed section (including Load more button)
             int unnamedCount = (int)items.size() - namedCount;
-            if (unnamedCount > 0) {
-                int rows = (unnamedCount + columns_ - 1) / columns_;
+            int unnamedDataCount = unnamedCount + (hasMore ? 1 : 0);
+            if (unnamedDataCount > 0) {
+                int unnamedRows = (unnamedCount + columns_ - 1) / columns_;
+                int totalRows = unnamedRows + (hasMore ? 1 : 0);
                 float top = unnamedStartY_;
-                float bot = top + rows * (CARD_HEIGHT + CARD_SPACING);
+                float bot = top + totalRows * (CARD_HEIGHT + CARD_SPACING);
                 if (bot > viewTop && top < viewBottom) {
                     int r0 = max(0, (int)((viewTop - top) / (CARD_HEIGHT + CARD_SPACING)));
-                    int r1 = min(rows - 1, (int)((viewBottom - top) / (CARD_HEIGHT + CARD_SPACING)));
-                    startIdx = min(startIdx, namedCount + r0 * columns_);
-                    endIdx = max(endIdx, namedCount + min((r1 + 1) * columns_, unnamedCount));
+                    int r1 = min(totalRows - 1, (int)((viewBottom - top) / (CARD_HEIGHT + CARD_SPACING)));
+                    // Map rows to data indices
+                    int s = namedCount + r0 * columns_;
+                    int e = namedCount + min((r1 + 1) * columns_, unnamedCount);
+                    // If Load more button row is visible, include it
+                    if (hasMore && r1 >= unnamedRows) {
+                        e = max(e, (int)items.size() + 1);
+                    }
+                    startIdx = min(startIdx, s);
+                    endIdx = max(endIdx, e);
                 }
             }
             if (endIdx <= startIdx) return {0, 0};
@@ -1179,6 +1248,10 @@ private:
         if (cardRecycler_) {
             cardRecycler_->setData(cardItems_, namedCount_);
             cardRecycler_->selectedIdx = selectedDataIdx_;
+            cardRecycler_->hasMore = hasMoreFaces_;
+            cardRecycler_->remainingCount = totalUnnamedFaces_ - maxFaces_;
+            if (cardRecycler_->remainingCount < 0) cardRecycler_->remainingCount = 0;
+            cardRecycler_->onLoadMore = [this]() { loadMore(); };
             cardRecycler_->resetScroll();
             cardRecycler_->rebuild();
         }
@@ -1422,7 +1495,10 @@ private:
         hideNameOverlay();
 
         // Rebuild clusters
-        clusters_ = provider_->buildFaceClusters();
+        auto cr = provider_->buildFaceClusters(0.60f, maxFaces_);
+        clusters_ = std::move(cr.clusters);
+        totalUnnamedFaces_ = cr.totalUnnamed;
+        hasMoreFaces_ = cr.processedUnnamed < cr.totalUnnamed;
         galleryVisible_ = false;
         if (galleryRecycler_) {
             galleryRecycler_->unbindAll();
@@ -1431,6 +1507,22 @@ private:
         }
         selectedDataIdx_ = -1;
         rebuildUI();
+    }
+
+    void startNameEdit(int dataIdx) {
+        if (dataIdx < 0 || dataIdx >= (int)cardItems_.size()) return;
+        auto* cluster = cardItems_[dataIdx];
+        editingClusterId_ = cluster->clusterId;
+        string initial = cluster->name;
+        // For unnamed clusters, preset suggested name (without "?")
+        if (initial.empty()) initial = cluster->suggestedName;
+        string placeholder = cluster->suggestedName;
+        if (nameOverlay_) {
+            nameOverlay_->setPos(0, 0);
+            nameOverlay_->setSize(getWidth(), getHeight());
+            nameOverlay_->show(initial, placeholder);
+        }
+        if (onRedraw) onRedraw();
     }
 
     void hideNameOverlay() {
@@ -1461,6 +1553,25 @@ private:
                 ++it;
             }
         }
+    }
+
+    void runClustering() {
+        // Run DB load + clustering in background thread
+        if (clusterThread_.joinable()) clusterThread_.join();
+        int mf = maxFaces_;
+        clusterThread_ = thread([this, mf]() {
+            logNotice() << "[PeopleView] Loading face data from DB...";
+            auto input = provider_->loadFaceClusterData();
+            logNotice() << "[PeopleView] Loaded " << input.allFaces.size()
+                        << " faces, clustering (maxFaces=" << mf << ")...";
+            auto result = PhotoProvider::clusterFaces(
+                input.allFaces, input.personNames, 0.60f, mf);
+            {
+                lock_guard<mutex> lock(clusterMutex_);
+                pendingClusterResult_ = std::move(result);
+            }
+            clusteringDone_ = true;
+        });
     }
 
     void queueMissingThumbnails(const unordered_set<string>& neededIds) {

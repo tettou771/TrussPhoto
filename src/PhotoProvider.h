@@ -976,6 +976,12 @@ public:
         float repFaceX = 0, repFaceY = 0, repFaceW = 0, repFaceH = 0;  // rep face bbox
     };
 
+    struct ClusterResult {
+        vector<FaceCluster> clusters;
+        int processedUnnamed = 0;    // number of unnamed faces actually clustered
+        int totalUnnamed = 0;        // total unnamed faces in DB
+    };
+
     // Pre-load face data from DB (call on main thread, returns data for clustering)
     struct FaceClusterInput {
         vector<PhotoDatabase::FaceInfo> allFaces;
@@ -990,10 +996,12 @@ public:
     }
 
     // Build clusters from pre-loaded data (thread-safe: no DB access)
-    static vector<FaceCluster> clusterFaces(
+    // maxFaces: limit unnamed faces to process (0 = unlimited)
+    static ClusterResult clusterFaces(
             const vector<PhotoDatabase::FaceInfo>& allFaces,
             const unordered_map<int, string>& personNames,
-            float threshold = 0.60f) {
+            float threshold = 0.60f,
+            int maxFaces = 0) {
         if (allFaces.empty()) return {};
 
         // Step 1: Group named faces by person_id
@@ -1007,6 +1015,14 @@ public:
                 unnamedIndices.push_back(i);
             }
         }
+
+        int totalUnnamed = (int)unnamedIndices.size();
+
+        // Limit unnamed faces if maxFaces specified
+        if (maxFaces > 0 && (int)unnamedIndices.size() > maxFaces) {
+            unnamedIndices.resize(maxFaces);
+        }
+        int processedUnnamed = (int)unnamedIndices.size();
 
         vector<FaceCluster> clusters;
 
@@ -1063,7 +1079,7 @@ public:
              });
 
         // Step 3: Greedy centroid clustering for unnamed faces
-        // Use projection-sorted windowed approach for O(n * W) instead of O(n²)
+        // Full pairwise for small counts, windowed for large
         static constexpr int CLUSTER_WINDOW = 600;
 
         int nextClusterId = -1;
@@ -1107,8 +1123,10 @@ public:
             // sortedOrder[i] = original index into unnamedIndices
             // We need assigned to track by sorted position
 
+            // Use full pairwise for small counts (<=1000), windowed for large
+            int window = (unnamedCount <= 1000) ? unnamedCount : CLUSTER_WINDOW;
             logNotice() << "[Clustering] " << unnamedCount
-                        << " unnamed faces, window=" << CLUSTER_WINDOW;
+                        << " unnamed faces, window=" << window;
 
             int assignedCount = 0;
             for (int si = 0; si < unnamedCount; si++) {
@@ -1124,7 +1142,7 @@ public:
                 assignedCount++;
 
                 // Only check within the window in sorted order
-                int windowEnd = min(si + CLUSTER_WINDOW, unnamedCount);
+                int windowEnd = min(si + window, unnamedCount);
                 for (int sj = si + 1; sj < windowEnd; sj++) {
                     int origJ = sortedOrder[sj];
                     if (assigned[origJ]) continue;
@@ -1204,14 +1222,15 @@ public:
         logNotice() << "[Clustering] " << clusters.size() << " clusters ("
                     << namedGroups.size() << " named, "
                     << (clusters.size() - namedGroups.size()) << " unnamed) from "
-                    << allFaces.size() << " faces";
-        return clusters;
+                    << allFaces.size() << " faces"
+                    << " [processed " << processedUnnamed << "/" << totalUnnamed << " unnamed]";
+        return {std::move(clusters), processedUnnamed, totalUnnamed};
     }
 
     // Convenience: load data + cluster in one call (main thread only)
-    vector<FaceCluster> buildFaceClusters(float threshold = 0.60f) {
+    ClusterResult buildFaceClusters(float threshold = 0.60f, int maxFaces = 0) {
         auto input = loadFaceClusterData();
-        return clusterFaces(input.allFaces, input.personNames, threshold);
+        return clusterFaces(input.allFaces, input.personNames, threshold, maxFaces);
     }
 
     // Assign a name to an unnamed cluster (batch update face person_id)
