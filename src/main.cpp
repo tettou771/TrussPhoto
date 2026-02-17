@@ -14,7 +14,10 @@ int main(int argc, char* argv[]) {
         hs.targetFps = 1;
         return tc::runHeadlessApp<tcApp>(hs);
     } else {
-        // GUI mode
+        // GUI mode — large screens (5K+) can exceed default 64k vertices
+        tc::internal::sglMaxVertices = 262144;  // 256k
+        tc::internal::sglMaxCommands = 65536;   // 64k
+
         tc::WindowSettings settings;
         settings.setHighDpi(true);
         settings.setSize(960, 600);
