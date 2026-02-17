@@ -385,6 +385,14 @@ private:
             nameLabel->setSize(max(1.0f, labelW), max(1.0f, getHeight() - 16));
 
             addChild(nameLabel);
+
+            // Apply already-bound cluster data (onBind runs before setup)
+            if (cluster.personId > 0 || cluster.photoCount > 0) {
+                nameLabel->name = cluster.name;
+                nameLabel->suggestedName = cluster.suggestedName;
+                nameLabel->faceCount = (int)cluster.faceIds.size();
+                nameLabel->photoCount = cluster.photoCount;
+            }
         }
 
         void bindCluster(const PhotoProvider::FaceCluster& c, bool sel) {
