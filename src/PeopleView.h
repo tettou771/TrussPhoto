@@ -81,7 +81,7 @@ public:
 
     void populate(PhotoProvider& provider) {
         provider_ = &provider;
-        editingClusterId_ = -1;
+        editingClusterId_ = INT_MIN;
         selectedDataIdx_ = -1;
         pendingClickDataIdx_ = -1;
         clusteringDone_ = false;
@@ -303,7 +303,7 @@ public:
         pendingLoads_.clear();
         clusters_.clear();
         cardItems_.clear();
-        editingClusterId_ = -1;
+        editingClusterId_ = INT_MIN;
         pendingClickDataIdx_ = -1;
         pendingFaceClickIdx_ = -1;
         lastFaceClickIdx_ = -1;
@@ -394,7 +394,7 @@ private:
     int selectedDataIdx_ = -1;
     int pendingClickDataIdx_ = -1;
     int pendingFaceClickIdx_ = -1;
-    int editingClusterId_ = -1;
+    int editingClusterId_ = INT_MIN;  // sentinel: INT_MIN = not editing
 
     // Face gallery double-click detection
     chrono::steady_clock::time_point lastFaceClickTime_;
@@ -816,6 +816,20 @@ private:
         }
 
         void update() override {
+            // Detect Enter: IME inserts newline → lines_ grows > 1
+            string text = ime_.getString();
+            if (text.find('\n') != string::npos) {
+                // Trim whitespace/newlines
+                auto s = text.find_first_not_of(" \t\n\r");
+                auto e = text.find_last_not_of(" \t\n\r");
+                string trimmed = (s != string::npos) ? text.substr(s, e - s + 1) : "";
+                // Hide immediately to prevent re-firing next frame
+                hide();
+                if (!trimmed.empty() && onConfirm) onConfirm(trimmed);
+                else if (onCancel) onCancel();
+                return;
+            }
+
             bool cursorOn = fmod(getElapsedTimef(), 1.0f) < 0.5f;
             if (cursorOn != lastCursorOn_) {
                 lastCursorOn_ = cursorOn;
@@ -1595,7 +1609,7 @@ private:
     // =========================================================================
 
     void handleNameConfirm(const string& name) {
-        if (editingClusterId_ < 0 || !provider_) return;
+        if (editingClusterId_ == INT_MIN || !provider_) return;
 
         // Find the cluster by ID
         const PhotoProvider::FaceCluster* editCluster = nullptr;
@@ -1606,7 +1620,6 @@ private:
             }
         }
         if (!editCluster) { hideNameOverlay(); return; }
-
         if (editCluster->personId > 0) {
             provider_->renamePerson(editCluster->personId, name);
         } else {
@@ -1646,7 +1659,7 @@ private:
 
     void hideNameOverlay() {
         if (nameOverlay_) nameOverlay_->hide();
-        editingClusterId_ = -1;
+        editingClusterId_ = INT_MIN;
         if (onRedraw) onRedraw();
     }
 
