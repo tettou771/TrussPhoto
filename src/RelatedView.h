@@ -9,6 +9,7 @@
 #include <TrussC.h>
 #include "PhotoProvider.h"
 #include "AsyncImageLoader.h"
+#include "ViewContainer.h"
 #include "FolderTree.h"  // for loadJapaneseFont
 #include <ctime>
 
@@ -17,7 +18,7 @@ using namespace tc;
 
 enum class MatchType { Clip, Gps };
 
-class RelatedView : public RectNode {
+class RelatedView : public ViewContainer {
 public:
     using Ptr = shared_ptr<RelatedView>;
 
@@ -120,6 +121,12 @@ public:
             applyLayout(oldSnapshots, hasOldLayout);
         }
     }
+
+    // ViewContainer lifecycle
+    void beginView(ViewContext& ctx) override { /* center set via setCenter() before activation */ }
+    void endView() override { shutdown(); }
+    bool wantsSearchBar() const override { return false; }
+    bool wantsLeftSidebar() const override { return false; }
 
     void shutdown() {
         fadingOutNodes_.clear();

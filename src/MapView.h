@@ -7,6 +7,7 @@
 #include <TrussC.h>
 #include <tcxCurl.h>
 #include "PhotoEntry.h"
+#include "ViewContainer.h"
 #include "FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
 #include <deque>
 #include <thread>
@@ -21,7 +22,7 @@ using namespace tcx;
 
 namespace fs = std::filesystem;
 
-class MapView : public RectNode {
+class MapView : public ViewContainer {
 public:
     using Ptr = shared_ptr<MapView>;
 
@@ -388,6 +389,12 @@ public:
         }
         return true;
     }
+
+    // ViewContainer lifecycle
+    void beginView(ViewContext& ctx) override { /* pins set via setPhotos() before activation */ }
+    void endView() override { /* keep tile cache, just deactivate */ }
+    bool wantsSearchBar() const override { return false; }
+    bool wantsLeftSidebar() const override { return false; }
 
     // Stop background tile thread
     void shutdown() {

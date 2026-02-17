@@ -12,12 +12,13 @@
 #include <optional>
 #include "PhotoProvider.h"
 #include "RecyclerGrid.h"
+#include "ViewContainer.h"
 #include "FolderTree.h"  // for loadJapaneseFont
 
 using namespace std;
 using namespace tc;
 
-class PeopleView : public RectNode {
+class PeopleView : public ViewContainer {
 public:
     using Ptr = shared_ptr<PeopleView>;
 
@@ -241,8 +242,13 @@ public:
             14, h - 18, Direction::Left, Direction::Center);
     }
 
-    // Check if this view has state that can be restored
-    bool hasState() const { return !clusters_.empty(); }
+    // ViewContainer lifecycle
+    void beginView(ViewContext& ctx) override { /* populated via populate() before activation */ }
+    void endView() override { shutdown(); }
+    void suspendView() override { suspend(); }
+    bool hasState() const override { return !clusters_.empty(); }
+    bool wantsSearchBar() const override { return false; }
+    bool wantsLeftSidebar() const override { return false; }
 
     // Suspend: stop threads but keep data (for temporary exit)
     void suspend() {
