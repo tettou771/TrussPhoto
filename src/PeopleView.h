@@ -13,6 +13,7 @@
 #include "PhotoProvider.h"
 #include "RecyclerGrid.h"
 #include "ViewContainer.h"
+#include "MetadataPanel.h"  // for OverlayRect
 #include "FolderTree.h"  // for loadJapaneseFont
 
 using namespace std;
@@ -26,6 +27,7 @@ public:
     function<void()> onRedraw;
     function<void(const string& photoId)> onFaceSelect;
     function<void(const string& photoId)> onFaceDoubleClick;
+    function<void(const vector<OverlayRect>& overlays)> onOverlayUpdate;
 
     // Modifier key state (set by tcApp)
     bool* cmdDownRef = nullptr;
@@ -1508,6 +1510,9 @@ private:
         const string& photoId = galleryRecycler_->faces[dataIdx].photoId;
         if (onFaceSelect) onFaceSelect(photoId);
 
+        // Send face overlays for the selected photo
+        sendFaceOverlays(photoId);
+
         if (onRedraw) onRedraw();
     }
 
@@ -1631,6 +1636,42 @@ private:
         if (nameOverlay_) nameOverlay_->hide();
         editingClusterId_ = -1;
         if (onRedraw) onRedraw();
+    }
+
+    // =========================================================================
+    // Face overlay on metadata thumbnail
+    // =========================================================================
+
+    void sendFaceOverlays(const string& photoId) {
+        if (!onOverlayUpdate || !galleryRecycler_) return;
+
+        vector<OverlayRect> overlays;
+        for (int di : galleryRecycler_->selectedSet) {
+            if (di < 0 || di >= (int)galleryRecycler_->faces.size()) continue;
+            auto& fb = galleryRecycler_->faces[di];
+            if (fb.photoId != photoId) continue;
+
+            overlays.push_back({
+                fb.x, fb.y, fb.w, fb.h,
+                Color(0.3f, 0.7f, 1.0f, 0.9f),
+                2.0f
+            });
+        }
+
+        // Also show all other faces in same photo as dim outlines
+        for (int i = 0; i < (int)galleryRecycler_->faces.size(); i++) {
+            auto& fb = galleryRecycler_->faces[i];
+            if (fb.photoId != photoId) continue;
+            if (galleryRecycler_->selectedSet.count(i)) continue;  // skip selected
+
+            overlays.push_back({
+                fb.x, fb.y, fb.w, fb.h,
+                Color(0.5f, 0.5f, 0.55f, 0.5f),
+                1.0f
+            });
+        }
+
+        onOverlayUpdate(overlays);
     }
 
     // =========================================================================

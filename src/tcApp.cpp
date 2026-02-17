@@ -241,6 +241,10 @@ void tcApp::setup() {
         }
         redraw();
     };
+    peopleView->onOverlayUpdate = [this](const vector<OverlayRect>& overlays) {
+        if (metadataPanel_) metadataPanel_->setOverlays(overlays);
+        redraw();
+    };
     peopleView->onFaceDoubleClick = [this](const string& photoId) {
         auto g = grid();
         for (int i = 0; i < (int)g->getPhotoIdCount(); i++) {

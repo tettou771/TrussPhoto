@@ -10,6 +10,14 @@
 using namespace std;
 using namespace tc;
 
+// Overlay rectangle for drawing on top of the thumbnail
+// Coordinates are normalized (0-1) relative to the original image dimensions
+struct OverlayRect {
+    float x, y, w, h;  // normalized bbox (0-1)
+    Color color;
+    float lineWidth = 1.0f;
+};
+
 class MetadataPanel : public RectNode {
 public:
     using Ptr = shared_ptr<MetadataPanel>;
@@ -37,6 +45,7 @@ public:
         } else {
             hasPhoto_ = false;
         }
+        overlays_.clear();
         needsRedraw_ = true;
     }
 
@@ -50,6 +59,18 @@ public:
     void clearThumbnail() {
         thumbnail_.clear();
         hasThumbnail_ = false;
+        overlays_.clear();
+        needsRedraw_ = true;
+    }
+
+    // Set overlay rectangles (normalized 0-1 coordinates)
+    void setOverlays(const vector<OverlayRect>& rects) {
+        overlays_ = rects;
+        needsRedraw_ = true;
+    }
+
+    void clearOverlays() {
+        overlays_.clear();
         needsRedraw_ = true;
     }
 
@@ -116,6 +137,9 @@ private:
     // Thumbnail (for map pin preview)
     Texture thumbnail_;
     bool hasThumbnail_ = false;
+
+    // Overlay rectangles on thumbnail
+    vector<OverlayRect> overlays_;
 
     // View info (single view only)
     float viewZoom_ = 1.0f;
@@ -291,6 +315,19 @@ private:
             // Draw thumbnail fitted
             setColor(1.0f, 1.0f, 1.0f);
             thumbnail_.draw(dx, dy, drawW, drawH);
+
+            // Draw overlay rectangles on thumbnail
+            for (const auto& ov : overlays_) {
+                float rx = dx + ov.x * drawW;
+                float ry = dy + ov.y * drawH;
+                float rw = ov.w * drawW;
+                float rh = ov.h * drawH;
+                setColor(ov.color);
+                noFill();
+                for (float i = 0; i < ov.lineWidth; i += 1.0f) {
+                    drawRect(rx - i, ry - i, rw + i * 2, rh + i * 2);
+                }
+            }
 
             y += areaSize + sectionGap_;
         }
