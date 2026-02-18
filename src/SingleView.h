@@ -42,6 +42,7 @@ public:
         profileManager_.setProfileDir(profileDir);
         lutShader_.load();
         lensCorrector_.loadDatabase(lensfunDir);
+        lensCorrector_.loadAliases(lensfunDir + "/lens_aliases.json");
     }
 
     // Check if a profile exists for a given camera/style combo
@@ -98,6 +99,7 @@ public:
                     rawLoadInProgress_ = true;
                     rawLoadCompleted_ = false;
                     rawLoadTargetIndex_ = index;
+                    lensCorrector_.reset();
 
                     if (rawLoadThread_.joinable()) rawLoadThread_.join();
                     rawLoadThread_ = thread([this, index, path, cameraMake, camera, lens, focalLength, aperture]() {
@@ -105,9 +107,13 @@ public:
                         if (RawLoader::loadFloat(path, loadedPixels)) {
                             lock_guard<mutex> lock(rawLoadMutex_);
                             pendingRawPixels_ = std::move(loadedPixels);
-                            if (focalLength > 0 && aperture > 0) {
-                                lensCorrector_.setup(cameraMake, camera, lens, focalLength, aperture,
-                                    pendingRawPixels_.getWidth(), pendingRawPixels_.getHeight());
+                            int pw = pendingRawPixels_.getWidth();
+                            int ph = pendingRawPixels_.getHeight();
+                            // EXIF embedded correction (Sony) > lensfun fallback
+                            if (!lensCorrector_.setupFromExif(path, pw, ph)) {
+                                if (focalLength > 0 && aperture > 0) {
+                                    lensCorrector_.setup(cameraMake, camera, lens, focalLength, aperture, pw, ph);
+                                }
                             }
                             rawLoadCompleted_ = true;
                         }
@@ -156,8 +162,16 @@ public:
                 ctx_->metadataPanel->setPhoto(entry);
                 ctx_->metadataPanel->setStyleProfileStatus(!profileManager_.findProfile(
                     entry->camera, entry->creativeStyle).empty());
-                ctx_->metadataPanel->setViewInfo(zoomLevel_, profileEnabled_, profileBlend_,
-                    hasProfileLut_, lensEnabled_, isSmartPreview_);
+                ctx_->metadataPanel->setViewInfo({
+                    .zoom = zoomLevel_,
+                    .profileEnabled = profileEnabled_,
+                    .profileBlend = profileBlend_,
+                    .hasProfile = hasProfileLut_,
+                    .lensEnabled = lensEnabled_,
+                    .hasLensData = lensCorrector_.isReady(),
+                    .isSmartPreview = isSmartPreview_,
+                    .isExifLens = lensCorrector_.isExifMode(),
+                });
             }
         } else {
             logWarning() << "Failed to load: " << entry->localPath;
@@ -324,7 +338,8 @@ public:
         }
         if (key == 'L' || key == 'l') {
             lensEnabled_ = !lensEnabled_;
-            logNotice() << "[Lensfun] " << (lensEnabled_ ? "ON" : "OFF");
+            logNotice() << "[LensCorrection] " << (lensEnabled_ ? "ON" : "OFF")
+                        << (lensCorrector_.isExifMode() ? " (EXIF)" : " (lensfun)");
             if (selectedIndex_ >= 0 && isRawImage_ && rawPixels_.isAllocated()) {
                 reprocessImage();
             }
@@ -407,8 +422,16 @@ public:
     // Update metadata panel with current view state
     void updateViewInfo() {
         if (ctx_ && ctx_->metadataPanel) {
-            ctx_->metadataPanel->setViewInfo(zoomLevel_, profileEnabled_, profileBlend_,
-                hasProfileLut_, lensEnabled_, isSmartPreview_);
+            ctx_->metadataPanel->setViewInfo({
+                .zoom = zoomLevel_,
+                .profileEnabled = profileEnabled_,
+                .profileBlend = profileBlend_,
+                .hasProfile = hasProfileLut_,
+                .lensEnabled = lensEnabled_,
+                .hasLensData = lensCorrector_.isReady(),
+                .isSmartPreview = isSmartPreview_,
+                .isExifLens = lensCorrector_.isExifMode(),
+            });
         }
     }
 

@@ -18,6 +18,17 @@ struct OverlayRect {
     float lineWidth = 1.0f;
 };
 
+struct ViewInfo {
+    float zoom = 1.0f;
+    bool profileEnabled = false;
+    float profileBlend = 1.0f;
+    bool hasProfile = false;
+    bool lensEnabled = false;
+    bool hasLensData = false;
+    bool isSmartPreview = false;
+    bool isExifLens = false;
+};
+
 class MetadataPanel : public RectNode {
 public:
     using Ptr = shared_ptr<MetadataPanel>;
@@ -82,14 +93,8 @@ public:
     }
 
     // Set single-view info
-    void setViewInfo(float zoom, bool profileEnabled, float profileBlend,
-                     bool hasProfile, bool lensEnabled, bool isSmartPreview) {
-        viewZoom_ = zoom;
-        viewProfileEnabled_ = profileEnabled;
-        viewProfileBlend_ = profileBlend;
-        viewHasProfile_ = hasProfile;
-        viewLensEnabled_ = lensEnabled;
-        viewIsSmartPreview_ = isSmartPreview;
+    void setViewInfo(const ViewInfo& info) {
+        viewInfo_ = info;
         hasViewInfo_ = true;
         needsRedraw_ = true;
     }
@@ -150,12 +155,7 @@ private:
     vector<OverlayRect> overlays_;
 
     // View info (single view only)
-    float viewZoom_ = 1.0f;
-    bool viewProfileEnabled_ = false;
-    float viewProfileBlend_ = 1.0f;
-    bool viewHasProfile_ = false;
-    bool viewLensEnabled_ = false;
-    bool viewIsSmartPreview_ = false;
+    ViewInfo viewInfo_;
 
     float lineH_ = 18.0f;
     float sectionGap_ = 8.0f;
@@ -252,9 +252,9 @@ private:
         if (hasViewInfo_) {
             y += lineH_; // header
             y += lineH_; // zoom
-            if (viewHasProfile_) y += lineH_;
+            if (viewInfo_.hasProfile) y += lineH_;
             y += lineH_; // lens
-            if (viewIsSmartPreview_) y += lineH_;
+            if (viewInfo_.isSmartPreview) y += lineH_;
             y += sectionGap_;
         }
 
@@ -466,20 +466,26 @@ private:
 
         // === View (single view only) ===
         if (hasViewInfo_) {
+            auto& vi = viewInfo_;
             drawSectionHeader("View", y, w);
 
-            drawValue(format("Zoom: {:.0f}%", viewZoom_ * 100), y);
+            drawValue(format("Zoom: {:.0f}%", vi.zoom * 100), y);
 
-            if (viewHasProfile_) {
+            if (vi.hasProfile) {
                 string profileStr = format("Profile: {} {:.0f}%",
-                    viewProfileEnabled_ ? "ON" : "OFF", viewProfileBlend_ * 100);
+                    vi.profileEnabled ? "ON" : "OFF", vi.profileBlend * 100);
                 drawValue(profileStr, y, Color(0.5f, 0.75f, 0.5f));
             }
 
-            drawValue(format("Lens: {}", viewLensEnabled_ ? "ON" : "OFF"), y,
-                Color(0.6f, 0.6f, 0.65f));
+            if (vi.hasLensData) {
+                string lensSource = vi.isExifLens ? "EXIF" : "lensfun";
+                drawValue(format("Lens: {} ({})", vi.lensEnabled ? "ON" : "OFF", lensSource), y,
+                    Color(0.6f, 0.6f, 0.65f));
+            } else {
+                drawValue("Lens: No Data", y, Color(0.5f, 0.4f, 0.4f));
+            }
 
-            if (viewIsSmartPreview_) {
+            if (vi.isSmartPreview) {
                 drawValue("[Smart Preview]", y, Color(0.7f, 0.55f, 0.2f));
             }
             y += sectionGap_;
