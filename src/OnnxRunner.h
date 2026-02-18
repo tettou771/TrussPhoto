@@ -22,6 +22,18 @@ inline Ort::Env& getSharedOrtEnv() {
     return env;
 }
 
+// Shared CoreML cache directory (~/.trussc/onnx_cache)
+// Prevents ONNX Runtime from creating a new temp dir on every launch.
+inline const std::string& getCoreMLCacheDir() {
+    static std::string dir = [] {
+        std::string home = getenv("HOME") ? getenv("HOME") : ".";
+        std::string path = home + "/.trussc/onnx_cache";
+        std::filesystem::create_directories(path);
+        return path;
+    }();
+    return dir;
+}
+
 class OnnxRunner {
 public:
     OnnxRunner() = default;
@@ -33,9 +45,11 @@ public:
             opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
 #if defined(__APPLE__)
-            // CoreML EP: NeuralNetwork format (ANE uses FP16 internally)
-            OrtSessionOptionsAppendExecutionProvider_CoreML(opts, 0);
-            logNotice() << "[OnnxRunner] CoreML execution provider enabled";
+            // CoreML EP with cached model directory to avoid temp file leak
+            opts.AppendExecutionProvider("CoreML", {
+                {kCoremlProviderOption_ModelCacheDirectory, getCoreMLCacheDir()}
+            });
+            logNotice() << "[OnnxRunner] CoreML EP enabled (cache: " << getCoreMLCacheDir() << ")";
 #endif
 
             session_ = make_unique<Ort::Session>(getSharedOrtEnv(), modelPath.c_str(), opts);

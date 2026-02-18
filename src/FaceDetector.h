@@ -48,7 +48,9 @@ public:
             opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
 #if defined(__APPLE__)
-            OrtSessionOptionsAppendExecutionProvider_CoreML(opts, 0);
+            opts.AppendExecutionProvider("CoreML", {
+                {kCoremlProviderOption_ModelCacheDirectory, getCoreMLCacheDir()}
+            });
 #endif
 
             session_ = make_unique<Ort::Session>(getSharedOrtEnv(), modelPath.c_str(), opts);
