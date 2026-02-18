@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
 """
-generate_lut.py - Generate .cube 3D LUT from RAW+JPG pairs
-============================================================
+generate_lut.py - Generate .cube 3D LUT from RAW+JPG pairs (gradient chart)
+============================================================================
 
 Creates a color lookup table that transforms LibRaw's default RAW rendering
-to match the camera's JPEG output (with its color profile/style applied).
+to match the camera's JPEG output. Uses pixel-level correspondence from
+a photographed gradient color chart.
 
-Supports two modes:
-  1. RAW + external JPG pair
-  2. RAW with embedded JPEG preview (for cameras you no longer have)
+Center-crops both RAW and JPG to (h/2)x(h/2) square, then fits a 2nd-order
+polynomial color transform from millions of pixel correspondences.
 
 Usage:
-  # From RAW + JPG pair
-  python generate_lut.py BF_07993.DNG BF_07993.JPG -o Standard.cube
-
-  # From RAW with embedded preview
-  python generate_lut.py BF_07993.DNG --embedded -o Standard.cube
-
   # Process all pairs in a directory (auto-detect style from Sigma MakerNote)
-  python generate_lut.py --dir /path/to/calibration/ -o /output/dir/
+  python generate_lut.py --dir /path/to/gradient/ -o /output/dir/
+
+  # Single pair
+  python generate_lut.py BF_08009.DNG BF_08009.JPG -o Standard.cube
 
   # Specify LUT size (default 33)
-  python generate_lut.py BF_07993.DNG BF_07993.JPG -o Standard.cube --size 64
+  python generate_lut.py --dir /path/to/gradient/ -o /output/dir/ --size 64
 """
 
 import argparse
 import sys
-import struct
 from pathlib import Path
 
 import numpy as np
@@ -42,8 +38,8 @@ def process_raw(raw_path: Path) -> np.ndarray:
             use_camera_wb=True,
             output_color=rawpy.ColorSpace.sRGB,
             output_bps=8,
-            no_auto_bright=False,
-            user_flip=0,  # no EXIF rotation - match embedded preview orientation
+            no_auto_bright=True,
+            user_flip=0,
         )
     return rgb
 
@@ -54,128 +50,129 @@ def load_jpg(jpg_path: Path) -> np.ndarray:
     return np.array(img)
 
 
-def extract_embedded_preview(raw_path: Path) -> np.ndarray:
-    """Extract the largest embedded JPEG preview from a RAW file.
-    Returns numpy array (H, W, 3) uint8."""
-    with rawpy.imread(str(raw_path)) as raw:
-        # Get the largest thumbnail
-        try:
-            thumb = raw.extract_thumb()
-        except rawpy.LibRawNoThumbnailError:
-            raise RuntimeError(f"No embedded thumbnail in {raw_path}")
-
-        if thumb.format == rawpy.ThumbFormat.JPEG:
-            from io import BytesIO
-            img = Image.open(BytesIO(thumb.data)).convert("RGB")
-            return np.array(img)
-        elif thumb.format == rawpy.ThumbFormat.BITMAP:
-            return thumb.data
-        else:
-            raise RuntimeError(f"Unknown thumbnail format: {thumb.format}")
+def center_crop_square(img: np.ndarray, size: int) -> np.ndarray:
+    """Center-crop image to size x size square."""
+    h, w = img.shape[:2]
+    y0 = (h - size) // 2
+    x0 = (w - size) // 2
+    return img[y0:y0+size, x0:x0+size]
 
 
-def align_images(src: np.ndarray, target: np.ndarray) -> tuple:
-    """Resize images to match dimensions (use the smaller of the two).
-    Returns (src_resized, target_resized) as float32 [0,1]."""
-    # Use the smaller dimensions
-    h = min(src.shape[0], target.shape[0])
-    w = min(src.shape[1], target.shape[1])
+def align_and_crop(raw_img: np.ndarray, jpg_img: np.ndarray) -> tuple:
+    """Align RAW and JPG to same dimensions, then center-crop to (h/2)x(h/2).
+    Returns (src, tgt) as float32 [0,1]."""
+    # Match dimensions first (center-crop to smaller of the two)
+    h = min(raw_img.shape[0], jpg_img.shape[0])
+    w = min(raw_img.shape[1], jpg_img.shape[1])
 
-    # Center crop both to same size
-    def center_crop(img, th, tw):
-        y0 = (img.shape[0] - th) // 2
-        x0 = (img.shape[1] - tw) // 2
-        return img[y0:y0+th, x0:x0+tw]
+    raw_c = center_crop_square.__wrapped__(raw_img, h, w) if False else \
+            raw_img[(raw_img.shape[0]-h)//2:(raw_img.shape[0]-h)//2+h,
+                    (raw_img.shape[1]-w)//2:(raw_img.shape[1]-w)//2+w]
+    jpg_c = jpg_img[(jpg_img.shape[0]-h)//2:(jpg_img.shape[0]-h)//2+h,
+                    (jpg_img.shape[1]-w)//2:(jpg_img.shape[1]-w)//2+w]
 
-    src_c = center_crop(src, h, w)
-    tgt_c = center_crop(target, h, w)
+    # If JPG is different resolution, resize to match RAW
+    if raw_c.shape[:2] != jpg_c.shape[:2]:
+        jpg_pil = Image.fromarray(jpg_c).resize(
+            (raw_c.shape[1], raw_c.shape[0]), Image.LANCZOS)
+        jpg_c = np.array(jpg_pil)
 
-    # If sizes still differ significantly, resize target to match src
-    if abs(src_c.shape[0] - tgt_c.shape[0]) > 2 or abs(src_c.shape[1] - tgt_c.shape[1]) > 2:
-        tgt_pil = Image.fromarray(tgt_c).resize((src_c.shape[1], src_c.shape[0]), Image.LANCZOS)
-        tgt_c = np.array(tgt_pil)
+    # Center-crop to h/2 x h/2 square
+    crop_size = h // 2
+    raw_sq = center_crop_square(raw_c, crop_size)
+    jpg_sq = center_crop_square(jpg_c, crop_size)
 
-    return src_c.astype(np.float32) / 255.0, tgt_c.astype(np.float32) / 255.0
+    print(f"  Crop: {raw_img.shape[1]}x{raw_img.shape[0]} → {crop_size}x{crop_size}")
+
+    return raw_sq.astype(np.float32) / 255.0, jpg_sq.astype(np.float32) / 255.0
 
 
-def build_3d_lut(src: np.ndarray, target: np.ndarray, lut_size: int = 33) -> np.ndarray:
-    """Build a 3D LUT using per-channel tone curves + 3x3 color matrix.
+def expand_poly(rgb: np.ndarray, order: int = 2) -> np.ndarray:
+    """Expand RGB to polynomial features.
+    order=2: 9 terms [R, G, B, R^2, G^2, B^2, RG, RB, GB]
+    """
+    R, G, B = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    terms = [R, G, B, R*R, G*G, B*B, R*G, R*B, G*B]
+    if order >= 3:
+        terms += [
+            R*R*R, G*G*G, B*B*B,
+            R*R*G, R*R*B, R*G*G, G*G*B, R*B*B, G*B*B, R*G*B,
+        ]
+    return np.column_stack(terms)
 
-    Two-stage approach for robustness:
-      1. Fit a 3x3 color matrix via least-squares (cross-channel color shifts)
-      2. Build per-channel 1D tone curves from residuals (tone/contrast)
-      3. Combine into a 3D LUT
+
+def expand_poly_single(r, g, b, order: int = 2) -> np.ndarray:
+    """Expand a single RGB triplet to polynomial features."""
+    terms = [r, g, b, r*r, g*g, b*b, r*g, r*b, g*b]
+    if order >= 3:
+        terms += [
+            r*r*r, g*g*g, b*b*b,
+            r*r*g, r*r*b, r*g*g, g*g*b, r*b*b, g*b*b, r*g*b,
+        ]
+    return np.array(terms)
+
+
+def build_3d_lut(src: np.ndarray, tgt: np.ndarray, lut_size: int = 33) -> np.ndarray:
+    """Build 3D LUT using 2nd-order polynomial fit from pixel correspondences.
 
     Args:
-        src: Source image (RAW rendered) as float32 [0,1], shape (H, W, 3)
-        target: Target image (JPG) as float32 [0,1], shape (H, W, 3)
-        lut_size: Number of nodes per axis (typically 33 or 64)
+        src: Source (RAW) float32 [0,1], shape (H, W, 3)
+        tgt: Target (JPG) float32 [0,1], shape (H, W, 3)
+        lut_size: LUT grid size
 
     Returns:
-        3D LUT array of shape (lut_size, lut_size, lut_size, 3)
+        (lut_size, lut_size, lut_size, 3) float32 LUT
     """
     src_flat = src.reshape(-1, 3)
-    tgt_flat = target.reshape(-1, 3)
+    tgt_flat = tgt.reshape(-1, 3)
+    n_pixels = src_flat.shape[0]
 
-    # Subsample for matrix fitting (full image is too large)
-    n = src_flat.shape[0]
+    # Skip near-black pixels (outside the gradient circle = black background)
+    brightness = src_flat.sum(axis=1)
+    valid = brightness > 0.03  # ~1% threshold
+    src_valid = src_flat[valid]
+    tgt_valid = tgt_flat[valid]
+    print(f"  Valid pixels: {valid.sum():,} / {n_pixels:,} ({valid.sum()*100/n_pixels:.1f}%)")
+
+    # Subsample for polynomial fitting (500k points is plenty)
+    n = src_valid.shape[0]
     step = max(1, n // 500000)
-    src_sub = src_flat[::step]
-    tgt_sub = tgt_flat[::step]
+    src_sub = src_valid[::step]
+    tgt_sub = tgt_valid[::step]
+    print(f"  Fitting samples: {len(src_sub):,} (step={step})")
 
-    # Stage 1: Fit 3x3 color matrix (least squares: tgt = src @ M.T)
-    # Solve: M = (src^T src)^-1 src^T tgt
-    M, _, _, _ = np.linalg.lstsq(src_sub, tgt_sub, rcond=None)
-    print(f"    Color matrix:\n{M}")
+    # 3rd-order polynomial fit: tgt = poly(src) @ M
+    use_order = 3
+    X = expand_poly(src_sub, use_order)
+    M, residuals, rank, sv = np.linalg.lstsq(X, tgt_sub, rcond=None)
 
-    # Stage 2: Per-channel 1D tone curves on the residual
-    # Apply matrix to source, then build 1D curves for remaining correction
-    src_corrected = src_flat @ M
-    src_corrected = np.clip(src_corrected, 0, 1)
+    # Report fit quality
+    pred = X @ M
+    mae = np.mean(np.abs(pred - tgt_sub))
+    rmse = np.sqrt(np.mean((pred - tgt_sub) ** 2))
+    print(f"  Fit quality: MAE={mae:.4f}, RMSE={rmse:.4f}")
 
+    # Check per-channel
+    for ch, name in enumerate(['R', 'G', 'B']):
+        ch_mae = np.mean(np.abs(pred[:, ch] - tgt_sub[:, ch]))
+        print(f"    {name}: MAE={ch_mae:.4f}")
+
+    # Build 3D LUT
+    print(f"  Building {lut_size}^3 LUT...", end="", flush=True)
     scale = lut_size - 1
-    curves = np.zeros((3, lut_size), dtype=np.float64)
-    counts = np.zeros((3, lut_size), dtype=np.float64)
-
-    for ch in range(3):
-        idx = np.clip((src_corrected[:, ch] * scale).astype(np.int32), 0, int(scale))
-        np.add.at(curves[ch], idx, tgt_flat[:, ch])
-        np.add.at(counts[ch], idx, 1)
-
-    # Average and fill empty bins with identity
-    for ch in range(3):
-        for i in range(lut_size):
-            if counts[ch, i] > 0:
-                curves[ch, i] /= counts[ch, i]
-            else:
-                curves[ch, i] = i / scale
-
-    # Enforce monotonicity
-    for ch in range(3):
-        for i in range(1, lut_size):
-            if curves[ch, i] < curves[ch, i - 1]:
-                curves[ch, i] = curves[ch, i - 1]
-
-    # Stage 3: Combine into 3D LUT
-    # For each input (r,g,b): apply matrix, then look up tone curves
     lut = np.zeros((lut_size, lut_size, lut_size, 3), dtype=np.float32)
+
     for ri in range(lut_size):
         for gi in range(lut_size):
             for bi in range(lut_size):
-                rgb_in = np.array([ri / scale, gi / scale, bi / scale])
-                # Apply color matrix
-                rgb_mat = rgb_in @ M
-                rgb_mat = np.clip(rgb_mat, 0, 1)
-                # Apply per-channel tone curves (linear interpolation)
-                out = np.zeros(3)
-                for ch in range(3):
-                    v = rgb_mat[ch] * scale
-                    lo = int(v)
-                    hi = min(lo + 1, int(scale))
-                    frac = v - lo
-                    out[ch] = curves[ch, lo] * (1 - frac) + curves[ch, hi] * frac
+                r = ri / scale
+                g = gi / scale
+                b = bi / scale
+                features = expand_poly_single(r, g, b, use_order)
+                out = features @ M
                 lut[ri, gi, bi] = np.clip(out, 0, 1)
 
+    print(" done")
     return lut
 
 
@@ -189,20 +186,17 @@ def write_cube(lut: np.ndarray, output_path: Path, title: str = ""):
         f.write(f'DOMAIN_MIN 0.0 0.0 0.0\n')
         f.write(f'DOMAIN_MAX 1.0 1.0 1.0\n')
         f.write('\n')
-
-        # .cube format: R changes fastest, then G, then B (slowest)
+        # .cube format: R fastest, B slowest
         for b in range(size):
             for g in range(size):
                 for r in range(size):
                     val = lut[r, g, b]
                     f.write(f'{val[0]:.6f} {val[1]:.6f} {val[2]:.6f}\n')
-
     print(f"  Written: {output_path} ({size}x{size}x{size})")
 
 
 def read_sigma_style(filepath: Path) -> str:
-    """Read Sigma color mode from MakerNote tag 0x003d.
-    Works by parsing the TIFF IFD structure in the MakerNote."""
+    """Read Sigma color mode from MakerNote tag 0x003d."""
     try:
         import subprocess
         result = subprocess.run(
@@ -220,33 +214,34 @@ def read_sigma_style(filepath: Path) -> str:
 def process_pair(raw_path: Path, jpg_path: Path = None, embedded: bool = False,
                  output_path: Path = None, lut_size: int = 33, title: str = ""):
     """Process a single RAW+JPG pair and generate .cube LUT."""
+    print(f"\nProcessing: {raw_path.name}")
 
-    print(f"Processing: {raw_path.name}")
-
-    # Get RAW rendering
+    # Load RAW
     print("  RAW → sRGB...", end="", flush=True)
     raw_img = process_raw(raw_path)
     print(f" {raw_img.shape[1]}x{raw_img.shape[0]}")
 
-    # Get target JPG
+    # Load target JPG
     if embedded:
         print("  Extracting embedded preview...", end="", flush=True)
-        jpg_img = extract_embedded_preview(raw_path)
+        from io import BytesIO
+        with rawpy.imread(str(raw_path)) as raw:
+            thumb = raw.extract_thumb()
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                jpg_img = np.array(Image.open(BytesIO(thumb.data)).convert("RGB"))
+            else:
+                jpg_img = thumb.data
         print(f" {jpg_img.shape[1]}x{jpg_img.shape[0]}")
     else:
         print(f"  Loading {jpg_path.name}...", end="", flush=True)
         jpg_img = load_jpg(jpg_path)
         print(f" {jpg_img.shape[1]}x{jpg_img.shape[0]}")
 
-    # Align
-    print("  Aligning...", end="", flush=True)
-    src, tgt = align_images(raw_img, jpg_img)
-    print(f" {src.shape[1]}x{src.shape[0]}")
+    # Align and center-crop to h/2 square
+    src, tgt = align_and_crop(raw_img, jpg_img)
 
     # Build LUT
-    print(f"  Building {lut_size}x{lut_size}x{lut_size} LUT...", end="", flush=True)
     lut = build_3d_lut(src, tgt, lut_size)
-    print(" done")
 
     # Write
     write_cube(lut, output_path, title=title)
@@ -255,7 +250,6 @@ def process_pair(raw_path: Path, jpg_path: Path = None, embedded: bool = False,
 def process_directory(dir_path: Path, output_dir: Path, lut_size: int = 33,
                       embedded: bool = False):
     """Process all RAW+JPG pairs in a directory."""
-    # Find DNG files
     raw_files = sorted(dir_path.glob("*.DNG")) + sorted(dir_path.glob("*.dng"))
     if not raw_files:
         raw_files = sorted(dir_path.glob("*.ARW")) + sorted(dir_path.glob("*.arw"))
@@ -266,16 +260,13 @@ def process_directory(dir_path: Path, output_dir: Path, lut_size: int = 33,
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for raw_path in raw_files:
-        # Try to read Sigma style name
         style = read_sigma_style(raw_path)
         if not style:
-            style = raw_path.stem  # fallback to filename
+            style = raw_path.stem
 
-        # Determine output filename
         out_name = f"{style}.cube"
         out_path = output_dir / out_name
 
-        # Skip if already exists
         if out_path.exists():
             print(f"Skipping {raw_path.name} → {out_name} (already exists)")
             continue
@@ -284,7 +275,6 @@ def process_directory(dir_path: Path, output_dir: Path, lut_size: int = 33,
             process_pair(raw_path, embedded=True, output_path=out_path,
                         lut_size=lut_size, title=style)
         else:
-            # Find matching JPG
             jpg_path = raw_path.with_suffix('.JPG')
             if not jpg_path.exists():
                 jpg_path = raw_path.with_suffix('.jpg')
@@ -298,9 +288,9 @@ def process_directory(dir_path: Path, output_dir: Path, lut_size: int = 33,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate .cube 3D LUT from RAW+JPG pairs')
+        description='Generate .cube 3D LUT from RAW+JPG pairs (gradient chart)')
     parser.add_argument('raw', nargs='?', help='RAW file path')
-    parser.add_argument('jpg', nargs='?', help='JPG file path (omit with --embedded)')
+    parser.add_argument('jpg', nargs='?', help='JPG file path')
     parser.add_argument('-o', '--output', required=True,
                         help='Output .cube file or directory (with --dir)')
     parser.add_argument('--embedded', action='store_true',
@@ -319,7 +309,6 @@ def main():
         if not raw_path.exists():
             print(f"Error: {raw_path} not found")
             sys.exit(1)
-
         if args.embedded:
             process_pair(raw_path, embedded=True,
                         output_path=Path(args.output),

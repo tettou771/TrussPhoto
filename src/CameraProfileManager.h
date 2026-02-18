@@ -55,22 +55,20 @@ public:
     }
 
     // Find profile .cube path for a given camera model and creative style
-    // Camera model is sanitized: spaces -> underscores
+    // Camera model should match directory name exactly (from Exif.Image.Model)
     // Search order: exact style match -> _default -> empty
     string findProfile(const string& cameraModel, const string& style = "") const {
         string cameraKey = sanitize(cameraModel);
 
         // 1. Try exact style match
         if (!style.empty()) {
-            string key = cameraKey + "/" + style;
-            auto it = profiles_.find(key);
+            auto it = profiles_.find(cameraKey + "/" + style);
             if (it != profiles_.end()) return it->second;
         }
 
         // 2. Fallback to _default
         {
-            string key = cameraKey + "/_default";
-            auto it = profiles_.find(key);
+            auto it = profiles_.find(cameraKey + "/_default");
             if (it != profiles_.end()) return it->second;
         }
 
@@ -95,11 +93,8 @@ private:
     unordered_map<string, string> profiles_;  // "CameraKey/StyleName" -> path
 
     // Sanitize camera model name for directory matching
+    // Spaces are preserved to match directory names exactly
     static string sanitize(const string& name) {
-        string result = name;
-        for (auto& c : result) {
-            if (c == ' ') c = '_';
-        }
-        return result;
+        return name;
     }
 };
