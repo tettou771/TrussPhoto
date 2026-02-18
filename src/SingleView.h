@@ -39,8 +39,7 @@ public:
 
     // Initialize GPU resources (call once from tcApp::setup after addChild)
     void init(const string& profileDir, const string& lensfunDir) {
-        string home = getenv("HOME") ? getenv("HOME") : ".";
-        profileManager_.setProfileDir(home + "/.trussc/profiles");
+        profileManager_.setProfileDir(profileDir);
         lutShader_.load();
         lensCorrector_.loadDatabase(lensfunDir);
     }
@@ -235,17 +234,15 @@ public:
         float y = (winH - drawH) / 2 + panOffset_.y;
 
         setColor(1.0f, 1.0f, 1.0f);
-        bool useLut = hasProfileLut_ && profileEnabled_ && profileBlend_ > 0.0f;
+        // LUT only on LibRaw-decoded images (fullTexture_), NOT on:
+        // - embedded JPEG preview (previewTexture_) — already has camera style
+        // - non-RAW images (fullImage_) — already has camera style
+        bool useLut = hasFullRaw && hasProfileLut_ && profileEnabled_ && profileBlend_ > 0.0f;
         if (useLut) {
             lutShader_.setLut(profileLut_);
             lutShader_.setBlend(profileBlend_);
-            if (isRawImage_) {
-                lutShader_.setTexture(*rawTex);
-                lutShader_.draw(x, y, drawW, drawH);
-            } else {
-                lutShader_.setTexture(fullImage_.getTexture());
-                lutShader_.draw(x, y, drawW, drawH);
-            }
+            lutShader_.setTexture(fullTexture_);
+            lutShader_.draw(x, y, drawW, drawH);
         } else if (isRawImage_) {
             rawTex->draw(x, y, drawW, drawH);
         } else {

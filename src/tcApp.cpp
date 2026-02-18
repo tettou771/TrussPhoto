@@ -483,7 +483,7 @@ void tcApp::setup() {
     }
 
     // 10. SingleView init (camera profiles, LUT shader, lens correction)
-    viewManager_->singleView()->init("", getDataPath("lensfun"));
+    viewManager_->singleView()->init(getDataPath("profiles"), getDataPath("lensfun"));
 
     // 11. Fonts
     loadJapaneseFont(font_, 14);
