@@ -220,7 +220,7 @@ public:
         setSyncState(syncState);
         setSelected(selected);
         setIsVideo(isVideo);
-        label_->bgColor = isVideo ? Color(0.10f, 0.12f, 0.22f) : Color(0.12f, 0.12f, 0.14f);
+        label_->bgColor = isVideo ? Color(0.08f, 0.14f, 0.18f) : Color(0.12f, 0.12f, 0.14f);
         thumbnail_->clearImage();
 
         // Set Loading before firing request to prevent onActiveChanged re-request
