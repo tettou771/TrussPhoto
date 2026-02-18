@@ -106,6 +106,7 @@ public:
 
     string text;
     Color textColor = Color(0.8f, 0.8f, 0.85f);
+    Color bgColor = Color(0.12f, 0.12f, 0.14f);
     Font* font = nullptr;  // set by PhotoGrid
 
     LabelNode() {
@@ -114,7 +115,7 @@ public:
 
     void draw() override {
         // Background
-        setColor(0.12f, 0.12f, 0.14f);
+        setColor(bgColor);
         fill();
         drawRect(0, 0, getWidth(), getHeight());
 
@@ -204,8 +205,11 @@ public:
     void setClipMatch(bool v) { clipMatch_ = v; }
     bool isClipMatch() const { return clipMatch_; }
 
+    void setIsVideo(bool v) { isVideo_ = v; }
+    bool isVideo() const { return isVideo_; }
+
     void rebindAndLoad(int dataIndex, const string& label, SyncState syncState,
-                       bool selected, Font* font) {
+                       bool selected, bool isVideo, Font* font) {
         // Cancel pending load for old data
         if (loadState_ == LoadState::Loading && onRequestUnload)
             onRequestUnload(entryIndex_);
@@ -215,6 +219,8 @@ public:
         label_->font = font;
         setSyncState(syncState);
         setSelected(selected);
+        setIsVideo(isVideo);
+        label_->bgColor = isVideo ? Color(0.08f, 0.14f, 0.18f) : Color(0.12f, 0.12f, 0.14f);
         thumbnail_->clearImage();
 
         // Set Loading before firing request to prevent onActiveChanged re-request
@@ -230,19 +236,27 @@ public:
     }
     
     void draw() override {
-        // Hover highlight
+        // Hover highlight (background, behind thumbnail)
         if (isMouseOver()) {
             setColor(0.3f, 0.35f, 0.45f, 0.5f);
             fill();
             drawRect(0, 0, getWidth(), getHeight());
         }
 
-        // Selection highlight
+        // Selection highlight (background, behind thumbnail)
         if (isSelected_) {
             setColor(0.4f, 0.5f, 0.7f, 0.6f);
             fill();
             drawRect(0, 0, getWidth(), getHeight());
         }
+    }
+
+    // Badges drawn AFTER children (on top of thumbnail)
+    void endDraw() override {
+        // Card border (same color as label background)
+        setColor(label_->bgColor);
+        noFill();
+        drawRect(0, 0, getWidth(), getHeight());
 
         // Sync state badge (bottom-right corner of thumbnail)
         float badgeSize = 8;
@@ -324,6 +338,7 @@ private:
     ThumbnailNode::Ptr thumbnail_;
     LabelNode::Ptr label_;
     bool isSelected_ = false;
+    bool isVideo_ = false;
     bool clipMatch_ = false;
     bool pastMouseOver = false;
     LoadState loadState_ = LoadState::Unloaded;

@@ -204,7 +204,7 @@ public:
         int relinked = 0;
         for (const auto& entry : fs::recursive_directory_iterator(folder)) {
             if (!entry.is_regular_file()) continue;
-            if (!isSupportedImage(entry.path())) continue;
+            if (!isSupportedFile(entry.path())) continue;
 
             string fname = entry.path().filename().string();
             uintmax_t fsize = entry.file_size();
@@ -260,7 +260,7 @@ public:
         vector<PhotoEntry> newEntries;
         for (const auto& entry : fs::recursive_directory_iterator(rawStoragePath_)) {
             if (!entry.is_regular_file()) continue;
-            if (!isSupportedImage(entry.path())) continue;
+            if (!isSupportedFile(entry.path())) continue;
 
             string fname = entry.path().filename().string();
             uintmax_t fsize = entry.file_size();
@@ -268,15 +268,20 @@ public:
 
             if (photos_.count(id)) continue;
 
+            bool video = isVideoFile(entry.path());
+
             PhotoEntry photo;
             photo.id = id;
             photo.filename = fname;
             photo.fileSize = fsize;
             photo.localPath = entry.path().string();
-            photo.isRaw = RawLoader::isRawFile(entry.path());
+            photo.isVideo = video;
+            photo.isRaw = video ? false : RawLoader::isRawFile(entry.path());
             photo.syncState = SyncState::LocalOnly;
-            extractExifMetadata(photo.localPath, photo);
-            extractXmpMetadata(photo.localPath, photo);
+            if (!video) {
+                extractExifMetadata(photo.localPath, photo);
+                extractXmpMetadata(photo.localPath, photo);
+            }
             photos_[id] = photo;
             newEntries.push_back(photo);
             addedCount++;
@@ -287,9 +292,9 @@ public:
         return addedCount;
     }
 
-    // Check if a file path is a supported image
+    // Check if a file path is a supported file (image or video)
     bool isSupportedFile(const string& path) const {
-        return isSupportedImage(fs::path(path));
+        return isSupportedFile(fs::path(path));
     }
 
     // Import individual files (non-blocking, copies happen in background)
@@ -300,7 +305,7 @@ public:
         for (const auto& filePath : filePaths) {
             fs::path p(filePath);
             if (!fs::exists(p) || !fs::is_regular_file(p)) continue;
-            if (!isSupportedImage(p)) continue;
+            if (!isSupportedFile(p)) continue;
 
             string fname = p.filename().string();
             uintmax_t fsize = fs::file_size(p);
@@ -308,15 +313,20 @@ public:
 
             if (photos_.count(id)) continue;
 
+            bool video = isVideoFile(p);
+
             PhotoEntry photo;
             photo.id = id;
             photo.filename = fname;
             photo.fileSize = fsize;
             photo.localPath = filePath;
-            photo.isRaw = RawLoader::isRawFile(p);
+            photo.isVideo = video;
+            photo.isRaw = video ? false : RawLoader::isRawFile(p);
             photo.syncState = SyncState::LocalOnly;
-            extractExifMetadata(filePath, photo);
-            extractXmpMetadata(filePath, photo);
+            if (!video) {
+                extractExifMetadata(filePath, photo);
+                extractXmpMetadata(filePath, photo);
+            }
 
             photos_[id] = photo;
             newEntries.push_back(photo);
@@ -365,7 +375,7 @@ public:
 
         for (const auto& entry : fs::recursive_directory_iterator(folder)) {
             if (!entry.is_regular_file()) continue;
-            if (!isSupportedImage(entry.path())) continue;
+            if (!isSupportedFile(entry.path())) continue;
 
             string path = entry.path().string();
             auto size = entry.file_size();
@@ -376,18 +386,23 @@ public:
             // Skip if already known
             if (photos_.count(id)) continue;
 
+            bool video = isVideoFile(entry.path());
+
             // Register immediately with original path
             PhotoEntry photo;
             photo.id = id;
             photo.filename = fname;
             photo.fileSize = size;
             photo.localPath = path;
-            photo.isRaw = RawLoader::isRawFile(entry.path());
+            photo.isVideo = video;
+            photo.isRaw = video ? false : RawLoader::isRawFile(entry.path());
             photo.syncState = SyncState::LocalOnly;
 
-            // Extract metadata via exiv2 + XMP sidecar
-            extractExifMetadata(path, photo);
-            extractXmpMetadata(path, photo);
+            // Extract metadata (skip exiv2/XMP for video — may crash)
+            if (!video) {
+                extractExifMetadata(path, photo);
+                extractXmpMetadata(path, photo);
+            }
 
             photos_[id] = photo;
             newEntries.push_back(photo);
@@ -414,7 +429,7 @@ public:
         if (!newEntries.empty()) {
             db_.insertPhotos(newEntries);
         }
-        logNotice() << "[PhotoProvider] Found " << added << " new images (total: " << photos_.size() << ")";
+        logNotice() << "[PhotoProvider] Found " << added << " new files (total: " << photos_.size() << ")";
 
         // Start background copy if there are pending copies
         startCopyThread();
@@ -480,7 +495,28 @@ public:
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
         auto& photo = it->second;
-        if (photo.isVideo) return false;  // no thumbnail for video (yet)
+
+        // Video thumbnail: extract frame via AVFoundation
+        if (photo.isVideo) {
+            // 1. Check local cache
+            if (!photo.localThumbnailPath.empty() && fs::exists(photo.localThumbnailPath)) {
+                if (outPixels.load(photo.localThumbnailPath)) return true;
+            }
+            // 2. Extract frame from video file
+            if (!photo.localPath.empty() && fs::exists(photo.localPath)) {
+                if (VideoPlayer::extractFrame(photo.localPath, outPixels, 1.0f)) {
+                    int w = outPixels.getWidth();
+                    int h = outPixels.getHeight();
+                    if (w > THUMBNAIL_MAX_SIZE || h > THUMBNAIL_MAX_SIZE) {
+                        float scale = (float)THUMBNAIL_MAX_SIZE / max(w, h);
+                        resizePixels(outPixels, (int)(w * scale), (int)(h * scale));
+                    }
+                    saveThumbnailCache(id, photo, outPixels);
+                    return true;
+                }
+            }
+            return false;
+        }
 
         // 1. Check local thumbnail cache
         if (!photo.localThumbnailPath.empty() && fs::exists(photo.localThumbnailPath)) {
@@ -2454,7 +2490,14 @@ private:
 
     // Supported standard image extensions
     static inline const unordered_set<string> standardExtensions_ = {
-        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tga", ".psd", ".hdr"
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tga", ".psd", ".hdr",
+        ".heic", ".heif"
+    };
+
+    // Supported video extensions
+    static inline const unordered_set<string> videoExtensions_ = {
+        ".mp4", ".mov", ".avi", ".mkv", ".mts", ".m2ts",
+        ".mpg", ".mpeg", ".wmv", ".webm", ".m4v", ".3gp"
     };
 
     bool isSupportedImage(const fs::path& path) const {
@@ -2462,6 +2505,18 @@ private:
         transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
         if (standardExtensions_.count(ext)) return true;
         if (RawLoader::isRawFile(path)) return true;
+        return false;
+    }
+
+    static bool isVideoFile(const fs::path& path) {
+        string ext = path.extension().string();
+        transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        return videoExtensions_.count(ext) > 0;
+    }
+
+    bool isSupportedFile(const fs::path& path) const {
+        if (isSupportedImage(path)) return true;
+        if (isVideoFile(path)) return true;
         return false;
     }
 

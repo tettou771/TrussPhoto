@@ -258,7 +258,8 @@ protected:
         bool clipMatch = !clipResults_.empty() && !textMatchIds_.count(photoIds_[dataIdx]);
         item->setClipMatch(clipMatch);
 
-        item->rebindAndLoad(dataIdx, stem, sync, selected, &labelFont_);
+        bool video = photo ? photo->isVideo : false;
+        item->rebindAndLoad(dataIdx, stem, sync, selected, video, &labelFont_);
     }
 
     void onUnbind(int dataIdx, ItemPtr& item) override {

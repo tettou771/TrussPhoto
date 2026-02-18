@@ -62,17 +62,25 @@ public:
         auto* entry = provider.getPhoto(photoId);
         if (!entry) return;
 
-        logNotice() << "Opening image: " << entry->filename;
+        logNotice() << "Opening: " << entry->filename;
 
-        // Cancel any pending background load
-        if (rawLoadInProgress_) {
-            rawLoadCompleted_ = false;
-        }
+        // Clean up previous state
+        cleanupState();
 
         bool loaded = false;
         isSmartPreview_ = false;
 
-        if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
+        // Video playback
+        if (entry->isVideo) {
+            if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
+                if (videoPlayer_.load(entry->localPath)) {
+                    isVideo_ = true;
+                    videoPlayer_.play();
+                    loaded = true;
+                    if (ctx_->redraw) ctx_->redraw(1);
+                }
+            }
+        } else if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
             if (entry->isRaw) {
                 // Step 1: Try embedded JPEG first (fastest)
                 Pixels previewPixels;
@@ -178,6 +186,15 @@ public:
         }
     }
 
+    // Process video frame updates (call from update)
+    void processVideoUpdate() {
+        if (!isVideo_ || !videoPlayer_.isLoaded()) return;
+        videoPlayer_.update();
+        if (videoPlayer_.isFrameNew()) {
+            if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+        }
+    }
+
     // Process background RAW load completion (call from update)
     void processRawLoadCompletion() {
         if (!ctx_ || !rawLoadCompleted_ || !isRawImage_) return;
@@ -212,6 +229,12 @@ public:
 
     // Draw the image (called from tcApp::draw or node draw)
     void drawView() {
+        // Video playback
+        if (isVideo_) {
+            drawVideoView();
+            return;
+        }
+
         bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
         bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
         bool hasImage = isRawImage_ ? (hasFullRaw || hasPreviewRaw) : fullImage_.isAllocated();
@@ -269,6 +292,26 @@ public:
         if (!ctx_) return false;
         auto& grid = ctx_->grid;
         auto& provider = *ctx_->provider;
+
+        // Video-specific keys
+        if (isVideo_) {
+            if (key == SAPP_KEYCODE_SPACE) {
+                videoPlayer_.togglePause();
+                return true;
+            }
+            if (key == SAPP_KEYCODE_LEFT) {
+                float t = videoPlayer_.getCurrentTime() - 5.0f;
+                videoPlayer_.setCurrentTime(max(0.0f, t));
+                return true;
+            }
+            if (key == SAPP_KEYCODE_RIGHT) {
+                float t = videoPlayer_.getCurrentTime() + 5.0f;
+                videoPlayer_.setCurrentTime(min(t, videoPlayer_.getDuration()));
+                return true;
+            }
+            // No other keys for video
+            return false;
+        }
 
         if (key == SAPP_KEYCODE_LEFT && selectedIndex_ > 0) {
             show(selectedIndex_ - 1);
@@ -349,9 +392,20 @@ public:
         return false;
     }
 
-    // Handle mouse press for panning
+    // Handle mouse press for panning / seek bar
     bool handleMousePress(Vec2 pos, int button) {
         if (button == 0) {
+            // Video seek bar click
+            if (isVideo_) {
+                float barY = getHeight() - seekBarHeight_;
+                if (pos.y >= barY) {
+                    seekDragging_ = true;
+                    float pct = clamp(pos.x / getWidth(), 0.0f, 1.0f);
+                    videoPlayer_.setPosition(pct);
+                    return true;
+                }
+                return false;  // no pan for video
+            }
             isDragging_ = true;
             dragStart_ = pos;
             return true;
@@ -361,6 +415,10 @@ public:
 
     bool handleMouseRelease(int button) {
         if (button == 0) {
+            if (seekDragging_) {
+                seekDragging_ = false;
+                return true;
+            }
             isDragging_ = false;
             return true;
         }
@@ -368,17 +426,27 @@ public:
     }
 
     bool handleMouseDrag(Vec2 pos, int button) {
-        if (button == 0 && isDragging_) {
-            Vec2 delta = pos - dragStart_;
-            panOffset_ = panOffset_ + delta;
-            dragStart_ = pos;
-            if (ctx_ && ctx_->redraw) ctx_->redraw(1);
-            return true;
+        if (button == 0) {
+            // Video seek bar scrub
+            if (seekDragging_ && isVideo_) {
+                float pct = clamp(pos.x / getWidth(), 0.0f, 1.0f);
+                videoPlayer_.setPosition(pct);
+                if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+                return true;
+            }
+            if (isDragging_ && !isVideo_) {
+                Vec2 delta = pos - dragStart_;
+                panOffset_ = panOffset_ + delta;
+                dragStart_ = pos;
+                if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+                return true;
+            }
         }
         return false;
     }
 
     bool handleMouseScroll(Vec2 delta) {
+        if (isVideo_) return false;  // no zoom for video
         bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
         bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
         bool hasImage = isRawImage_ ? (hasFullRaw || hasPreviewRaw) : fullImage_.isAllocated();
@@ -418,6 +486,7 @@ public:
     bool lensEnabled() const { return lensEnabled_; }
     bool isSmartPreview() const { return isSmartPreview_; }
     bool isRawImage() const { return isRawImage_; }
+    bool isVideo() const { return isVideo_; }
 
     // Update metadata panel with current view state
     void updateViewInfo() {
@@ -508,7 +577,20 @@ private:
     LensCorrector lensCorrector_;
     bool lensEnabled_ = true;
 
+    // Video playback
+    VideoPlayer videoPlayer_;
+    bool isVideo_ = false;
+    bool seekDragging_ = false;
+    float seekBarHeight_ = 40.0f;
+
     void cleanupState() {
+        // Video cleanup
+        if (isVideo_) {
+            videoPlayer_.close();
+            isVideo_ = false;
+            seekDragging_ = false;
+        }
+
         if (rawLoadThread_.joinable()) rawLoadThread_.join();
         rawLoadInProgress_ = false;
         rawLoadCompleted_ = false;
@@ -537,6 +619,88 @@ private:
             lensCorrector_.apply(fullPixels_);
         }
         fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
+    }
+
+    void drawVideoView() {
+        if (!videoPlayer_.isLoaded()) return;
+
+        auto& tex = videoPlayer_.getTexture();
+        float imgW = videoPlayer_.getWidth();
+        float imgH = videoPlayer_.getHeight();
+        float winW = getWidth();
+        float winH = getHeight() - seekBarHeight_;  // leave room for seek bar
+
+        // Fit-to-contain (no zoom)
+        float fitScale = min(winW / imgW, winH / imgH);
+        float drawW = imgW * fitScale;
+        float drawH = imgH * fitScale;
+        float x = (winW - drawW) / 2;
+        float y = (winH - drawH) / 2;
+
+        setColor(1.0f, 1.0f, 1.0f);
+        tex.draw(x, y, drawW, drawH);
+
+        // Seek bar
+        float barY = getHeight() - seekBarHeight_;
+        float pos = videoPlayer_.getPosition();
+        float dur = videoPlayer_.getDuration();
+        float cur = pos * dur;
+
+        // Background
+        setColor(0, 0, 0, 0.6f);
+        fill();
+        drawRect(0, barY, getWidth(), seekBarHeight_);
+
+        // Play/pause icon (left side)
+        float iconX = 20;
+        float iconY = barY + seekBarHeight_ / 2;
+        setColor(1, 1, 1, 0.9f);
+        if (videoPlayer_.isPlaying()) {
+            // Pause icon (two bars)
+            fill();
+            drawRect(iconX - 4, iconY - 8, 4, 16);
+            drawRect(iconX + 4, iconY - 8, 4, 16);
+        } else {
+            // Play triangle
+            fill();
+            drawTriangle(iconX - 4, iconY - 8,
+                         iconX - 4, iconY + 8,
+                         iconX + 8, iconY);
+        }
+
+        // Progress bar
+        float barX = 44;
+        float barW = getWidth() - barX - 100;  // leave space for time label
+        float barMidY = barY + seekBarHeight_ / 2;
+
+        // Track background
+        setColor(0.3f, 0.3f, 0.35f);
+        fill();
+        drawRect(barX, barMidY - 2, barW, 4);
+
+        // Progress fill
+        setColor(0.5f, 0.7f, 1.0f);
+        drawRect(barX, barMidY - 2, barW * pos, 4);
+
+        // Playhead
+        drawCircle(barX + barW * pos, barMidY, 6);
+
+        // Time label
+        setColor(0.8f, 0.8f, 0.85f);
+        string timeStr = formatTime(cur) + " / " + formatTime(dur);
+        pushStyle();
+        setTextAlign(Direction::Right, Direction::Center);
+        drawBitmapString(timeStr, getWidth() - 10, barMidY);
+        popStyle();
+    }
+
+    static string formatTime(float seconds) {
+        int s = (int)seconds;
+        int m = s / 60;
+        s = s % 60;
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d:%02d", m, s);
+        return buf;
     }
 
     void loadProfileForEntry(const PhotoEntry& entry) {
