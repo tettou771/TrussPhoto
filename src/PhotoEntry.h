@@ -63,6 +63,22 @@ struct PhotoEntry {
 
     bool hasGps() const { return latitude != 0 || longitude != 0; }
 
+    // Lens correction (JSON: Sony EXIF spline or DNG polynomial)
+    string lensCorrectionParams;
+
+    // Additional shooting info (available without RAW file)
+    string exposureTime;       // "1/125" etc (human-readable string)
+    float exposureBias = 0;    // EV
+    int orientation = 1;       // EXIF orientation (1-8, 1=normal)
+    string whiteBalance;       // "Auto", "Daylight" etc
+    int focalLength35mm = 0;   // 35mm equivalent
+    string offsetTime;         // timezone "+09:00"
+    string bodySerial;         // camera body serial
+    string lensSerial;         // lens serial
+    float subjectDistance = 0; // meters
+    string subsecTimeOriginal; // "625" etc (for pairing timestamp)
+    string companionFiles;     // JSON array: companion paths (future use)
+
     // State
     SyncState syncState = SyncState::LocalOnly;
 };
@@ -104,7 +120,19 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"longitude", e.longitude},
         {"altitude", e.altitude},
         {"developSettings", e.developSettings},
-        {"isManaged", e.isManaged}
+        {"isManaged", e.isManaged},
+        {"lensCorrectionParams", e.lensCorrectionParams},
+        {"exposureTime", e.exposureTime},
+        {"exposureBias", e.exposureBias},
+        {"orientation", e.orientation},
+        {"whiteBalance", e.whiteBalance},
+        {"focalLength35mm", e.focalLength35mm},
+        {"offsetTime", e.offsetTime},
+        {"bodySerial", e.bodySerial},
+        {"lensSerial", e.lensSerial},
+        {"subjectDistance", e.subjectDistance},
+        {"subsecTimeOriginal", e.subsecTimeOriginal},
+        {"companionFiles", e.companionFiles}
     };
 }
 
@@ -146,6 +174,19 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
 
     e.developSettings = j.value("developSettings", string(""));
     e.isManaged = j.value("isManaged", true);
+
+    e.lensCorrectionParams = j.value("lensCorrectionParams", string(""));
+    e.exposureTime = j.value("exposureTime", string(""));
+    e.exposureBias = j.value("exposureBias", 0.0f);
+    e.orientation = j.value("orientation", 1);
+    e.whiteBalance = j.value("whiteBalance", string(""));
+    e.focalLength35mm = j.value("focalLength35mm", 0);
+    e.offsetTime = j.value("offsetTime", string(""));
+    e.bodySerial = j.value("bodySerial", string(""));
+    e.lensSerial = j.value("lensSerial", string(""));
+    e.subjectDistance = j.value("subjectDistance", 0.0f);
+    e.subsecTimeOriginal = j.value("subsecTimeOriginal", string(""));
+    e.companionFiles = j.value("companionFiles", string(""));
 
     int state = j.value("syncState", 0);
     e.syncState = static_cast<SyncState>(state);
