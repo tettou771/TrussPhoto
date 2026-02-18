@@ -106,6 +106,7 @@ public:
 
     string text;
     Color textColor = Color(0.8f, 0.8f, 0.85f);
+    Color bgColor = Color(0.12f, 0.12f, 0.14f);
     Font* font = nullptr;  // set by PhotoGrid
 
     LabelNode() {
@@ -114,7 +115,7 @@ public:
 
     void draw() override {
         // Background
-        setColor(0.12f, 0.12f, 0.14f);
+        setColor(bgColor);
         fill();
         drawRect(0, 0, getWidth(), getHeight());
 
@@ -219,6 +220,7 @@ public:
         setSyncState(syncState);
         setSelected(selected);
         setIsVideo(isVideo);
+        label_->bgColor = isVideo ? Color(0.10f, 0.12f, 0.22f) : Color(0.12f, 0.12f, 0.14f);
         thumbnail_->clearImage();
 
         // Set Loading before firing request to prevent onActiveChanged re-request
@@ -251,21 +253,10 @@ public:
 
     // Badges drawn AFTER children (on top of thumbnail)
     void endDraw() override {
-        // Video play icon overlay (center of thumbnail)
-        if (isVideo_) {
-            float cx = getWidth() / 2;
-            float cy = getWidth() / 2;  // thumbnail is square
-            float r = 16;
-            // Semi-transparent circle background
-            setColor(0, 0, 0, 0.5f);
-            fill();
-            drawCircle(cx, cy, r);
-            // White play triangle
-            setColor(1, 1, 1, 0.9f);
-            drawTriangle(cx - r*0.35f, cy - r*0.5f,
-                         cx - r*0.35f, cy + r*0.5f,
-                         cx + r*0.55f, cy);
-        }
+        // Card border (same color as label background)
+        setColor(label_->bgColor);
+        noFill();
+        drawRect(0, 0, getWidth(), getHeight());
 
         // Sync state badge (bottom-right corner of thumbnail)
         float badgeSize = 8;
