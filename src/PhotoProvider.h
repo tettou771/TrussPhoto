@@ -2454,7 +2454,8 @@ private:
 
     // Supported standard image extensions
     static inline const unordered_set<string> standardExtensions_ = {
-        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tga", ".psd", ".hdr"
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tga", ".psd", ".hdr",
+        ".heic", ".heif"
     };
 
     bool isSupportedImage(const fs::path& path) const {
