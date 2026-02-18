@@ -218,6 +218,7 @@ def expand_poly(lrg: np.ndarray, order: int = 3) -> np.ndarray:
     """Expand (L, r, g) chromaticity to polynomial features with bias.
     order=2: 10 terms [1, L, r, g, L^2, r^2, g^2, Lr, Lg, rg]
     order=3: 20 terms (+ 10 cubic terms)
+    order=4: 35 terms (+ 15 quartic terms)
     """
     n = lrg.shape[0]
     L, r, g = lrg[:, 0], lrg[:, 1], lrg[:, 2]
@@ -225,6 +226,14 @@ def expand_poly(lrg: np.ndarray, order: int = 3) -> np.ndarray:
     if order >= 3:
         terms += [L*L*L, r*r*r, g*g*g,
                   L*L*r, L*L*g, L*r*r, L*g*g, r*r*g, r*g*g, L*r*g]
+    if order >= 4:
+        L2, r2, g2 = L*L, r*r, g*g
+        terms += [L2*L2, r2*r2, g2*g2,
+                  L2*L*r, L2*L*g,
+                  L*r2*r, r2*r*g,
+                  L*g2*g, r*g2*g,
+                  L2*r2, L2*g2, r2*g2,
+                  L2*r*g, L*r2*g, L*r*g2]
     return np.column_stack(terms)
 
 
@@ -234,6 +243,14 @@ def expand_poly_single(L, r, g, order: int = 3) -> np.ndarray:
     if order >= 3:
         terms += [L*L*L, r*r*r, g*g*g,
                   L*L*r, L*L*g, L*r*r, L*g*g, r*r*g, r*g*g, L*r*g]
+    if order >= 4:
+        L2, r2, g2 = L*L, r*r, g*g
+        terms += [L2*L2, r2*r2, g2*g2,
+                  L2*L*r, L2*L*g,
+                  L*r2*r, r2*r*g,
+                  L*g2*g, r*g2*g,
+                  L2*r2, L2*g2, r2*g2,
+                  L2*r*g, L*r2*g, L*r*g2]
     return np.array(terms)
 
 
@@ -253,8 +270,8 @@ def build_lut(src_all: np.ndarray, tgt_all: np.ndarray,
     # Convert to chromaticity space (L, r, g)
     src_lrg = rgb_to_lrg(src_sub)
 
-    # 3rd-order polynomial fit in chromaticity space
-    use_order = 3
+    # 4th-order polynomial fit in chromaticity space
+    use_order = 4
     X = expand_poly(src_lrg, use_order)
     n_terms = X.shape[1]
     M, _, _, _ = np.linalg.lstsq(X, tgt_sub, rcond=None)
