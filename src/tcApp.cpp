@@ -606,9 +606,10 @@ void tcApp::update() {
     // Process consolidation results
     provider_.processConsolidateResults();
 
-    // Process background RAW load completion
+    // Process background RAW load / video update
     if (viewMode() == ViewMode::Single) {
         viewManager_->singleView()->processRawLoadCompletion();
+        viewManager_->singleView()->processVideoUpdate();
     }
 
     // Process upload results

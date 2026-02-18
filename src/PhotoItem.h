@@ -204,8 +204,11 @@ public:
     void setClipMatch(bool v) { clipMatch_ = v; }
     bool isClipMatch() const { return clipMatch_; }
 
+    void setIsVideo(bool v) { isVideo_ = v; }
+    bool isVideo() const { return isVideo_; }
+
     void rebindAndLoad(int dataIndex, const string& label, SyncState syncState,
-                       bool selected, Font* font) {
+                       bool selected, bool isVideo, Font* font) {
         // Cancel pending load for old data
         if (loadState_ == LoadState::Loading && onRequestUnload)
             onRequestUnload(entryIndex_);
@@ -215,6 +218,7 @@ public:
         label_->font = font;
         setSyncState(syncState);
         setSelected(selected);
+        setIsVideo(isVideo);
         thumbnail_->clearImage();
 
         // Set Loading before firing request to prevent onActiveChanged re-request
@@ -230,18 +234,37 @@ public:
     }
     
     void draw() override {
-        // Hover highlight
+        // Hover highlight (background, behind thumbnail)
         if (isMouseOver()) {
             setColor(0.3f, 0.35f, 0.45f, 0.5f);
             fill();
             drawRect(0, 0, getWidth(), getHeight());
         }
 
-        // Selection highlight
+        // Selection highlight (background, behind thumbnail)
         if (isSelected_) {
             setColor(0.4f, 0.5f, 0.7f, 0.6f);
             fill();
             drawRect(0, 0, getWidth(), getHeight());
+        }
+    }
+
+    // Badges drawn AFTER children (on top of thumbnail)
+    void endDraw() override {
+        // Video play icon overlay (center of thumbnail)
+        if (isVideo_) {
+            float cx = getWidth() / 2;
+            float cy = getWidth() / 2;  // thumbnail is square
+            float r = 16;
+            // Semi-transparent circle background
+            setColor(0, 0, 0, 0.5f);
+            fill();
+            drawCircle(cx, cy, r);
+            // White play triangle
+            setColor(1, 1, 1, 0.9f);
+            drawTriangle(cx - r*0.35f, cy - r*0.5f,
+                         cx - r*0.35f, cy + r*0.5f,
+                         cx + r*0.55f, cy);
         }
 
         // Sync state badge (bottom-right corner of thumbnail)
@@ -324,6 +347,7 @@ private:
     ThumbnailNode::Ptr thumbnail_;
     LabelNode::Ptr label_;
     bool isSelected_ = false;
+    bool isVideo_ = false;
     bool clipMatch_ = false;
     bool pastMouseOver = false;
     LoadState loadState_ = LoadState::Unloaded;
