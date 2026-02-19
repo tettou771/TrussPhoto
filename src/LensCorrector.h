@@ -473,6 +473,64 @@ private:
         return values[nc - 1];
     }
 
+    // Compute minimum auto-scale so distortion remap never samples outside source bounds.
+    // Binary searches over output boundary points. Returns s >= 1.0.
+    float computeExifAutoScale(int srcW, int srcH, int outW, int outH,
+                                float cropCx, float cropCy,
+                                float srcCx, float srcCy, float invDiag) const {
+        float outHalfW = (outW - 1) * 0.5f;
+        float outHalfH = (outH - 1) * 0.5f;
+        int nc = exifKnotCount_;
+        const float* knots = exifKnots_;
+        const float* distVals = exifDistortion_;
+        const float* caR = exifCaR_;
+        const float* caB = exifCaB_;
+        bool doTca = hasExifTca_;
+
+        // 4 corners + 4 edge midpoints
+        struct Pt { float x, y; };
+        Pt tests[] = {
+            {0, 0}, {(float)(outW-1), 0},
+            {0, (float)(outH-1)}, {(float)(outW-1), (float)(outH-1)},
+            {outHalfW, 0}, {outHalfW, (float)(outH-1)},
+            {0, outHalfH}, {(float)(outW-1), outHalfH},
+        };
+        constexpr int nTests = 8;
+        float srcMaxX = (float)(srcW - 1);
+        float srcMaxY = (float)(srcH - 1);
+
+        auto checkScale = [&](float s) -> bool {
+            float inv = 1.0f / s;
+            for (int t = 0; t < nTests; t++) {
+                float ix = cropCx + (tests[t].x - outHalfW) * inv;
+                float iy = cropCy + (tests[t].y - outHalfH) * inv;
+                float px = ix - srcCx, py = iy - srcCy;
+                float radius = sqrt(px * px + py * py) * invDiag;
+                float dr = interpSpline(knots, distVals, nc, radius);
+                float sx = dr * px + srcCx;
+                float sy = dr * py + srcCy;
+                if (sx < 0 || sx > srcMaxX || sy < 0 || sy > srcMaxY) return false;
+                if (doTca) {
+                    float drR = dr * interpSpline(knots, caR, nc, radius);
+                    if (drR * px + srcCx < 0 || drR * px + srcCx > srcMaxX ||
+                        drR * py + srcCy < 0 || drR * py + srcCy > srcMaxY) return false;
+                    float drB = dr * interpSpline(knots, caB, nc, radius);
+                    if (drB * px + srcCx < 0 || drB * px + srcCx > srcMaxX ||
+                        drB * py + srcCy < 0 || drB * py + srcCy > srcMaxY) return false;
+                }
+            }
+            return true;
+        };
+
+        if (checkScale(1.0f)) return 1.0f;
+        float lo = 1.0f, hi = 1.5f;
+        for (int i = 0; i < 20; i++) {
+            float mid = (lo + hi) * 0.5f;
+            if (checkScale(mid)) hi = mid; else lo = mid;
+        }
+        return hi;
+    }
+
     bool applyExifFloat(Pixels& pixels) {
         int w = pixels.getWidth();
         int h = pixels.getHeight();
@@ -480,8 +538,8 @@ private:
         if (w != width_ || h != height_ || ch != 4) return false;
 
         float* data = pixels.getDataF32();
-        float cx = (w - 1) * 0.5f, cy = (h - 1) * 0.5f;
-        float invDiag = 1.0f / sqrt(cx * cx + cy * cy);
+        float srcCx = (w - 1) * 0.5f, srcCy = (h - 1) * 0.5f;
+        float invDiag = 1.0f / sqrt(srcCx * srcCx + srcCy * srcCy);
         int nThreads = max(1u, std::thread::hardware_concurrency());
         auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -494,12 +552,37 @@ private:
         bool doTca = hasExifTca_;
         bool doVig = hasExifVig_;
 
-        // Pass 1: Vignetting (in-place)
+        // Output dimensions: DefaultCrop if available, else same as source.
+        // For smart preview, scale crop coords to match SP resolution.
+        int outW, outH;
+        float cropCx, cropCy;
+        if (hasDefaultCrop_) {
+            float scaleX = 1.0f, scaleY = 1.0f;
+            if (intW_ > 0 && intH_ > 0 && w != intW_) {
+                scaleX = (float)w / intW_;
+                scaleY = (float)h / intH_;
+            }
+            outW = max(1, (int)round(cropW_ * scaleX));
+            outH = max(1, (int)round(cropH_ * scaleY));
+            cropCx = cropX_ * scaleX + (outW - 1) * 0.5f;
+            cropCy = cropY_ * scaleY + (outH - 1) * 0.5f;
+        } else {
+            outW = w;
+            outH = h;
+            cropCx = srcCx;
+            cropCy = srcCy;
+        }
+
+        float autoScale = computeExifAutoScale(w, h, outW, outH,
+                                                cropCx, cropCy,
+                                                srcCx, srcCy, invDiag);
+
+        // Pass 1: Vignetting (in-place on source)
         if (doVig) {
             parallelRows(h, nThreads, [=](int y) {
-                float dy = y - cy;
+                float dy = y - srcCy;
                 for (int x = 0; x < w; x++) {
-                    float dx = x - cx;
+                    float dx = x - srcCx;
                     float radius = sqrt(dx * dx + dy * dy) * invDiag;
                     float correction = interpSpline(knots, vigVals, nc, radius);
                     if (correction < 0.01f) correction = 0.01f;
@@ -512,14 +595,20 @@ private:
             });
         }
 
-        // Pass 2: Distortion + TCA (remap)
+        // Pass 2: Distortion + TCA + Crop + AutoScale (single remap)
         Pixels corrected;
-        corrected.allocate(w, h, ch, PixelFormat::F32);
+        corrected.allocate(outW, outH, ch, PixelFormat::F32);
         float* dst = corrected.getDataF32();
+        float outHalfW = (outW - 1) * 0.5f;
+        float outHalfH = (outH - 1) * 0.5f;
+        float invScale = 1.0f / autoScale;
 
-        parallelRows(h, nThreads, [=](int y) {
-            for (int x = 0; x < w; x++) {
-                float px = x - cx, py = y - cy;
+        parallelRows(outH, nThreads, [=](int y) {
+            for (int x = 0; x < outW; x++) {
+                // Map output pixel to intermediate image coords via crop center + auto-scale
+                float ix = cropCx + (x - outHalfW) * invScale;
+                float iy = cropCy + (y - outHalfH) * invScale;
+                float px = ix - srcCx, py = iy - srcCy;
                 float radius = sqrt(px * px + py * py) * invDiag;
 
                 for (int c = 0; c < 3; c++) {
@@ -528,18 +617,20 @@ private:
                         if (c == 0) dr *= interpSpline(knots, caR, nc, radius);
                         if (c == 2) dr *= interpSpline(knots, caB, nc, radius);
                     }
-                    float sx = dr * px + cx;
-                    float sy = dr * py + cy;
-                    dst[(y * w + x) * ch + c] = sampleBilinearF32(data, w, h, ch, c, sx, sy);
+                    float sx = dr * px + srcCx;
+                    float sy = dr * py + srcCy;
+                    dst[(y * outW + x) * ch + c] = sampleBilinearF32(data, w, h, ch, c, sx, sy);
                 }
-                dst[(y * w + x) * ch + 3] = 1.0f;
+                dst[(y * outW + x) * ch + 3] = 1.0f;
             }
         });
 
         auto t1 = std::chrono::high_resolution_clock::now();
         logNotice() << "[LensCorrector] EXIF correction: "
             << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
-            << "ms (" << nThreads << " threads, " << w << "x" << h << ")";
+            << "ms (" << nThreads << " threads, " << w << "x" << h
+            << " -> " << outW << "x" << outH
+            << " scale=" << autoScale << ")";
 
         pixels = std::move(corrected);
         return true;
@@ -552,8 +643,8 @@ private:
         if (w != width_ || h != height_ || ch != 4) return false;
 
         unsigned char* data = pixels.getData();
-        float cx = (w - 1) * 0.5f, cy = (h - 1) * 0.5f;
-        float invDiag = 1.0f / sqrt(cx * cx + cy * cy);
+        float srcCx = (w - 1) * 0.5f, srcCy = (h - 1) * 0.5f;
+        float invDiag = 1.0f / sqrt(srcCx * srcCx + srcCy * srcCy);
         int nThreads = max(1u, std::thread::hardware_concurrency());
 
         int nc = exifKnotCount_;
@@ -578,12 +669,36 @@ private:
             lutReady = true;
         }
 
+        // Output dimensions (same logic as F32 path)
+        int outW, outH;
+        float cropCx, cropCy;
+        if (hasDefaultCrop_) {
+            float scaleX = 1.0f, scaleY = 1.0f;
+            if (intW_ > 0 && intH_ > 0 && w != intW_) {
+                scaleX = (float)w / intW_;
+                scaleY = (float)h / intH_;
+            }
+            outW = max(1, (int)round(cropW_ * scaleX));
+            outH = max(1, (int)round(cropH_ * scaleY));
+            cropCx = cropX_ * scaleX + (outW - 1) * 0.5f;
+            cropCy = cropY_ * scaleY + (outH - 1) * 0.5f;
+        } else {
+            outW = w;
+            outH = h;
+            cropCx = srcCx;
+            cropCy = srcCy;
+        }
+
+        float autoScale = computeExifAutoScale(w, h, outW, outH,
+                                                cropCx, cropCy,
+                                                srcCx, srcCy, invDiag);
+
         // Pass 1: Vignetting (in-place, linear light)
         if (doVig) {
             parallelRows(h, nThreads, [=](int y) {
-                float dy = y - cy;
+                float dy = y - srcCy;
                 for (int x = 0; x < w; x++) {
-                    float dx = x - cx;
+                    float dx = x - srcCx;
                     float radius = sqrt(dx * dx + dy * dy) * invDiag;
                     float correction = interpSpline(knots, vigVals, nc, radius);
                     if (correction < 0.01f) correction = 0.01f;
@@ -600,14 +715,19 @@ private:
             });
         }
 
-        // Pass 2: Distortion + TCA (remap)
+        // Pass 2: Distortion + TCA + Crop + AutoScale (single remap)
         Pixels corrected;
-        corrected.allocate(w, h, ch);
+        corrected.allocate(outW, outH, ch);
         unsigned char* dst = corrected.getData();
+        float outHalfW = (outW - 1) * 0.5f;
+        float outHalfH = (outH - 1) * 0.5f;
+        float invScale = 1.0f / autoScale;
 
-        parallelRows(h, nThreads, [=](int y) {
-            for (int x = 0; x < w; x++) {
-                float px = x - cx, py = y - cy;
+        parallelRows(outH, nThreads, [=](int y) {
+            for (int x = 0; x < outW; x++) {
+                float ix = cropCx + (x - outHalfW) * invScale;
+                float iy = cropCy + (y - outHalfH) * invScale;
+                float px = ix - srcCx, py = iy - srcCy;
                 float radius = sqrt(px * px + py * py) * invDiag;
 
                 for (int c = 0; c < 3; c++) {
@@ -616,11 +736,11 @@ private:
                         if (c == 0) dr *= interpSpline(knots, caR, nc, radius);
                         if (c == 2) dr *= interpSpline(knots, caB, nc, radius);
                     }
-                    float sx = dr * px + cx;
-                    float sy = dr * py + cy;
-                    dst[(y * w + x) * ch + c] = sampleBilinear(data, w, h, ch, c, sx, sy);
+                    float sx = dr * px + srcCx;
+                    float sy = dr * py + srcCy;
+                    dst[(y * outW + x) * ch + c] = sampleBilinear(data, w, h, ch, c, sx, sy);
                 }
-                dst[(y * w + x) * ch + 3] = 255;
+                dst[(y * outW + x) * ch + 3] = 255;
             }
         });
 
@@ -631,6 +751,57 @@ private:
     // =========================================================================
     // DNG apply (WarpRectilinear + GainMap)
     // =========================================================================
+
+    // Compute minimum auto-scale for DNG WarpRectilinear remap.
+    float computeDngAutoScale(int srcW, int srcH, int outW, int outH,
+                               float cropCx, float cropCy) const {
+        float outHalfW = (outW - 1) * 0.5f;
+        float outHalfH = (outH - 1) * 0.5f;
+        int np = dngWarpPlanes_;
+        DngWarpPlane wp[3];
+        for (int i = 0; i < 3; i++) wp[i] = dngWarp_[min(i, np - 1)];
+        double cx = dngCx_, cy = dngCy_;
+        float srcMaxX = (float)(srcW - 1);
+        float srcMaxY = (float)(srcH - 1);
+
+        struct Pt { float x, y; };
+        Pt tests[] = {
+            {0, 0}, {(float)(outW-1), 0},
+            {0, (float)(outH-1)}, {(float)(outW-1), (float)(outH-1)},
+            {outHalfW, 0}, {outHalfW, (float)(outH-1)},
+            {0, outHalfH}, {(float)(outW-1), outHalfH},
+        };
+        constexpr int nTests = 8;
+
+        auto checkScale = [&](float s) -> bool {
+            float inv = 1.0f / s;
+            for (int t = 0; t < nTests; t++) {
+                float ix = cropCx + (tests[t].x - outHalfW) * inv;
+                float iy = cropCy + (tests[t].y - outHalfH) * inv;
+                double nx = (double)ix / (srcW - 1) - cx;
+                double ny = (double)iy / (srcH - 1) - cy;
+                double r2 = nx * nx + ny * ny;
+                double r4 = r2 * r2;
+                double r6 = r4 * r2;
+                for (int c = 0; c < 3; c++) {
+                    const auto& p = wp[c];
+                    double factor = p.kr[0] + p.kr[1] * r2 + p.kr[2] * r4 + p.kr[3] * r6;
+                    float sx = (float)((factor * nx + cx) * (srcW - 1));
+                    float sy = (float)((factor * ny + cy) * (srcH - 1));
+                    if (sx < 0 || sx > srcMaxX || sy < 0 || sy > srcMaxY) return false;
+                }
+            }
+            return true;
+        };
+
+        if (checkScale(1.0f)) return 1.0f;
+        float lo = 1.0f, hi = 1.5f;
+        for (int i = 0; i < 20; i++) {
+            float mid = (lo + hi) * 0.5f;
+            if (checkScale(mid)) hi = mid; else lo = mid;
+        }
+        return hi;
+    }
 
     bool applyDngFloat(Pixels& pixels) {
         int w = pixels.getWidth();
@@ -659,7 +830,6 @@ private:
 
                     int idx = (y * w + x) * ch;
                     for (int c = 0; c < 3; c++) {
-                        // Select gain map plane
                         int p = (mp >= 3) ? c : 0;
                         int stride = gc * mp;
                         float g00 = gm[gy0 * stride + gx0 * mp + p];
@@ -674,23 +844,50 @@ private:
             });
         }
 
-        // Pass 2: WarpRectilinear (per-channel polynomial remap)
+        // Pass 2: WarpRectilinear + Crop + AutoScale (single remap)
         if (dngWarpPlanes_ > 0) {
+            // Output dimensions
+            int outW, outH;
+            float cropCx, cropCy;
+            if (hasDefaultCrop_) {
+                float scaleX = 1.0f, scaleY = 1.0f;
+                if (intW_ > 0 && intH_ > 0 && w != intW_) {
+                    scaleX = (float)w / intW_;
+                    scaleY = (float)h / intH_;
+                }
+                outW = max(1, (int)round(cropW_ * scaleX));
+                outH = max(1, (int)round(cropH_ * scaleY));
+                cropCx = cropX_ * scaleX + (outW - 1) * 0.5f;
+                cropCy = cropY_ * scaleY + (outH - 1) * 0.5f;
+            } else {
+                outW = w;
+                outH = h;
+                cropCx = (w - 1) * 0.5f;
+                cropCy = (h - 1) * 0.5f;
+            }
+
+            float autoScale = computeDngAutoScale(w, h, outW, outH, cropCx, cropCy);
+
             Pixels corrected;
-            corrected.allocate(w, h, ch, PixelFormat::F32);
+            corrected.allocate(outW, outH, ch, PixelFormat::F32);
             float* dst = corrected.getDataF32();
 
             double cx = dngCx_, cy = dngCy_;
             int np = dngWarpPlanes_;
             DngWarpPlane wp[3];
             for (int i = 0; i < 3; i++) wp[i] = dngWarp_[min(i, np - 1)];
+            float outHalfW = (outW - 1) * 0.5f;
+            float outHalfH = (outH - 1) * 0.5f;
+            float invScale = 1.0f / autoScale;
 
-            parallelRows(h, nThreads, [=](int y) {
-                double ny = (double)y / (h - 1) - cy;
-                for (int x = 0; x < w; x++) {
-                    double nx = (double)x / (w - 1) - cx;
+            parallelRows(outH, nThreads, [=](int y) {
+                for (int x = 0; x < outW; x++) {
+                    float ix = cropCx + (x - outHalfW) * invScale;
+                    float iy = cropCy + (y - outHalfH) * invScale;
+                    double nx = (double)ix / (w - 1) - cx;
+                    double ny = (double)iy / (h - 1) - cy;
 
-                    int dstIdx = (y * w + x) * ch;
+                    int dstIdx = (y * outW + x) * ch;
                     for (int c = 0; c < 3; c++) {
                         const auto& p = wp[c];
                         double r2 = nx * nx + ny * ny;
@@ -700,8 +897,6 @@ private:
 
                         double sx = factor * nx + cx;
                         double sy = factor * ny + cy;
-
-                        // Convert normalized to pixel
                         float px = (float)(sx * (w - 1));
                         float py = (float)(sy * (h - 1));
                         dst[dstIdx + c] = sampleBilinearF32(data, w, h, ch, c, px, py);
@@ -713,7 +908,9 @@ private:
             auto t1 = std::chrono::high_resolution_clock::now();
             logNotice() << "[LensCorrector] DNG correction: "
                 << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
-                << "ms (" << nThreads << " threads, " << w << "x" << h << ")";
+                << "ms (" << nThreads << " threads, " << w << "x" << h
+                << " -> " << outW << "x" << outH
+                << " scale=" << autoScale << ")";
 
             pixels = std::move(corrected);
         }
@@ -778,23 +975,49 @@ private:
             });
         }
 
-        // Pass 2: WarpRectilinear (per-channel polynomial remap)
+        // Pass 2: WarpRectilinear + Crop + AutoScale (single remap)
         if (dngWarpPlanes_ > 0) {
+            int outW, outH;
+            float cropCx, cropCy;
+            if (hasDefaultCrop_) {
+                float scaleX = 1.0f, scaleY = 1.0f;
+                if (intW_ > 0 && intH_ > 0 && w != intW_) {
+                    scaleX = (float)w / intW_;
+                    scaleY = (float)h / intH_;
+                }
+                outW = max(1, (int)round(cropW_ * scaleX));
+                outH = max(1, (int)round(cropH_ * scaleY));
+                cropCx = cropX_ * scaleX + (outW - 1) * 0.5f;
+                cropCy = cropY_ * scaleY + (outH - 1) * 0.5f;
+            } else {
+                outW = w;
+                outH = h;
+                cropCx = (w - 1) * 0.5f;
+                cropCy = (h - 1) * 0.5f;
+            }
+
+            float autoScale = computeDngAutoScale(w, h, outW, outH, cropCx, cropCy);
+
             Pixels corrected;
-            corrected.allocate(w, h, ch);
+            corrected.allocate(outW, outH, ch);
             unsigned char* dst = corrected.getData();
 
             double cx = dngCx_, cy = dngCy_;
             int np = dngWarpPlanes_;
             DngWarpPlane wp[3];
             for (int i = 0; i < 3; i++) wp[i] = dngWarp_[min(i, np - 1)];
+            float outHalfW = (outW - 1) * 0.5f;
+            float outHalfH = (outH - 1) * 0.5f;
+            float invScale = 1.0f / autoScale;
 
-            parallelRows(h, nThreads, [=](int y) {
-                double ny = (double)y / (h - 1) - cy;
-                for (int x = 0; x < w; x++) {
-                    double nx = (double)x / (w - 1) - cx;
+            parallelRows(outH, nThreads, [=](int y) {
+                for (int x = 0; x < outW; x++) {
+                    float ix = cropCx + (x - outHalfW) * invScale;
+                    float iy = cropCy + (y - outHalfH) * invScale;
+                    double nx = (double)ix / (w - 1) - cx;
+                    double ny = (double)iy / (h - 1) - cy;
 
-                    int dstIdx = (y * w + x) * ch;
+                    int dstIdx = (y * outW + x) * ch;
                     for (int c = 0; c < 3; c++) {
                         const auto& p = wp[c];
                         double r2 = nx * nx + ny * ny;
@@ -804,7 +1027,6 @@ private:
 
                         double sx = factor * nx + cx;
                         double sy = factor * ny + cy;
-
                         float px = (float)(sx * (w - 1));
                         float py = (float)(sy * (h - 1));
                         dst[dstIdx + c] = sampleBilinear(data, w, h, ch, c, px, py);

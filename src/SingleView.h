@@ -197,11 +197,12 @@ public:
                 rawPixels_ = std::move(pendingRawPixels_);
                 fullPixels_ = rawPixels_.clone();
                 if (lensEnabled_ && lensCorrector_.isReady()) {
+                    // apply() includes distortion + crop + auto-scale in one pass
                     lensCorrector_.apply(fullPixels_);
+                } else {
+                    // Lens disabled: just crop intermediate → EXIF declared size
+                    lensCorrector_.applyDefaultCrop(fullPixels_);
                 }
-                // Post-correction crop: intermediate → EXIF declared size
-                // (e.g., 7041x4689 → 7008x4672 using DefaultCropOrigin)
-                lensCorrector_.applyDefaultCrop(fullPixels_);
                 fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
                 previewTexture_.clear();
                 logNotice() << "Full-size RAW loaded: " << rawPixels_.getWidth() << "x" << rawPixels_.getHeight()
@@ -643,12 +644,12 @@ private:
     void reprocessImage() {
         fullPixels_ = rawPixels_.clone();
         if (lensEnabled_ && lensCorrector_.isReady()) {
+            // apply() includes distortion + crop + auto-scale in one pass
             lensCorrector_.apply(fullPixels_);
+        } else {
+            // Lens disabled: just crop (full-size only; SP is auto-skipped)
+            lensCorrector_.applyDefaultCrop(fullPixels_);
         }
-        // Post-correction crop to EXIF declared dimensions.
-        // For full-size RAW: crops intermediate (e.g., 7041x4689) to final (7008x4672).
-        // For smart preview: skipped automatically (SP resolution < crop dimensions).
-        lensCorrector_.applyDefaultCrop(fullPixels_);
         fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
     }
 
