@@ -499,9 +499,9 @@ void tcApp::setup() {
 
     // 9.5 Face detection models (InsightFace SCRFD + ArcFace)
     {
-        string insightDir = getDataPath("insightface/");
-        provider_.initFaceModels(insightDir + "det_10g.onnx",
-                                 insightDir + "w600k_r50.onnx");
+        string md = AppPaths::modelsDir() + "/";
+        provider_.initFaceModels(md + "det_10g.onnx",
+                                 md + "w600k_r50.onnx");
     }
 
     // 10. SingleView init (camera profiles, LUT shader, lens correction)
