@@ -370,25 +370,38 @@ public:
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare(
             "UPDATE photos SET "
-            "lens_correction_params=?1, exposure_time=?2, exposure_bias=?3, "
-            "orientation=?4, white_balance=?5, focal_length_35mm=?6, "
-            "offset_time=?7, body_serial=?8, lens_serial=?9, "
-            "subject_distance=?10, subsec_time_original=?11, companion_files=?12 "
-            "WHERE id=?13");
+            "width=?1, height=?2, camera_make=?3, camera=?4, lens=?5, "
+            "focal_length=?6, aperture=?7, iso=?8, date_time_original=?9, "
+            "creative_style=?10, "
+            "lens_correction_params=?11, exposure_time=?12, exposure_bias=?13, "
+            "orientation=?14, white_balance=?15, focal_length_35mm=?16, "
+            "offset_time=?17, body_serial=?18, lens_serial=?19, "
+            "subject_distance=?20, subsec_time_original=?21, companion_files=?22 "
+            "WHERE id=?23");
         if (!stmt.valid()) return false;
-        stmt.bind(1, e.lensCorrectionParams);
-        stmt.bind(2, e.exposureTime);
-        stmt.bind(3, (double)e.exposureBias);
-        stmt.bind(4, e.orientation);
-        stmt.bind(5, e.whiteBalance);
-        stmt.bind(6, e.focalLength35mm);
-        stmt.bind(7, e.offsetTime);
-        stmt.bind(8, e.bodySerial);
-        stmt.bind(9, e.lensSerial);
-        stmt.bind(10, (double)e.subjectDistance);
-        stmt.bind(11, e.subsecTimeOriginal);
-        stmt.bind(12, e.companionFiles);
-        stmt.bind(13, e.id);
+        stmt.bind(1, e.width);
+        stmt.bind(2, e.height);
+        stmt.bind(3, e.cameraMake);
+        stmt.bind(4, e.camera);
+        stmt.bind(5, e.lens);
+        stmt.bind(6, (double)e.focalLength);
+        stmt.bind(7, (double)e.aperture);
+        stmt.bind(8, (double)e.iso);
+        stmt.bind(9, e.dateTimeOriginal);
+        stmt.bind(10, e.creativeStyle);
+        stmt.bind(11, e.lensCorrectionParams);
+        stmt.bind(12, e.exposureTime);
+        stmt.bind(13, (double)e.exposureBias);
+        stmt.bind(14, e.orientation);
+        stmt.bind(15, e.whiteBalance);
+        stmt.bind(16, e.focalLength35mm);
+        stmt.bind(17, e.offsetTime);
+        stmt.bind(18, e.bodySerial);
+        stmt.bind(19, e.lensSerial);
+        stmt.bind(20, (double)e.subjectDistance);
+        stmt.bind(21, e.subsecTimeOriginal);
+        stmt.bind(22, e.companionFiles);
+        stmt.bind(23, e.id);
         return stmt.execute();
     }
 

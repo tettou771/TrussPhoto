@@ -1565,10 +1565,14 @@ public:
         if (exifBackfillRunning_) return 0;
         vector<string> ids;
         for (const auto& [id, photo] : photos_) {
-            // Need backfill if v9 fields are empty and we have a local file
-            if (photo.lensCorrectionParams.empty() && photo.exposureTime.empty() &&
-                photo.orientation == 1 && photo.focalLength35mm == 0 &&
-                !photo.localPath.empty() && fs::exists(photo.localPath)) {
+            if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
+            // Queue if v9 fields are all at defaults (never extracted)
+            bool needsV9 = photo.lensCorrectionParams.empty() &&
+                           photo.exposureTime.empty() &&
+                           photo.orientation == 1 && photo.focalLength35mm == 0;
+            // Also queue if basic metadata is missing (e.g. DNG dimension issue)
+            bool needsBasic = (photo.width == 0 || photo.height == 0);
+            if (needsV9 || needsBasic) {
                 ids.push_back(id);
             }
         }
@@ -1585,6 +1589,20 @@ public:
             if (it == photos_.end()) continue;
             auto& photo = it->second;
             const auto& r = result.updatedFields;
+
+            // Basic metadata: only overwrite if currently missing
+            if (photo.width == 0 && r.width > 0) photo.width = r.width;
+            if (photo.height == 0 && r.height > 0) photo.height = r.height;
+            if (photo.cameraMake.empty() && !r.cameraMake.empty()) photo.cameraMake = r.cameraMake;
+            if (photo.camera.empty() && !r.camera.empty()) photo.camera = r.camera;
+            if (photo.lens.empty() && !r.lens.empty()) photo.lens = r.lens;
+            if (photo.focalLength == 0 && r.focalLength > 0) photo.focalLength = r.focalLength;
+            if (photo.aperture == 0 && r.aperture > 0) photo.aperture = r.aperture;
+            if (photo.iso == 0 && r.iso > 0) photo.iso = r.iso;
+            if (photo.dateTimeOriginal.empty() && !r.dateTimeOriginal.empty()) photo.dateTimeOriginal = r.dateTimeOriginal;
+            if (photo.creativeStyle.empty() && !r.creativeStyle.empty()) photo.creativeStyle = r.creativeStyle;
+
+            // v9 fields: always overwrite (backfill is the authority)
             photo.lensCorrectionParams = r.lensCorrectionParams;
             photo.exposureTime = r.exposureTime;
             photo.exposureBias = r.exposureBias;
@@ -3427,6 +3445,34 @@ private:
                             return 0;
                         };
 
+                        // Basic metadata (may be missing for some formats)
+                        temp.cameraMake = getString("Exif.Image.Make");
+                        temp.camera = getString("Exif.Image.Model");
+                        temp.lens = getString("Exif.Photo.LensModel");
+                        temp.focalLength = getFloat("Exif.Photo.FocalLength");
+                        temp.aperture = getFloat("Exif.Photo.FNumber");
+                        temp.iso = getFloat("Exif.Photo.ISOSpeedRatings");
+                        temp.dateTimeOriginal = getString("Exif.Photo.DateTimeOriginal");
+
+                        // Image dimensions
+                        auto wIt = exif.findKey(Exiv2::ExifKey("Exif.Photo.PixelXDimension"));
+                        auto hIt = exif.findKey(Exiv2::ExifKey("Exif.Photo.PixelYDimension"));
+                        if (wIt != exif.end()) temp.width = (int)wIt->toInt64();
+                        if (hIt != exif.end()) temp.height = (int)hIt->toInt64();
+                        if (temp.width == 0 || temp.height == 0) {
+                            auto w2 = exif.findKey(Exiv2::ExifKey("Exif.Image.ImageWidth"));
+                            auto h2 = exif.findKey(Exiv2::ExifKey("Exif.Image.ImageLength"));
+                            if (w2 != exif.end() && temp.width == 0) temp.width = (int)w2->toInt64();
+                            if (h2 != exif.end() && temp.height == 0) temp.height = (int)h2->toInt64();
+                        }
+                        // Fallback: SubImage1 (DNG main image)
+                        if (temp.width == 0 || temp.height == 0) {
+                            auto w3 = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.ImageWidth"));
+                            auto h3 = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.ImageLength"));
+                            if (w3 != exif.end() && temp.width == 0) temp.width = (int)w3->toInt64();
+                            if (h3 != exif.end() && temp.height == 0) temp.height = (int)h3->toInt64();
+                        }
+
                         // Extended shooting info
                         string et = getString("Exif.Photo.ExposureTime");
                         if (!et.empty()) {
@@ -3444,6 +3490,11 @@ private:
                         temp.lensSerial = getString("Exif.Photo.LensSerialNumber");
                         temp.subjectDistance = getFloat("Exif.Photo.SubjectDistance");
                         temp.subsecTimeOriginal = getString("Exif.Photo.SubSecTimeOriginal");
+
+                        // Creative Style
+                        string style = getString("Exif.Sony2.CreativeStyle");
+                        if (style.empty()) style = extractSigmaColorMode(exif);
+                        temp.creativeStyle = style;
 
                         // Lens correction
                         extractLensCorrectionParams(exif, temp);
