@@ -8,6 +8,7 @@
 #include <tcxCurl.h>
 #include "PhotoEntry.h"
 #include "ViewContainer.h"
+#include "PhotoStrip.h"
 #include "FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
 #include <deque>
 #include <thread>
@@ -26,8 +27,9 @@ class MapView : public ViewContainer {
 public:
     using Ptr = shared_ptr<MapView>;
 
-    // Set photos to display as pins (filters to GPS-only)
-    void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids) {
+    // Set photos to display as pins (filters to GPS-only) + populate strip
+    void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids,
+                   PhotoProvider& provider) {
         pins_.clear();
         for (size_t i = 0; i < photos.size(); i++) {
             if (photos[i].hasGps()) {
@@ -35,6 +37,17 @@ public:
             }
         }
         clusterZoom_ = -999;  // invalidate cluster cache
+
+        // Populate strip with all photos (GPS and non-GPS)
+        vector<bool> hasGps(ids.size());
+        for (size_t i = 0; i < photos.size(); i++)
+            hasGps[i] = photos[i].hasGps();
+        if (strip_) strip_->setPhotos(ids, hasGps, provider);
+    }
+
+    // Select a photo in the strip (scroll to center)
+    void setStripSelection(const string& photoId) {
+        if (strip_) strip_->selectPhoto(photoId);
     }
 
     // Set tile disk cache directory
@@ -65,7 +78,7 @@ public:
 
         // Find zoom level that fits all pins
         float w = getWidth();
-        float h = getHeight();
+        float h = mapHeight();
         if (w < 1 || h < 1) { zoom_ = 10; return; }
 
         for (int z = 18; z >= 1; z--) {
@@ -86,12 +99,30 @@ public:
     function<void(int index, const string& photoId)> onPinDoubleClick;  // double click on pin
     function<void()> onRedraw;
 
+    // Layout helpers
+    float stripHeight() const { return clamp(getHeight() * 0.15f, 80.0f, 160.0f); }
+    float mapHeight() const { return getHeight() - stripHeight(); }
+
+    void setSize(float w, float h) override {
+        RectNode::setSize(w, h);
+        layoutStrip();
+    }
+
     void setup() override {
         enableEvents();
+        setClipping(true);
         loadJapaneseFont(font_, 12);
         loadJapaneseFont(fontSmall_, 10);
 
         tileClient_.addHeader("User-Agent", "TrussPhoto/1.0");
+
+        // Photo strip at bottom
+        strip_ = make_shared<PhotoStrip>();
+        addChild(strip_);
+        strip_->onPhotoClick = [this](int idx, const string& id) {
+            if (onPinClick) onPinClick(idx, id);
+        };
+        layoutStrip();
     }
 
     void update() override {
@@ -130,7 +161,7 @@ public:
 
     void draw() override {
         float w = getWidth();
-        float h = getHeight();
+        float h = mapHeight();
 
         // Background
         setColor(0.12f, 0.12f, 0.14f);
@@ -251,17 +282,24 @@ public:
             font_.drawString("No geotagged photos", w / 2, h / 2,
                 Direction::Center, Direction::Center);
         }
+
+        // Separator line between map and strip
+        setColor(0.25f, 0.25f, 0.28f);
+        fill();
+        drawRect(0, h - 1, w, 1);
     }
 
     bool onMousePress(Vec2 pos, int button) override {
         if (button != 0) return false;
+        // Ignore clicks in strip area (let strip handle them)
+        if (pos.y >= mapHeight()) return false;
 
         // Hit test against cached clusters (world coords → screen coords)
         double qZoom = quantizeZoom(zoom_);
         double sf = pow(2.0, zoom_ - qZoom);
         auto centerPxQ = latLonToPixel(centerLat_, centerLon_, qZoom);
         float qLeft = centerPxQ.x * (float)sf - getWidth() / 2.0f;
-        float qTop  = centerPxQ.y * (float)sf - getHeight() / 2.0f;
+        float qTop  = centerPxQ.y * (float)sf - mapHeight() / 2.0f;
 
         for (const auto& cluster : cachedClusters_) {
             float sx = cluster.wx * (float)sf - qLeft;
@@ -329,6 +367,8 @@ public:
     }
 
     bool onMouseScroll(Vec2 pos, Vec2 scroll) override {
+        // Ignore scrolls in strip area (let strip handle them)
+        if (pos.y >= mapHeight()) return false;
         double oldZoom = zoom_;
         zoom_ += scroll.y * 0.05;
         zoom_ = clamp(zoom_, 1.0, 19.0);
@@ -345,7 +385,7 @@ public:
 
             // Keep the point under the mouse cursor fixed
             float w = getWidth();
-            float h = getHeight();
+            float h = mapHeight();
             float dx = pos.x - w / 2.0f;
             float dy = pos.y - h / 2.0f;
 
@@ -376,15 +416,24 @@ public:
     bool wantsSearchBar() const override { return false; }
     bool wantsLeftSidebar() const override { return false; }
 
-    // Stop background tile thread
+    // Stop background threads
     void shutdown() {
+        if (strip_) strip_->shutdown();
         tileThreadStop_ = true;
         if (tileThread_.joinable()) tileThread_.join();
+    }
+
+    // Update strip layout on resize
+    void layoutStrip() {
+        if (strip_) strip_->setRect(0, mapHeight(), getWidth(), stripHeight());
     }
 
 private:
     static constexpr float PIN_RADIUS = 8.0f;
     inline static const Color PIN_COLOR = Color(0.9f, 0.2f, 0.2f);
+
+    // Photo strip
+    PhotoStrip::Ptr strip_;
 
     // Map state
     double centerLat_ = 35.68;  // Tokyo default
