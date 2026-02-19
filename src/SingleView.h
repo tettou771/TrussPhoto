@@ -96,11 +96,6 @@ public:
 
                     // Step 2: Start full-size load in background
                     string path = entry->localPath;
-                    string cameraMake = entry->cameraMake;
-                    string camera = entry->camera;
-                    string lens = entry->lens;
-                    float focalLength = entry->focalLength;
-                    float aperture = entry->aperture;
 
                     rawLoadInProgress_ = true;
                     rawLoadCompleted_ = false;
@@ -108,14 +103,18 @@ public:
                     lensCorrector_.reset();
 
                     if (rawLoadThread_.joinable()) rawLoadThread_.join();
-                    rawLoadThread_ = thread([this, index, path, cameraMake, camera, lens, focalLength, aperture]() {
+                    rawLoadThread_ = thread([this, index, path]() {
                         Pixels loadedPixels;
                         if (RawLoader::loadFloat(path, loadedPixels)) {
+                            // LibRaw outputs the zero-cropped intermediate image
+                            // (e.g., 7041x4689). Lens correction uses this size as
+                            // the reference frame. DefaultCrop is applied AFTER
+                            // correction in processRawLoadCompletion/reprocessImage.
                             lock_guard<mutex> lock(rawLoadMutex_);
                             pendingRawPixels_ = std::move(loadedPixels);
                             int pw = pendingRawPixels_.getWidth();
                             int ph = pendingRawPixels_.getHeight();
-                            // EXIF embedded correction (Sony ARW / DNG)
+                            // EXIF embedded correction (Sony ARW + DNG OpcodeList)
                             lensCorrector_.setupFromExif(path, pw, ph);
                             rawLoadCompleted_ = true;
                         }
@@ -200,12 +199,48 @@ public:
                 if (lensEnabled_ && lensCorrector_.isReady()) {
                     lensCorrector_.apply(fullPixels_);
                 }
+                // Post-correction crop: intermediate → EXIF declared size
+                // (e.g., 7041x4689 → 7008x4672 using DefaultCropOrigin)
+                lensCorrector_.applyDefaultCrop(fullPixels_);
                 fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
                 previewTexture_.clear();
-                logNotice() << "Full-size RAW loaded: " << rawPixels_.getWidth() << "x" << rawPixels_.getHeight();
+                logNotice() << "Full-size RAW loaded: " << rawPixels_.getWidth() << "x" << rawPixels_.getHeight()
+                            << " → " << fullPixels_.getWidth() << "x" << fullPixels_.getHeight();
+
+                const string& spId = ctx_->grid->getPhotoId(selectedIndex_);
+
+                // Write intermediate dimensions + rotation-adjusted crop coords to DB.
+                // setupFromExif has transformed crop for portrait orientation;
+                // writing back ensures setupFromJson gets correct coords for SP display.
+                if (lensCorrector_.isReady()) {
+                    auto* entry2 = ctx_->provider->getPhoto(spId);
+                    if (entry2 && !entry2->lensCorrectionParams.empty()) {
+                        try {
+                            auto j = nlohmann::json::parse(entry2->lensCorrectionParams);
+                            if (!j.contains("intW")) {
+                                // Use lensCorrector's intW if set (Sony path),
+                                // otherwise use raw pixel dimensions (DNG path)
+                                int intW = lensCorrector_.intermediateWidth();
+                                int intH = lensCorrector_.intermediateHeight();
+                                if (intW == 0) {
+                                    intW = rawPixels_.getWidth();
+                                    intH = rawPixels_.getHeight();
+                                }
+                                j["intW"] = intW;
+                                j["intH"] = intH;
+                                if (lensCorrector_.hasDefaultCrop()) {
+                                    j["cropX"] = lensCorrector_.cropX();
+                                    j["cropY"] = lensCorrector_.cropY();
+                                    j["cropW"] = lensCorrector_.cropW();
+                                    j["cropH"] = lensCorrector_.cropH();
+                                }
+                                ctx_->provider->updateLensCorrectionParams(spId, j.dump());
+                            }
+                        } catch (...) {}
+                    }
+                }
 
                 // Generate smart preview if not yet done
-                const string& spId = ctx_->grid->getPhotoId(selectedIndex_);
                 if (!ctx_->provider->hasSmartPreview(spId)) {
                     ctx_->provider->generateSmartPreview(spId, rawPixels_);
                 }
@@ -610,6 +645,10 @@ private:
         if (lensEnabled_ && lensCorrector_.isReady()) {
             lensCorrector_.apply(fullPixels_);
         }
+        // Post-correction crop to EXIF declared dimensions.
+        // For full-size RAW: crops intermediate (e.g., 7041x4689) to final (7008x4672).
+        // For smart preview: skipped automatically (SP resolution < crop dimensions).
+        lensCorrector_.applyDefaultCrop(fullPixels_);
         fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
     }
 
