@@ -1,8 +1,10 @@
 #pragma once
 
 // =============================================================================
-// SingleView.h - Full-size image viewer with RAW loading, LUT, lens correction
-// Extracted from tcApp.cpp's drawSingleView() + related state.
+// SingleView.h - Full-size image viewer with RAW loading, GPU develop shader
+// =============================================================================
+// Pipeline: RAW → LibRaw → [CPU] NR → GPU upload (uncropped) →
+//           develop shader (lens + crop + LUT) → display
 // =============================================================================
 
 #include <TrussC.h>
@@ -14,6 +16,8 @@
 #include "MetadataPanel.h"
 #include "CameraProfileManager.h"
 #include "LensCorrector.h"
+#include "DevelopShader.h"
+#include "GuidedFilter.h"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -37,10 +41,13 @@ public:
     bool wantsSearchBar() const override { return false; }
     bool wantsLeftSidebar() const override { return false; }
 
+    // Callback when photo changes (for DevelopPanel slider sync)
+    function<void(float chroma, float luma)> onDenoiseRestored;
+
     // Initialize GPU resources (call once from tcApp::setup after addChild)
     void init(const string& profileDir) {
         profileManager_.setProfileDir(profileDir);
-        lutShader_.load();
+        developShader_.load();
     }
 
     // Check if a profile exists for a given camera/style combo
@@ -64,6 +71,11 @@ public:
 
         // Clean up previous state
         cleanupState();
+
+        // Restore NR settings from entry
+        chromaDenoise_ = entry->chromaDenoise;
+        lumaDenoise_ = entry->lumaDenoise;
+        if (onDenoiseRestored) onDenoiseRestored(chromaDenoise_, lumaDenoise_);
 
         bool loaded = false;
         isSmartPreview_ = false;
@@ -89,7 +101,7 @@ public:
 
                 if (hasPreview) {
                     previewTexture_.allocate(previewPixels, TextureUsage::Immutable, true);
-                    fullTexture_.clear();
+                    intermediateTexture_.clear();
                     rawPixels_.clear();
                     isRawImage_ = true;
                     loaded = true;
@@ -106,15 +118,10 @@ public:
                     rawLoadThread_ = thread([this, index, path]() {
                         Pixels loadedPixels;
                         if (RawLoader::loadFloat(path, loadedPixels)) {
-                            // LibRaw outputs the zero-cropped intermediate image
-                            // (e.g., 7041x4689). Lens correction uses this size as
-                            // the reference frame. DefaultCrop is applied AFTER
-                            // correction in processRawLoadCompletion/reprocessImage.
                             lock_guard<mutex> lock(rawLoadMutex_);
                             pendingRawPixels_ = std::move(loadedPixels);
                             int pw = pendingRawPixels_.getWidth();
                             int ph = pendingRawPixels_.getHeight();
-                            // EXIF embedded correction (Sony ARW + DNG OpcodeList)
                             lensCorrector_.setupFromExif(path, pw, ph);
                             rawLoadCompleted_ = true;
                         }
@@ -140,7 +147,7 @@ public:
                     lensCorrector_.setupFromJson(entry->lensCorrectionParams,
                         rawPixels_.getWidth(), rawPixels_.getHeight());
                 }
-                reprocessImage();
+                setupIntermediateFromRaw();
                 previewTexture_.clear();
                 isRawImage_ = true;
                 isSmartPreview_ = true;
@@ -195,32 +202,24 @@ public:
             lock_guard<mutex> lock(rawLoadMutex_);
             if (pendingRawPixels_.isAllocated()) {
                 rawPixels_ = std::move(pendingRawPixels_);
-                fullPixels_ = rawPixels_.clone();
-                if (lensEnabled_ && lensCorrector_.isReady()) {
-                    // apply() includes distortion + crop + auto-scale in one pass
-                    lensCorrector_.apply(fullPixels_);
-                } else {
-                    // Lens disabled: just crop intermediate → EXIF declared size
-                    lensCorrector_.applyDefaultCrop(fullPixels_);
-                }
-                fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
+
+                // Apply NR then upload uncropped intermediate
+                setupIntermediateFromRaw();
                 previewTexture_.clear();
-                logNotice() << "Full-size RAW loaded: " << rawPixels_.getWidth() << "x" << rawPixels_.getHeight()
-                            << " → " << fullPixels_.getWidth() << "x" << fullPixels_.getHeight();
+
+                logNotice() << "Full-size RAW loaded: "
+                            << rawPixels_.getWidth() << "x" << rawPixels_.getHeight()
+                            << " display=" << displayW_ << "x" << displayH_;
 
                 const string& spId = ctx_->grid->getPhotoId(selectedIndex_);
 
-                // Write intermediate dimensions + rotation-adjusted crop coords to DB.
-                // setupFromExif has transformed crop for portrait orientation;
-                // writing back ensures setupFromJson gets correct coords for SP display.
+                // Write intermediate dimensions + crop coords to DB
                 if (lensCorrector_.isReady()) {
                     auto* entry2 = ctx_->provider->getPhoto(spId);
                     if (entry2 && !entry2->lensCorrectionParams.empty()) {
                         try {
                             auto j = nlohmann::json::parse(entry2->lensCorrectionParams);
                             if (!j.contains("intW")) {
-                                // Use lensCorrector's intW if set (Sony path),
-                                // otherwise use raw pixel dimensions (DNG path)
                                 int intW = lensCorrector_.intermediateWidth();
                                 int intH = lensCorrector_.intermediateHeight();
                                 if (intW == 0) {
@@ -241,7 +240,7 @@ public:
                     }
                 }
 
-                // Generate smart preview if not yet done
+                // Generate smart preview (CPU lens correction, background)
                 if (!ctx_->provider->hasSmartPreview(spId)) {
                     ctx_->provider->generateSmartPreview(spId, rawPixels_);
                 }
@@ -256,42 +255,46 @@ public:
         rawLoadCompleted_ = false;
     }
 
-    // Draw the image (called from tcApp::draw or node draw)
+    // Draw the image
     void drawView() {
-        // Video playback
         if (isVideo_) {
             drawVideoView();
             return;
         }
 
-        bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
+        bool hasIntermediate = isRawImage_ && intermediateTexture_.isAllocated();
         bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
-        bool hasImage = isRawImage_ ? (hasFullRaw || hasPreviewRaw) : fullImage_.isAllocated();
+        bool hasImage = isRawImage_ ? (hasIntermediate || hasPreviewRaw) : fullImage_.isAllocated();
         if (!hasImage) return;
 
-        Texture* rawTex = hasFullRaw ? &fullTexture_ : &previewTexture_;
-        float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
-        float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
+        // Display dimensions: crop output or full texture
+        float imgW, imgH;
+        if (hasIntermediate) {
+            imgW = (float)displayW_;
+            imgH = (float)displayH_;
+        } else if (hasPreviewRaw) {
+            imgW = previewTexture_.getWidth();
+            imgH = previewTexture_.getHeight();
+        } else {
+            imgW = fullImage_.getWidth();
+            imgH = fullImage_.getHeight();
+        }
+
         float winW = getWidth();
         float winH = getHeight();
-
         float fitScale = min(winW / imgW, winH / imgH);
         float scale = fitScale * zoomLevel_;
-
         float drawW = imgW * scale;
         float drawH = imgH * scale;
 
         // Clamp pan offset
-        if (drawW <= winW) {
-            panOffset_.x = 0;
-        } else {
+        if (drawW <= winW) panOffset_.x = 0;
+        else {
             float maxPanX = (drawW - winW) / 2;
             panOffset_.x = clamp(panOffset_.x, -maxPanX, maxPanX);
         }
-
-        if (drawH <= winH) {
-            panOffset_.y = 0;
-        } else {
+        if (drawH <= winH) panOffset_.y = 0;
+        else {
             float maxPanY = (drawH - winH) / 2;
             panOffset_.y = clamp(panOffset_.y, -maxPanY, maxPanY);
         }
@@ -300,23 +303,20 @@ public:
         float y = (winH - drawH) / 2 + panOffset_.y;
 
         setColor(1.0f, 1.0f, 1.0f);
-        // LUT only on LibRaw-decoded images (fullTexture_), NOT on:
-        // - embedded JPEG preview (previewTexture_) — already has camera style
-        // - non-RAW images (fullImage_) — already has camera style
-        bool useLut = hasFullRaw && hasProfileLut_ && profileEnabled_ && profileBlend_ > 0.0f;
-        if (useLut) {
-            lutShader_.setLut(profileLut_);
-            lutShader_.setBlend(profileBlend_);
-            lutShader_.setTexture(fullTexture_);
-            lutShader_.draw(x, y, drawW, drawH);
-        } else if (isRawImage_) {
-            rawTex->draw(x, y, drawW, drawH);
+
+        if (hasIntermediate) {
+            // DevelopShader handles lens + crop + LUT in one pass
+            developShader_.draw(x, y, drawW, drawH);
+        } else if (hasPreviewRaw) {
+            // Embedded JPEG preview: draw directly (already has camera style)
+            previewTexture_.draw(x, y, drawW, drawH);
         } else {
+            // Non-RAW image: draw directly
             fullImage_.draw(x, y, drawW, drawH);
         }
     }
 
-    // Handle key input (returns true if handled)
+    // Handle key input
     bool handleKey(int key) {
         if (!ctx_) return false;
         auto& grid = ctx_->grid;
@@ -338,7 +338,6 @@ public:
                 videoPlayer_.setCurrentTime(min(t, videoPlayer_.getDuration()));
                 return true;
             }
-            // No other keys for video
             return false;
         }
 
@@ -353,6 +352,7 @@ public:
         if (key == 'P' || key == 'p') {
             if (hasProfileLut_) {
                 profileEnabled_ = !profileEnabled_;
+                developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
                 logNotice() << "[Profile] " << (profileEnabled_ ? "ON" : "OFF");
             }
             return true;
@@ -360,6 +360,7 @@ public:
         if (key == SAPP_KEYCODE_LEFT_BRACKET) {
             if (hasProfileLut_) {
                 profileBlend_ = clamp(profileBlend_ - 0.1f, 0.0f, 1.0f);
+                developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
                 logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
             }
             return true;
@@ -367,6 +368,7 @@ public:
         if (key == SAPP_KEYCODE_RIGHT_BRACKET) {
             if (hasProfileLut_) {
                 profileBlend_ = clamp(profileBlend_ + 0.1f, 0.0f, 1.0f);
+                developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
                 logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
             }
             return true;
@@ -397,7 +399,7 @@ public:
                         lensCorrector_.setupFromJson(spEntry->lensCorrectionParams,
                             rawPixels_.getWidth(), rawPixels_.getHeight());
                     }
-                    reprocessImage();
+                    setupIntermediateFromRaw();
                     previewTexture_.clear();
                     isSmartPreview_ = true;
                     logNotice() << "[Debug] Forced smart preview: " << photoId;
@@ -411,19 +413,42 @@ public:
             lensEnabled_ = !lensEnabled_;
             logNotice() << "[LensCorrection] " << (lensEnabled_ ? "ON" : "OFF")
                         << " (" << lensCorrector_.correctionSource() << ")";
-            if (selectedIndex_ >= 0 && isRawImage_ && rawPixels_.isAllocated()) {
-                reprocessImage();
-            }
+            // GPU uniform change only — instant!
+            developShader_.setLensEnabled(lensEnabled_);
+            updateDisplayDimensions();
             return true;
         }
 
         return false;
     }
 
-    // Handle mouse press for panning / seek bar
+    // Called when DevelopPanel NR sliders change
+    void onDenoiseChanged(float chroma, float luma) {
+        chromaDenoise_ = chroma;
+        lumaDenoise_ = luma;
+
+        if (!isRawImage_ || !rawPixels_.isAllocated()) return;
+
+        // Re-apply NR to raw pixels and re-upload
+        nrPixels_ = rawPixels_.clone();
+        if (chromaDenoise_ > 0 || lumaDenoise_ > 0) {
+            tp::guidedDenoise(nrPixels_, chromaDenoise_, lumaDenoise_);
+        }
+        intermediateTexture_.allocate(nrPixels_, TextureUsage::Immutable, true);
+        developShader_.setSourceTexture(intermediateTexture_);
+
+        // Save to DB
+        if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
+            const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
+            ctx_->provider->setDenoise(pid, chroma, luma);
+        }
+
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+    }
+
+    // Handle mouse input
     bool handleMousePress(Vec2 pos, int button) {
         if (button == 0) {
-            // Video seek bar click
             if (isVideo_) {
                 float barY = getHeight() - seekBarHeight_;
                 if (pos.y >= barY) {
@@ -432,7 +457,7 @@ public:
                     videoPlayer_.setPosition(pct);
                     return true;
                 }
-                return false;  // no pan for video
+                return false;
             }
             isDragging_ = true;
             dragStart_ = pos;
@@ -443,10 +468,7 @@ public:
 
     bool handleMouseRelease(int button) {
         if (button == 0) {
-            if (seekDragging_) {
-                seekDragging_ = false;
-                return true;
-            }
+            if (seekDragging_) { seekDragging_ = false; return true; }
             isDragging_ = false;
             return true;
         }
@@ -455,7 +477,6 @@ public:
 
     bool handleMouseDrag(Vec2 pos, int button) {
         if (button == 0) {
-            // Video seek bar scrub
             if (seekDragging_ && isVideo_) {
                 float pct = clamp(pos.x / getWidth(), 0.0f, 1.0f);
                 videoPlayer_.setPosition(pct);
@@ -474,15 +495,25 @@ public:
     }
 
     bool handleMouseScroll(Vec2 delta) {
-        if (isVideo_) return false;  // no zoom for video
-        bool hasFullRaw = isRawImage_ && fullTexture_.isAllocated();
+        if (isVideo_) return false;
+
+        bool hasIntermediate = isRawImage_ && intermediateTexture_.isAllocated();
         bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
-        bool hasImage = isRawImage_ ? (hasFullRaw || hasPreviewRaw) : fullImage_.isAllocated();
+        bool hasImage = isRawImage_ ? (hasIntermediate || hasPreviewRaw) : fullImage_.isAllocated();
         if (!hasImage) return false;
 
-        Texture* rawTex = hasFullRaw ? &fullTexture_ : &previewTexture_;
-        float imgW = isRawImage_ ? rawTex->getWidth() : fullImage_.getWidth();
-        float imgH = isRawImage_ ? rawTex->getHeight() : fullImage_.getHeight();
+        float imgW, imgH;
+        if (hasIntermediate) {
+            imgW = (float)displayW_;
+            imgH = (float)displayH_;
+        } else if (hasPreviewRaw) {
+            imgW = previewTexture_.getWidth();
+            imgH = previewTexture_.getHeight();
+        } else {
+            imgW = fullImage_.getWidth();
+            imgH = fullImage_.getHeight();
+        }
+
         float winW = getWidth();
         float winH = getHeight();
 
@@ -491,7 +522,6 @@ public:
         zoomLevel_ = clamp(zoomLevel_, 1.0f, 10.0f);
 
         Vec2 mousePos(getGlobalMouseX(), getGlobalMouseY());
-        // Convert to local coordinates using node position
         mousePos.x -= getX();
         mousePos.y -= getY();
 
@@ -515,8 +545,9 @@ public:
     bool isSmartPreview() const { return isSmartPreview_; }
     bool isRawImage() const { return isRawImage_; }
     bool isVideo() const { return isVideo_; }
+    float chromaDenoise() const { return chromaDenoise_; }
+    float lumaDenoise() const { return lumaDenoise_; }
 
-    // Update metadata panel with current view state
     void updateViewInfo() {
         if (ctx_ && ctx_->metadataPanel) {
             ctx_->metadataPanel->setViewInfo({
@@ -532,7 +563,6 @@ public:
         }
     }
 
-    // Update metadata panel with current photo info
     void updateMetadata() {
         if (!ctx_ || selectedIndex_ < 0) return;
         if (selectedIndex_ >= (int)ctx_->grid->getPhotoIdCount()) return;
@@ -546,21 +576,18 @@ public:
         updateViewInfo();
     }
 
-    // Get the current photo ID (for V key → related view, F key → relink)
     string currentPhotoId() const {
         if (!ctx_ || selectedIndex_ < 0) return "";
         if (selectedIndex_ >= (int)ctx_->grid->getPhotoIdCount()) return "";
         return ctx_->grid->getPhotoId(selectedIndex_);
     }
 
-    // Check if an embedding exists for current photo
     bool hasEmbedding() const {
         if (!ctx_) return false;
         string id = currentPhotoId();
         return !id.empty() && ctx_->provider->getCachedEmbedding(id);
     }
 
-    // Join background thread (for exit)
     void joinRawLoadThread() {
         if (rawLoadThread_.joinable()) rawLoadThread_.join();
     }
@@ -572,11 +599,14 @@ private:
     int selectedIndex_ = -1;
     Image fullImage_;
     Pixels rawPixels_;
-    Pixels fullPixels_;
-    Texture fullTexture_;
+    Pixels nrPixels_;            // NR result cache
+    Texture intermediateTexture_; // Full uncropped intermediate (NR'd)
     Texture previewTexture_;
     bool isRawImage_ = false;
     bool isSmartPreview_ = false;
+
+    // Display dimensions (after crop, for fit-to-window calculation)
+    int displayW_ = 0, displayH_ = 0;
 
     // Pan/zoom
     Vec2 panOffset_ = {0, 0};
@@ -594,16 +624,22 @@ private:
 
     // Camera profile (LUT)
     CameraProfileManager profileManager_;
-    lut::LutShader lutShader_;
     lut::Lut3D profileLut_;
     bool hasProfileLut_ = false;
     bool profileEnabled_ = true;
     float profileBlend_ = 1.0f;
     string currentProfilePath_;
 
+    // Unified develop shader (replaces lutShader_)
+    DevelopShader developShader_;
+
     // Lens correction
     LensCorrector lensCorrector_;
     bool lensEnabled_ = true;
+
+    // Noise reduction
+    float chromaDenoise_ = 0.5f;
+    float lumaDenoise_ = 0.0f;
 
     // Video playback
     VideoPlayer videoPlayer_;
@@ -612,7 +648,6 @@ private:
     float seekBarHeight_ = 40.0f;
 
     void cleanupState() {
-        // Video cleanup
         if (isVideo_) {
             videoPlayer_.close();
             isVideo_ = false;
@@ -625,8 +660,8 @@ private:
 
         if (isRawImage_) {
             rawPixels_.clear();
-            fullPixels_.clear();
-            fullTexture_.clear();
+            nrPixels_.clear();
+            intermediateTexture_.clear();
             previewTexture_.clear();
             { lock_guard<mutex> lock(rawLoadMutex_); pendingRawPixels_.clear(); }
         } else {
@@ -635,22 +670,93 @@ private:
         isRawImage_ = false;
         isSmartPreview_ = false;
         selectedIndex_ = -1;
+        displayW_ = displayH_ = 0;
 
         hasProfileLut_ = false;
         profileLut_.clear();
         currentProfilePath_.clear();
+        developShader_.clearLut();
+        developShader_.clearLensData();
     }
 
-    void reprocessImage() {
-        fullPixels_ = rawPixels_.clone();
-        if (lensEnabled_ && lensCorrector_.isReady()) {
-            // apply() includes distortion + crop + auto-scale in one pass
-            lensCorrector_.apply(fullPixels_);
-        } else {
-            // Lens disabled: just crop (full-size only; SP is auto-skipped)
-            lensCorrector_.applyDefaultCrop(fullPixels_);
+    // Apply NR to rawPixels_, upload as intermediate texture, setup develop shader
+    void setupIntermediateFromRaw() {
+        int srcW = rawPixels_.getWidth();
+        int srcH = rawPixels_.getHeight();
+
+        // Apply noise reduction
+        nrPixels_ = rawPixels_.clone();
+        if (chromaDenoise_ > 0 || lumaDenoise_ > 0) {
+            tp::guidedDenoise(nrPixels_, chromaDenoise_, lumaDenoise_);
         }
-        fullTexture_.allocate(fullPixels_, TextureUsage::Immutable, true);
+
+        // Upload full uncropped intermediate
+        intermediateTexture_.allocate(nrPixels_, TextureUsage::Immutable, true);
+        developShader_.setSourceTexture(intermediateTexture_);
+
+        // Setup lens correction data for GPU
+        if (lensCorrector_.isReady()) {
+            // Distortion + TCA LUT (Sony/Fuji path)
+            auto distLut = lensCorrector_.generateDistortionLUT();
+            developShader_.updateLensLUT(distLut.data(), 512);
+
+            // Vignetting map
+            int vigRows, vigCols;
+            auto vigMap = lensCorrector_.generateVignettingMap(vigRows, vigCols);
+            developShader_.updateVigMap(vigMap.data(), vigRows, vigCols);
+        }
+
+        // Setup uniform params
+        setupDevelopShaderParams(srcW, srcH);
+
+        // Setup LUT
+        if (hasProfileLut_) {
+            developShader_.setLut(profileLut_);
+            developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+        }
+    }
+
+    void setupDevelopShaderParams(int srcW, int srcH) {
+        float cropRect[4];
+        float optCenter[2];
+
+        lensCorrector_.getGpuCropRect(srcW, srcH, cropRect);
+        lensCorrector_.getGpuOpticalCenter(srcW, srcH, optCenter);
+        float invDiag = lensCorrector_.getGpuInvDiag(srcW, srcH);
+        float autoScale = lensCorrector_.isReady()
+            ? lensCorrector_.getGpuAutoScale(srcW, srcH) : 1.0f;
+
+        developShader_.setLensParams(
+            lensEnabled_ && lensCorrector_.isReady(),
+            autoScale,
+            cropRect[0], cropRect[1], cropRect[2], cropRect[3],
+            optCenter[0], optCenter[1], invDiag,
+            (float)srcW, (float)srcH
+        );
+
+        updateDisplayDimensions();
+    }
+
+    void updateDisplayDimensions() {
+        if (!intermediateTexture_.isAllocated()) return;
+        int srcW = intermediateTexture_.getWidth();
+        int srcH = intermediateTexture_.getHeight();
+
+        if (lensEnabled_ && lensCorrector_.hasDefaultCrop()) {
+            float cropRect[4];
+            lensCorrector_.getGpuCropRect(srcW, srcH, cropRect);
+            displayW_ = max(1, (int)round(cropRect[2] * srcW));
+            displayH_ = max(1, (int)round(cropRect[3] * srcH));
+        } else if (lensCorrector_.hasDefaultCrop()) {
+            // Lens disabled but has crop data → still crop
+            float cropRect[4];
+            lensCorrector_.getGpuCropRect(srcW, srcH, cropRect);
+            displayW_ = max(1, (int)round(cropRect[2] * srcW));
+            displayH_ = max(1, (int)round(cropRect[3] * srcH));
+        } else {
+            displayW_ = srcW;
+            displayH_ = srcH;
+        }
     }
 
     void drawVideoView() {
@@ -660,9 +766,8 @@ private:
         float imgW = videoPlayer_.getWidth();
         float imgH = videoPlayer_.getHeight();
         float winW = getWidth();
-        float winH = getHeight() - seekBarHeight_;  // leave room for seek bar
+        float winH = getHeight() - seekBarHeight_;
 
-        // Fit-to-contain (no zoom)
         float fitScale = min(winW / imgW, winH / imgH);
         float drawW = imgW * fitScale;
         float drawH = imgH * fitScale;
@@ -678,46 +783,36 @@ private:
         float dur = videoPlayer_.getDuration();
         float cur = pos * dur;
 
-        // Background
         setColor(0, 0, 0, 0.6f);
         fill();
         drawRect(0, barY, getWidth(), seekBarHeight_);
 
-        // Play/pause icon (left side)
         float iconX = 20;
         float iconY = barY + seekBarHeight_ / 2;
         setColor(1, 1, 1, 0.9f);
         if (videoPlayer_.isPlaying()) {
-            // Pause icon (two bars)
             fill();
             drawRect(iconX - 4, iconY - 8, 4, 16);
             drawRect(iconX + 4, iconY - 8, 4, 16);
         } else {
-            // Play triangle
             fill();
             drawTriangle(iconX - 4, iconY - 8,
                          iconX - 4, iconY + 8,
                          iconX + 8, iconY);
         }
 
-        // Progress bar
         float barX = 44;
-        float barW = getWidth() - barX - 100;  // leave space for time label
+        float barW = getWidth() - barX - 100;
         float barMidY = barY + seekBarHeight_ / 2;
 
-        // Track background
         setColor(0.3f, 0.3f, 0.35f);
         fill();
         drawRect(barX, barMidY - 2, barW, 4);
 
-        // Progress fill
         setColor(0.5f, 0.7f, 1.0f);
         drawRect(barX, barMidY - 2, barW * pos, 4);
-
-        // Playhead
         drawCircle(barX + barW * pos, barMidY, 6);
 
-        // Time label
         setColor(0.8f, 0.8f, 0.85f);
         string timeStr = formatTime(cur) + " / " + formatTime(dur);
         pushStyle();
@@ -741,6 +836,7 @@ private:
             if (cubePath.empty()) {
                 hasProfileLut_ = false;
                 currentProfilePath_.clear();
+                developShader_.clearLut();
             }
             return;
         }
@@ -748,10 +844,13 @@ private:
         if (profileLut_.load(cubePath)) {
             hasProfileLut_ = true;
             currentProfilePath_ = cubePath;
+            developShader_.setLut(profileLut_);
+            developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
             logNotice() << "[Profile] Loaded: " << cubePath;
         } else {
             hasProfileLut_ = false;
             currentProfilePath_.clear();
+            developShader_.clearLut();
             logWarning() << "[Profile] Failed to load: " << cubePath;
         }
     }

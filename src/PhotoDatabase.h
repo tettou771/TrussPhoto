@@ -15,7 +15,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 9;
+    static constexpr int SCHEMA_VERSION = 10;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -82,7 +82,9 @@ public:
                 "  lens_serial         TEXT NOT NULL DEFAULT '',"
                 "  subject_distance    REAL NOT NULL DEFAULT 0,"
                 "  subsec_time_original TEXT NOT NULL DEFAULT '',"
-                "  companion_files     TEXT NOT NULL DEFAULT ''"
+                "  companion_files     TEXT NOT NULL DEFAULT '',"
+                "  chroma_denoise      REAL NOT NULL DEFAULT 0.5,"
+                "  luma_denoise        REAL NOT NULL DEFAULT 0.0"
                 ")"
             );
             if (!ok) return false;
@@ -224,8 +226,25 @@ public:
                     return false;
                 }
             }
+            version = 9;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v8 -> v9";
+        }
+
+        // v9 -> v10: add denoise settings
+        if (version == 9) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN chroma_denoise REAL NOT NULL DEFAULT 0.5",
+                "ALTER TABLE photos ADD COLUMN luma_denoise REAL NOT NULL DEFAULT 0.0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v9->v10 failed: " << sql;
+                    return false;
+                }
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v8 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v9 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -246,10 +265,10 @@ public:
             "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
             "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
             "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
-            "subsec_time_original, companion_files) "
+            "subsec_time_original, companion_files, chroma_denoise, luma_denoise) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
-            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48)"
+            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50)"
         );
         if (!stmt.valid()) return false;
         bindEntry(stmt, e);
@@ -343,6 +362,16 @@ public:
         if (!stmt.valid()) return false;
         stmt.bind(1, tags);
         stmt.bind(2, updatedAt);
+        stmt.bind(3, id);
+        return stmt.execute();
+    }
+
+    bool updateDenoise(const string& id, float chroma, float luma) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET chroma_denoise=?1, luma_denoise=?2 WHERE id=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, (double)chroma);
+        stmt.bind(2, (double)luma);
         stmt.bind(3, id);
         return stmt.execute();
     }
@@ -456,10 +485,10 @@ public:
             "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
             "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
             "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
-            "subsec_time_original, companion_files) "
+            "subsec_time_original, companion_files, chroma_denoise, luma_denoise) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
-            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48)"
+            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50)"
         );
         if (!stmt.valid()) {
             db_.rollback();
@@ -493,7 +522,7 @@ public:
             "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
             "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
             "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
-            "subsec_time_original, companion_files "
+            "subsec_time_original, companion_files, chroma_denoise, luma_denoise "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -548,6 +577,8 @@ public:
             e.subjectDistance     = (float)stmt.getDouble(45);
             e.subsecTimeOriginal = stmt.getText(46);
             e.companionFiles     = stmt.getText(47);
+            e.chromaDenoise      = (float)stmt.getDouble(48);
+            e.lumaDenoise        = (float)stmt.getDouble(49);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -1169,5 +1200,7 @@ private:
         stmt.bind(46, (double)e.subjectDistance);
         stmt.bind(47, e.subsecTimeOriginal);
         stmt.bind(48, e.companionFiles);
+        stmt.bind(49, (double)e.chromaDenoise);
+        stmt.bind(50, (double)e.lumaDenoise);
     }
 };

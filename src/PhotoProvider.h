@@ -639,6 +639,15 @@ public:
         return true;
     }
 
+    bool setDenoise(const string& id, float chroma, float luma) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        it->second.chromaDenoise = chroma;
+        it->second.lumaDenoise = luma;
+        db_.updateDenoise(id, chroma, luma);
+        return true;
+    }
+
     bool setColorLabel(const string& id, const string& label) {
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
@@ -3595,7 +3604,7 @@ private:
                         completedExifBackfills_.push_back({id, std::move(temp)});
                     }
 
-                    if ((idx + 1) % 100 == 0) {
+                    if (total > 0 && (idx + 1) % (max(1, total / 4)) == 0) {
                         logNotice() << "[ExifBackfill] " << (idx + 1) << "/" << total;
                     }
                 }

@@ -10,6 +10,7 @@
 #include "PhotoProvider.h"
 #include "FolderTree.h"
 #include "MetadataPanel.h"
+#include "DevelopPanel.h"
 #include "PaneToggle.h"
 #include "SearchBar.h"
 #include "ViewManager.h"
@@ -52,6 +53,8 @@ private:
     // UI
     FolderTree::Ptr folderTree_;
     MetadataPanel::Ptr metadataPanel_;
+    DevelopPanel::Ptr developPanel_;
+    bool showDevelop_ = false;
     SearchBar::Ptr searchBar_;
     float searchBarHeight_ = 36;
     PaneToggle::Ptr leftToggle_;

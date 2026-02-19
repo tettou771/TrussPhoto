@@ -265,6 +265,145 @@ public:
     }
 
     // =========================================================================
+    // GPU shader data generation (for DevelopShader)
+    // =========================================================================
+
+    // Generate 1D distortion+TCA LUT for GPU shader (512 RGBA32F entries).
+    // R = distortion * caR factor, G = distortion, B = distortion * caB factor.
+    // For Sony/Fuji spline-based corrections.
+    vector<float> generateDistortionLUT(int lutSize = 512) const {
+        vector<float> lut(lutSize * 4, 0.0f);
+        if (!ready_ || useDng_) {
+            // Identity for DNG or not ready
+            for (int i = 0; i < lutSize; i++) {
+                lut[i * 4 + 0] = 1.0f;
+                lut[i * 4 + 1] = 1.0f;
+                lut[i * 4 + 2] = 1.0f;
+                lut[i * 4 + 3] = 1.0f;
+            }
+            return lut;
+        }
+        for (int i = 0; i < lutSize; i++) {
+            float r = (float)i / (lutSize - 1);
+            float dist = interpSpline(exifKnots_, exifDistortion_, exifKnotCount_, r);
+            float factorR = hasExifTca_ ? dist * interpSpline(exifKnots_, exifCaR_, exifKnotCount_, r) : dist;
+            float factorB = hasExifTca_ ? dist * interpSpline(exifKnots_, exifCaB_, exifKnotCount_, r) : dist;
+            lut[i * 4 + 0] = factorR;
+            lut[i * 4 + 1] = dist;
+            lut[i * 4 + 2] = factorB;
+            lut[i * 4 + 3] = 1.0f;
+        }
+        return lut;
+    }
+
+    // Generate 2D vignetting gain map for GPU shader.
+    // Returns R32F data: gain = 1/correction (brighter where vignetting darkens).
+    // For Sony/Fuji radial spline vignetting.
+    vector<float> generateVignettingMap(int& outRows, int& outCols, int mapSize = 64) const {
+        outRows = mapSize;
+        outCols = mapSize;
+
+        // For DNG, use the existing gain map directly
+        if (useDng_ && !dngGainMap_.empty()) {
+            outRows = dngGainRows_;
+            outCols = dngGainCols_;
+            // DNG gain map may be multi-plane; take first plane (luminance)
+            if (dngGainMapPlanes_ == 1) {
+                return dngGainMap_;
+            }
+            // Multi-plane: average RGB
+            vector<float> mono(outRows * outCols);
+            for (int i = 0; i < outRows * outCols; i++) {
+                float sum = 0;
+                for (int p = 0; p < dngGainMapPlanes_ && p < 3; p++) {
+                    sum += dngGainMap_[i * dngGainMapPlanes_ + p];
+                }
+                mono[i] = sum / min(dngGainMapPlanes_, 3);
+            }
+            return mono;
+        }
+
+        vector<float> map(mapSize * mapSize, 1.0f);
+        if (!ready_ || !hasExifVig_) return map;
+
+        float srcCx = (width_ - 1) * 0.5f;
+        float srcCy = (height_ - 1) * 0.5f;
+        float invDiag = 1.0f / sqrt(srcCx * srcCx + srcCy * srcCy);
+
+        for (int y = 0; y < mapSize; y++) {
+            for (int x = 0; x < mapSize; x++) {
+                // UV → pixel coords → radius
+                float u = ((float)x + 0.5f) / mapSize;
+                float v = ((float)y + 0.5f) / mapSize;
+                float px = u * (width_ - 1) - srcCx;
+                float py = v * (height_ - 1) - srcCy;
+                float radius = sqrt(px * px + py * py) * invDiag;
+                float correction = interpSpline(exifKnots_, exifVignetting_, exifKnotCount_, radius);
+                if (correction < 0.01f) correction = 0.01f;
+                map[y * mapSize + x] = 1.0f / correction;
+            }
+        }
+        return map;
+    }
+
+    // Get auto-scale factor for GPU shader (Sony/Fuji path).
+    float getGpuAutoScale(int srcW, int srcH) const {
+        if (!ready_) return 1.0f;
+
+        int outW, outH;
+        float cropCx, cropCy;
+        getCropCenter(srcW, srcH, outW, outH, cropCx, cropCy);
+
+        float srcCx = (srcW - 1) * 0.5f;
+        float srcCy = (srcH - 1) * 0.5f;
+        float invDiag = 1.0f / sqrt(srcCx * srcCx + srcCy * srcCy);
+
+        if (useDng_) {
+            return computeDngAutoScale(srcW, srcH, outW, outH, cropCx, cropCy);
+        }
+        return computeExifAutoScale(srcW, srcH, outW, outH,
+                                     cropCx, cropCy, srcCx, srcCy, invDiag);
+    }
+
+    // Get crop rect in normalized UV coordinates [originX, originY, sizeX, sizeY].
+    void getGpuCropRect(int srcW, int srcH, float out[4]) const {
+        if (!hasDefaultCrop_ || srcW <= 0 || srcH <= 0) {
+            out[0] = 0; out[1] = 0; out[2] = 1; out[3] = 1;
+            return;
+        }
+        float scaleX = 1.0f, scaleY = 1.0f;
+        if (intW_ > 0 && intH_ > 0 && srcW != intW_) {
+            scaleX = (float)srcW / intW_;
+            scaleY = (float)srcH / intH_;
+        }
+        float cx = cropX_ * scaleX;
+        float cy = cropY_ * scaleY;
+        float cw = cropW_ * scaleX;
+        float ch = cropH_ * scaleY;
+        out[0] = cx / srcW;
+        out[1] = cy / srcH;
+        out[2] = cw / srcW;
+        out[3] = ch / srcH;
+    }
+
+    // Get optical center in normalized UV coordinates.
+    void getGpuOpticalCenter(int srcW, int srcH, float out[2]) const {
+        out[0] = 0.5f;
+        out[1] = 0.5f;
+        if (useDng_) {
+            out[0] = (float)dngCx_;
+            out[1] = (float)dngCy_;
+        }
+    }
+
+    // Get 1/diagonal_half in pixel space.
+    float getGpuInvDiag(int srcW, int srcH) const {
+        float cx = (srcW - 1) * 0.5f;
+        float cy = (srcH - 1) * 0.5f;
+        return 1.0f / sqrt(cx * cx + cy * cy);
+    }
+
+    // =========================================================================
     // Apply corrections (auto-dispatch by source and pixel format)
     // =========================================================================
     bool apply(Pixels& pixels) {
@@ -287,6 +426,27 @@ private:
     // Intermediate image dimensions (zero-cropped, before DefaultCrop).
     // Needed to scale crop coordinates for smart preview display.
     int intW_ = 0, intH_ = 0;
+
+    // Helper: compute output dimensions and crop center from current state
+    void getCropCenter(int srcW, int srcH, int& outW, int& outH,
+                       float& cropCx, float& cropCy) const {
+        if (hasDefaultCrop_) {
+            float scaleX = 1.0f, scaleY = 1.0f;
+            if (intW_ > 0 && intH_ > 0 && srcW != intW_) {
+                scaleX = (float)srcW / intW_;
+                scaleY = (float)srcH / intH_;
+            }
+            outW = max(1, (int)round(cropW_ * scaleX));
+            outH = max(1, (int)round(cropH_ * scaleY));
+            cropCx = cropX_ * scaleX + (outW - 1) * 0.5f;
+            cropCy = cropY_ * scaleY + (outH - 1) * 0.5f;
+        } else {
+            outW = srcW;
+            outH = srcH;
+            cropCx = (srcW - 1) * 0.5f;
+            cropCy = (srcH - 1) * 0.5f;
+        }
+    }
 
     // Sony EXIF spline data
     int exifKnotCount_ = 0;

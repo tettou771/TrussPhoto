@@ -277,6 +277,19 @@ void tcApp::setup() {
     metadataPanel_ = make_shared<MetadataPanel>();
     addChild(metadataPanel_);
 
+    // 5d2. Create develop panel (right sidebar, exclusive with metadata)
+    developPanel_ = make_shared<DevelopPanel>();
+    addChild(developPanel_);
+    developPanel_->setActive(false);
+
+    developPanel_->onSettingsChanged = [this]() {
+        auto sv = viewManager_->singleView();
+        if (viewMode() == ViewMode::Single && sv) {
+            sv->onDenoiseChanged(developPanel_->getChromaDenoise(),
+                                 developPanel_->getLumaDenoise());
+        }
+    };
+
     // Set metadataPanel in ViewContext after creation
     viewCtx_.metadataPanel = metadataPanel_;
     viewManager_->setContext(viewCtx_);
@@ -493,6 +506,13 @@ void tcApp::setup() {
 
     // 10. SingleView init (camera profiles, LUT shader, lens correction)
     viewManager_->singleView()->init(getDataPath("profiles"));
+
+    // Sync DevelopPanel sliders when photo changes
+    viewManager_->singleView()->onDenoiseRestored = [this](float chroma, float luma) {
+        if (developPanel_ && showDevelop_) {
+            developPanel_->setValues(chroma, luma);
+        }
+    };
 
     // 11. Fonts
     loadJapaneseFont(font_, 14);
@@ -772,6 +792,12 @@ void tcApp::keyPressed(int key) {
 
         if (key == SAPP_KEYCODE_ESCAPE) {
             // ESC: go back to previous view
+            // Hide develop panel if visible
+            if (showDevelop_) {
+                showDevelop_ = false;
+                if (developPanel_) developPanel_->setActive(false);
+                if (metadataPanel_) metadataPanel_->setActive(true);
+            }
             viewManager_->goBack();
             // Restore layout for target view
             auto active = viewManager_->activeView();
@@ -821,6 +847,28 @@ void tcApp::keyPressed(int key) {
                 }
                 updateLayout();
             }
+        }
+
+        if (key == 'D' || key == 'd') {
+            showDevelop_ = !showDevelop_;
+            if (showDevelop_) {
+                // Show develop panel, hide metadata panel
+                if (developPanel_) {
+                    developPanel_->setActive(true);
+                    // Restore slider values from current photo
+                    string photoId = singleView->currentPhotoId();
+                    auto* entry = provider_.getPhoto(photoId);
+                    if (entry) {
+                        developPanel_->setValues(entry->chromaDenoise, entry->lumaDenoise);
+                    }
+                }
+                if (metadataPanel_) metadataPanel_->setActive(false);
+            } else {
+                // Hide develop panel, show metadata panel
+                if (developPanel_) developPanel_->setActive(false);
+                if (metadataPanel_) metadataPanel_->setActive(true);
+            }
+            updateLayout();
         }
 
         // Update metadata panel with current state
@@ -1381,12 +1429,21 @@ void tcApp::updateLayout() {
         viewManager_->layoutViews();
     }
 
-    // MetadataPanel
+    // MetadataPanel (hidden when develop panel is shown)
     if (metadataPanel_) {
-        bool rightActive = rightPaneWidth_ > 0;
+        bool rightActive = rightPaneWidth_ > 0 && !showDevelop_;
         metadataPanel_->setActive(rightActive);
         if (rightActive) {
             metadataPanel_->setRect(w - rightW, contentY, metadataWidth_, contentH);
+        }
+    }
+
+    // DevelopPanel (exclusive with metadata panel)
+    if (developPanel_) {
+        bool devActive = rightPaneWidth_ > 0 && showDevelop_;
+        developPanel_->setActive(devActive);
+        if (devActive) {
+            developPanel_->setRect(w - rightW, contentY, metadataWidth_, contentH);
         }
     }
 

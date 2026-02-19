@@ -4,6 +4,10 @@
 # System libraries installed via brew, used only by this project.
 # =============================================================================
 
+if(APPLE)
+    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework MetalPerformanceShaders")
+endif()
+
 if(NOT EMSCRIPTEN)
     find_package(PkgConfig REQUIRED)
 

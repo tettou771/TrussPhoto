@@ -63,6 +63,10 @@ struct PhotoEntry {
 
     bool hasGps() const { return latitude != 0 || longitude != 0; }
 
+    // Develop settings (per-photo)
+    float chromaDenoise = 0.5f;  // 0-1, chroma noise reduction strength
+    float lumaDenoise = 0.0f;    // 0-1, luma noise reduction strength
+
     // Lens correction (JSON: Sony EXIF spline, DNG polynomial, or Fuji MakerNote)
     string lensCorrectionParams;
 
@@ -138,6 +142,8 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"altitude", e.altitude},
         {"developSettings", e.developSettings},
         {"isManaged", e.isManaged},
+        {"chromaDenoise", e.chromaDenoise},
+        {"lumaDenoise", e.lumaDenoise},
         {"lensCorrectionParams", e.lensCorrectionParams},
         {"exposureTime", e.exposureTime},
         {"exposureBias", e.exposureBias},
@@ -191,6 +197,8 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
 
     e.developSettings = j.value("developSettings", string(""));
     e.isManaged = j.value("isManaged", true);
+    e.chromaDenoise = j.value("chromaDenoise", 0.5f);
+    e.lumaDenoise = j.value("lumaDenoise", 0.0f);
 
     e.lensCorrectionParams = j.value("lensCorrectionParams", string(""));
     e.exposureTime = j.value("exposureTime", string(""));
