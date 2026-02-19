@@ -25,6 +25,71 @@ using namespace tcx;
 namespace fs = std::filesystem;
 
 // =============================================================================
+// ProvisionalPin - draggable temporary pin for unconfirmed geotag assignment
+// =============================================================================
+
+class MapCanvas;  // forward decl
+
+class ProvisionalPin : public RectNode {
+public:
+    using Ptr = shared_ptr<ProvisionalPin>;
+
+    string photoId;
+    int photoIndex = -1;
+    double lat = 0, lon = 0;
+
+    static constexpr float SIZE = 20.0f;
+    inline static const Color COLOR = Color(0.3f, 0.65f, 1.0f);
+
+    ProvisionalPin(const string& id, int idx, double lat_, double lon_,
+                   MapCanvas* canvas)
+        : photoId(id), photoIndex(idx), lat(lat_), lon(lon_), canvas_(canvas) {
+        enableEvents();
+        setSize(SIZE, SIZE);
+    }
+
+    void setSelected(bool v) { selected_ = v; }
+    bool isSelected() const { return selected_; }
+
+    void draw() override {
+        float cx = SIZE / 2;
+        float cy = SIZE / 2;
+
+        // Orange selection ring
+        if (selected_) {
+            setColor(SEL_R, SEL_G, SEL_B);
+            fill();
+            drawCircle(cx, cy, 10);
+        } else {
+            // Shadow (only when not selected)
+            setColor(0.0f, 0.0f, 0.0f, 0.35f);
+            fill();
+            drawCircle(cx + 1, cy + 1, 7);
+        }
+
+        // Pin body (light blue)
+        setColor(COLOR);
+        fill();
+        drawCircle(cx, cy, 7);
+
+        // White inner dot
+        setColor(1.0f, 1.0f, 1.0f);
+        fill();
+        drawCircle(cx, cy, 3);
+    }
+
+protected:
+    bool onMousePress(Vec2 pos, int button) override;
+    bool onMouseDrag(Vec2 pos, int button) override;
+    bool onMouseRelease(Vec2 pos, int button) override;
+
+private:
+    MapCanvas* canvas_;
+    bool draggingPin_ = false;
+    bool selected_ = false;
+};
+
+// =============================================================================
 // MapCanvas - map tile rendering, pins, and interaction (child RectNode)
 // =============================================================================
 
@@ -35,11 +100,12 @@ public:
     // Callbacks
     function<void(int index, const string& photoId)> onPinClick;
     function<void(int index, const string& photoId)> onPinDoubleClick;
+    function<void(const string& photoId, double lat, double lon)> onGeotagConfirm;
     function<void()> onRedraw;
 
     void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids) {
         pins_.clear();
-        selectedPinIdx_ = -1;
+        selectedPinIds_.clear();
         for (size_t i = 0; i < photos.size(); i++) {
             if (photos[i].hasGps()) {
                 pins_.push_back({photos[i].latitude, photos[i].longitude, (int)i, ids[i]});
@@ -48,22 +114,62 @@ public:
         clusterZoom_ = -999;
     }
 
-    // Select a pin by photoId. Returns true if the photo has GPS (pin found).
+    // Select a single pin by photoId. Returns true if the photo has GPS (pin found).
     bool selectPin(const string& photoId) {
-        selectedPinIdx_ = -1;
-        for (size_t i = 0; i < pins_.size(); i++) {
-            if (pins_[i].photoId == photoId) {
-                selectedPinIdx_ = (int)i;
+        selectedPinIds_.clear();
+        for (auto& pin : pins_) {
+            if (pin.photoId == photoId) {
+                selectedPinIds_.insert(photoId);
                 return true;
             }
         }
         return false;
     }
 
-    // Center map on pin if it's outside the viewport. Keep zoom level, animate.
+    // Select multiple pins by photoId set
+    void selectPins(const vector<string>& photoIds) {
+        selectedPinIds_.clear();
+        unordered_set<string> pinIds;
+        for (auto& pin : pins_) pinIds.insert(pin.photoId);
+        for (auto& id : photoIds) {
+            if (pinIds.count(id)) selectedPinIds_.insert(id);
+        }
+    }
+
+    // Get first selected pin's photoId (empty if none)
+    string selectedPhotoId() const {
+        if (!selectedPinIds_.empty()) return *selectedPinIds_.begin();
+        return "";
+    }
+
+    bool isPinSelected(const string& photoId) const {
+        return selectedPinIds_.count(photoId) > 0;
+    }
+
+    // Remove a pin by photoId and return true if found
+    bool removePin(const string& photoId) {
+        for (auto it = pins_.begin(); it != pins_.end(); ++it) {
+            if (it->photoId == photoId) {
+                selectedPinIds_.erase(photoId);
+                pins_.erase(it);
+                clusterZoom_ = -999;
+                if (onRedraw) onRedraw();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Center map on first selected pin if it's outside the viewport. Animate.
     void centerOnSelectedPin() {
-        if (selectedPinIdx_ < 0 || selectedPinIdx_ >= (int)pins_.size()) return;
-        auto& pin = pins_[selectedPinIdx_];
+        if (selectedPinIds_.empty()) return;
+        // Find the first selected pin
+        Pin* found = nullptr;
+        for (auto& pin : pins_) {
+            if (selectedPinIds_.count(pin.photoId)) { found = &pin; break; }
+        }
+        if (!found) return;
+        auto& pin = *found;
 
         // Check if pin is within the visible viewport (with margin)
         auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
@@ -126,6 +232,97 @@ public:
         zoom_ = 1;
     }
 
+    // --- Provisional pin management ---
+
+    void addProvisionalPin(const string& photoId, int photoIndex, double lat, double lon) {
+        // Don't add duplicate for same photo
+        for (auto& pp : provisionalPins_) {
+            if (pp->photoId == photoId) {
+                pp->lat = lat;
+                pp->lon = lon;
+                updateProvisionalPinPositions();
+                return;
+            }
+        }
+        auto pp = make_shared<ProvisionalPin>(photoId, photoIndex, lat, lon, this);
+        provisionalPins_.push_back(pp);
+        addChild(pp);
+        updateProvisionalPinPositions();
+        if (onRedraw) onRedraw();
+    }
+
+    void clearProvisionalPins() {
+        for (auto& pp : provisionalPins_) pp->destroy();
+        provisionalPins_.clear();
+        if (onRedraw) onRedraw();
+    }
+
+    void confirmPin(ProvisionalPin* pin) {
+        if (!pin) return;
+        if (onGeotagConfirm) onGeotagConfirm(pin->photoId, pin->lat, pin->lon);
+        pins_.push_back({pin->lat, pin->lon, pin->photoIndex, pin->photoId});
+        clusterZoom_ = -999;
+        selectPin(pin->photoId);
+        pin->destroy();
+    }
+
+    void confirmAllPins() {
+        for (auto& pp : provisionalPins_) {
+            if (onGeotagConfirm) onGeotagConfirm(pp->photoId, pp->lat, pp->lon);
+            pins_.push_back({pp->lat, pp->lon, pp->photoIndex, pp->photoId});
+            pp->destroy();
+        }
+        provisionalPins_.clear();
+        clusterZoom_ = -999;
+        if (onRedraw) onRedraw();
+    }
+
+    // Sweep destroyed provisional pins from our tracking vector (framework handles scene graph)
+    void sweepDeadPins() {
+        auto it = std::remove_if(provisionalPins_.begin(), provisionalPins_.end(),
+            [](const ProvisionalPin::Ptr& pp) { return pp->isDead(); });
+        if (it != provisionalPins_.end()) {
+            provisionalPins_.erase(it, provisionalPins_.end());
+            if (onRedraw) onRedraw();
+        }
+    }
+
+    bool hasProvisionalPins() const { return !provisionalPins_.empty(); }
+
+    const vector<ProvisionalPin::Ptr>& provisionalPins() const { return provisionalPins_; }
+
+    // Update selection highlight on provisional pins based on strip selection
+    void updateProvisionalPinSelection(const vector<string>& selectedIds) {
+        unordered_set<string> sel(selectedIds.begin(), selectedIds.end());
+        for (auto& pp : provisionalPins_) {
+            pp->setSelected(sel.count(pp->photoId) > 0);
+        }
+    }
+
+    // Convert local screen coords to lat/lon
+    pair<double, double> screenToLatLon(float sx, float sy) {
+        auto centerPx = latLonToPixel(centerLat_, centerLon_, zoom_);
+        float halfW = getWidth() / 2.0f;
+        float halfH = getHeight() / 2.0f;
+        double px = centerPx.x + (sx - halfW);
+        double py = centerPx.y + (sy - halfH);
+        return pixelToLatLon(px, py, zoom_);
+    }
+
+    void updateProvisionalPinPositions() {
+        auto centerPx = latLonToPixel(centerLat_, centerLon_, zoom_);
+        float halfW = getWidth() / 2.0f;
+        float halfH = getHeight() / 2.0f;
+        float left = centerPx.x - halfW;
+        float top = centerPx.y - halfH;
+
+        for (auto& pp : provisionalPins_) {
+            auto px = latLonToPixel(pp->lat, pp->lon, zoom_);
+            pp->setPos(px.x - left - ProvisionalPin::SIZE / 2,
+                       px.y - top - ProvisionalPin::SIZE / 2);
+        }
+    }
+
     void setup() override {
         enableEvents();
         setClipping(true);
@@ -177,6 +374,14 @@ public:
             centerLat_ = panFromLat_ + (panToLat_ - panFromLat_) * t;
             centerLon_ = panFromLon_ + (panToLon_ - panFromLon_) * t;
             if (onRedraw) onRedraw();
+        }
+
+        // Sweep confirmed (dead) provisional pins
+        sweepDeadPins();
+
+        // Keep provisional pins in sync with map pan/zoom
+        if (!provisionalPins_.empty()) {
+            updateProvisionalPinPositions();
         }
     }
 
@@ -269,6 +474,11 @@ public:
 
         // Draw pins
         drawPins(left, top, w, h);
+    }
+
+    void endDraw() override {
+        float w = getWidth();
+        float h = getHeight();
 
         // Zoom level indicator (bottom-left, flush to edges)
         float overlayH = 20;
@@ -290,7 +500,7 @@ public:
             Direction::Left, Direction::Center);
 
         // "No geotagged photos" message
-        if (pins_.empty()) {
+        if (pins_.empty() && provisionalPins_.empty()) {
             setColor(0.5f, 0.5f, 0.55f);
             font_.drawString("No geotagged photos", w / 2, h / 2,
                 Direction::Center, Direction::Center);
@@ -300,6 +510,8 @@ public:
         setColor(0.25f, 0.25f, 0.28f);
         fill();
         drawRect(0, h - 1, w, 1);
+
+        RectNode::endDraw();
     }
 
     bool onMousePress(Vec2 pos, int button) override {
@@ -364,6 +576,7 @@ public:
         while (centerLon_ > 180.0) centerLon_ -= 360.0;
         while (centerLon_ < -180.0) centerLon_ += 360.0;
 
+        if (!provisionalPins_.empty()) updateProvisionalPinPositions();
         if (onRedraw) onRedraw();
         return true;
     }
@@ -407,6 +620,7 @@ public:
             while (centerLon_ < -180.0) centerLon_ += 360.0;
 
             evictOldTiles();
+            if (!provisionalPins_.empty()) updateProvisionalPinPositions();
             if (onRedraw) onRedraw();
         }
         return true;
@@ -418,7 +632,7 @@ public:
     }
 
 private:
-    static constexpr float PIN_RADIUS = 8.0f;
+    static constexpr float PIN_RADIUS = 7.0f;
     inline static const Color PIN_COLOR = Color(0.9f, 0.2f, 0.2f);
 
     // Map state
@@ -450,6 +664,9 @@ private:
     };
     vector<Pin> pins_;
 
+    // Provisional (unconfirmed) pins
+    vector<ProvisionalPin::Ptr> provisionalPins_;
+
     struct Cluster {
         float wx, wy;
         int count;
@@ -462,8 +679,8 @@ private:
     Vec2 dragStart_;
     double dragStartLat_ = 0, dragStartLon_ = 0;
 
-    // Selected pin
-    int selectedPinIdx_ = -1;
+    // Selected pins (by photoId)
+    unordered_set<string> selectedPinIds_;
 
     // Pan animation
     bool panAnimating_ = false;
@@ -547,25 +764,24 @@ private:
             drawCluster(cluster, scaleFactor, qLeft, qTop, w, h);
         }
 
-        // Draw selected pin on top (independently from clusters)
-        if (selectedPinIdx_ >= 0 && selectedPinIdx_ < (int)pins_.size()) {
-            auto& pin = pins_[selectedPinIdx_];
-            auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
-            float sx = pinPx.x - left;
-            float sy = pinPx.y - top;
-
-            if (sx >= -30 && sx <= w + 30 && sy >= -30 && sy <= h + 30) {
-                float r = PIN_RADIUS + 2;
+        // Draw selected pins on top (independently from clusters)
+        if (!selectedPinIds_.empty()) {
+            for (auto& pin : pins_) {
+                if (!selectedPinIds_.count(pin.photoId)) continue;
+                auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
+                float sx = pinPx.x - left;
+                float sy = pinPx.y - top;
+                if (sx < -30 || sx > w + 30 || sy < -30 || sy > h + 30) continue;
 
                 // Shadow
                 setColor(0.0f, 0.0f, 0.0f, 0.4f);
                 fill();
-                drawCircle(sx + 1, sy + 1, r);
+                drawCircle(sx + 1, sy + 1, 10);
 
                 // Orange selection pin
                 setColor(SEL_R, SEL_G, SEL_B);
                 fill();
-                drawCircle(sx, sy, r);
+                drawCircle(sx, sy, 10);
 
                 // White inner dot
                 setColor(1.0f, 1.0f, 1.0f);
@@ -740,6 +956,42 @@ private:
     }
 };
 
+// --- ProvisionalPin mouse handlers (defined after MapCanvas) ---
+
+inline bool ProvisionalPin::onMousePress(Vec2 pos, int button) {
+    (void)pos;
+    if (button == 0) {
+        draggingPin_ = true;
+        return true;
+    }
+    if (button == 1) {  // right-click → confirm
+        canvas_->confirmPin(this);
+        return true;
+    }
+    return false;
+}
+
+inline bool ProvisionalPin::onMouseDrag(Vec2 pos, int button) {
+    if (!draggingPin_ || button != 0) return false;
+    // Convert local pos to canvas-local coords
+    float gx, gy;
+    localToGlobal(pos.x, pos.y, gx, gy);
+    float cx, cy;
+    canvas_->globalToLocal(gx, gy, cx, cy);
+    auto [newLat, newLon] = canvas_->screenToLatLon(cx, cy);
+    lat = newLat;
+    lon = newLon;
+    canvas_->updateProvisionalPinPositions();
+    if (canvas_->onRedraw) canvas_->onRedraw();
+    return true;
+}
+
+inline bool ProvisionalPin::onMouseRelease(Vec2 pos, int button) {
+    (void)pos;
+    if (button == 0) draggingPin_ = false;
+    return true;
+}
+
 // =============================================================================
 // MapView - container for MapCanvas + PhotoStrip
 // =============================================================================
@@ -751,17 +1003,22 @@ public:
     // Callbacks (forwarded to canvas)
     function<void(int index, const string& photoId)> onPinClick;
     function<void(int index, const string& photoId)> onPinDoubleClick;
+    function<void(const string& photoId, double lat, double lon)> onGeotagConfirm;
     function<void()> onRedraw;
 
+    // Modifier key refs (set by tcApp)
+    bool* cmdDownRef = nullptr;
+    bool* shiftDownRef = nullptr;
+
     MapView() {
-        // Create children in constructor (not setup!) so setPhotos() etc.
-        // can be called before setup() runs. addChild() is deferred to setup().
         canvas_ = make_shared<MapCanvas>();
         strip_ = make_shared<PhotoStrip>();
     }
 
     void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids,
                    PhotoProvider& provider) {
+        photos_ = photos;
+        photoIds_ = ids;
         canvas_->setPhotos(photos, ids);
 
         vector<bool> hasGps(ids.size());
@@ -783,6 +1040,180 @@ public:
         canvas_->fitBounds();
     }
 
+    // --- Provisional pin API ---
+
+    bool hasProvisionalPins() const { return canvas_->hasProvisionalPins(); }
+
+    // Get the selected pin's photoId (empty if none)
+    string selectedPhotoId() const { return canvas_->selectedPhotoId(); }
+
+    // Get all selected photo IDs from strip
+    vector<string> selectedPhotoIds() const { return strip_->selectedPhotoIds(); }
+
+    // Remove geotag from a photo: clear GPS in provider, remove pin from map, update strip
+    void removeGeotag(const string& photoId, PhotoProvider& provider) {
+        provider.setGps(photoId, 0, 0);
+        canvas_->removePin(photoId);
+        strip_->setHasGps(photoId, false);
+        // Update local photos_ copy so auto-geotag sees the change
+        updatePhotoCopy(photoId, 0, 0);
+        logNotice() << "[MapView] Geotag removed: " << photoId;
+    }
+
+    void clearProvisionalPins() {
+        // Reset strip indicators
+        for (auto& pp : canvas_->provisionalPins()) {
+            strip_->setProvisionalGeotag(pp->photoId, false);
+        }
+        canvas_->clearProvisionalPins();
+    }
+
+    void confirmAllPins() {
+        for (auto& pp : canvas_->provisionalPins()) {
+            strip_->setProvisionalGeotag(pp->photoId, false);
+            strip_->setHasGps(pp->photoId, true);
+        }
+        canvas_->confirmAllPins();
+    }
+
+    // Auto-geotag: interpolate GPS from timestamps for selected photos
+    void runAutoGeotag() {
+        constexpr double MAX_GAP_SEC = 2.0 * 3600;
+        constexpr double EXTRAP_MAX_SEC = MAX_GAP_SEC * 0.25;
+        constexpr int MAX_PINS = 1000;
+
+        // Only operate on selected photos
+        auto selectedIds = strip_->selectedPhotoIds();
+        if (selectedIds.empty()) return;
+
+        unordered_set<string> targetIds(selectedIds.begin(), selectedIds.end());
+
+        // Build sorted timeline (all photos for interpolation, but only selected as targets)
+        struct TimeEntry {
+            int idx;
+            string id;
+            int64_t time;
+            bool hasGps;
+            bool isTarget;
+            double lat, lon;
+        };
+        vector<TimeEntry> sorted;
+        for (size_t i = 0; i < photos_.size(); i++) {
+            int64_t t = PhotoEntry::parseDateTimeOriginal(photos_[i].dateTimeOriginal);
+            if (t == 0) continue;
+            bool target = !photos_[i].hasGps() && targetIds.count(photoIds_[i]);
+            sorted.push_back({(int)i, photoIds_[i], t,
+                              photos_[i].hasGps(), target,
+                              photos_[i].latitude, photos_[i].longitude});
+        }
+        sort(sorted.begin(), sorted.end(),
+             [](const TimeEntry& a, const TimeEntry& b) { return a.time < b.time; });
+
+        int count = 0;
+        for (size_t ci = 0; ci < sorted.size(); ci++) {
+            auto& c = sorted[ci];
+            if (c.hasGps || !c.isTarget) continue;
+
+            if (count >= MAX_PINS) {
+                logWarning() << "[MapView] Auto-geotag capped at " << MAX_PINS << " pins";
+                break;
+            }
+
+            // Already has provisional pin?
+            bool alreadyProvisional = false;
+            for (auto& pp : canvas_->provisionalPins()) {
+                if (pp->photoId == c.id) { alreadyProvisional = true; break; }
+            }
+            if (alreadyProvisional) continue;
+
+            // Find nearest GPS photo before and after
+            int beforeIdx = -1, afterIdx = -1;
+            for (int j = (int)ci - 1; j >= 0; j--) {
+                if (sorted[j].hasGps) { beforeIdx = j; break; }
+            }
+            for (int j = (int)ci + 1; j < (int)sorted.size(); j++) {
+                if (sorted[j].hasGps) { afterIdx = j; break; }
+            }
+
+            double lat = 0, lon = 0;
+            bool found = false;
+
+            if (beforeIdx >= 0 && afterIdx >= 0) {
+                // Interpolation between A and B
+                double gapA = abs((double)(c.time - sorted[beforeIdx].time));
+                double gapB = abs((double)(sorted[afterIdx].time - c.time));
+                if (gapA <= MAX_GAP_SEC && gapB <= MAX_GAP_SEC) {
+                    double total = (double)(sorted[afterIdx].time - sorted[beforeIdx].time);
+                    double t = (total > 0) ? (double)(c.time - sorted[beforeIdx].time) / total : 0.5;
+                    lat = sorted[beforeIdx].lat + (sorted[afterIdx].lat - sorted[beforeIdx].lat) * t;
+                    lon = sorted[beforeIdx].lon + (sorted[afterIdx].lon - sorted[beforeIdx].lon) * t;
+                    found = true;
+                }
+            }
+
+            if (!found && beforeIdx >= 0) {
+                // Extrapolation forward from A
+                double gap = abs((double)(c.time - sorted[beforeIdx].time));
+                if (gap <= EXTRAP_MAX_SEC) {
+                    // Find A2 (second GPS before)
+                    int a2Idx = -1;
+                    for (int j = beforeIdx - 1; j >= 0; j--) {
+                        if (sorted[j].hasGps) { a2Idx = j; break; }
+                    }
+                    if (a2Idx >= 0) {
+                        double segTime = (double)(sorted[beforeIdx].time - sorted[a2Idx].time);
+                        if (segTime > 0) {
+                            double t = (double)(c.time - sorted[beforeIdx].time) / segTime;
+                            lat = sorted[beforeIdx].lat + (sorted[beforeIdx].lat - sorted[a2Idx].lat) * t;
+                            lon = sorted[beforeIdx].lon + (sorted[beforeIdx].lon - sorted[a2Idx].lon) * t;
+                            found = true;
+                        }
+                    }
+                    if (!found) {
+                        // Snap to nearest GPS
+                        lat = sorted[beforeIdx].lat;
+                        lon = sorted[beforeIdx].lon;
+                        found = true;
+                    }
+                }
+            }
+
+            if (!found && afterIdx >= 0) {
+                // Extrapolation backward from B
+                double gap = abs((double)(sorted[afterIdx].time - c.time));
+                if (gap <= EXTRAP_MAX_SEC) {
+                    int b2Idx = -1;
+                    for (int j = afterIdx + 1; j < (int)sorted.size(); j++) {
+                        if (sorted[j].hasGps) { b2Idx = j; break; }
+                    }
+                    if (b2Idx >= 0) {
+                        double segTime = (double)(sorted[b2Idx].time - sorted[afterIdx].time);
+                        if (segTime > 0) {
+                            double t = (double)(sorted[afterIdx].time - c.time) / segTime;
+                            lat = sorted[afterIdx].lat + (sorted[afterIdx].lat - sorted[b2Idx].lat) * t;
+                            lon = sorted[afterIdx].lon + (sorted[afterIdx].lon - sorted[b2Idx].lon) * t;
+                            found = true;
+                        }
+                    }
+                    if (!found) {
+                        lat = sorted[afterIdx].lat;
+                        lon = sorted[afterIdx].lon;
+                        found = true;
+                    }
+                }
+            }
+
+            if (found) {
+                canvas_->addProvisionalPin(c.id, c.idx, lat, lon);
+                strip_->setProvisionalGeotag(c.id, true);
+                count++;
+            }
+        }
+
+        logNotice() << "[MapView] Auto-geotag: " << count << " provisional pins created";
+        if (onRedraw) onRedraw();
+    }
+
     // Layout helpers
     float stripHeight() const { return clamp(getHeight() * 0.15f, 80.0f, 160.0f); }
     float mapHeight() const { return getHeight() - stripHeight(); }
@@ -793,7 +1224,6 @@ public:
     }
 
     void setup() override {
-        // addChild deferred to setup (needs shared_from_this)
         addChild(canvas_);
         addChild(strip_);
 
@@ -807,17 +1237,48 @@ public:
         canvas_->onPinDoubleClick = [this](int idx, const string& id) {
             if (onPinDoubleClick) onPinDoubleClick(idx, id);
         };
+        canvas_->onGeotagConfirm = [this](const string& id, double lat, double lon) {
+            strip_->setProvisionalGeotag(id, false);
+            strip_->setHasGps(id, true);
+            updatePhotoCopy(id, lat, lon);
+            if (onGeotagConfirm) onGeotagConfirm(id, lat, lon);
+        };
         canvas_->onRedraw = [this]() {
             if (onRedraw) onRedraw();
         };
 
-        // Strip click → select pin + center map if GPS
+        // Strip click → select pins + center map if GPS
         strip_->onPhotoClick = [this](int idx, const string& id) {
-            bool hasGps = canvas_->selectPin(id);
-            if (hasGps) {
+            auto selectedIds = strip_->selectedPhotoIds();
+            canvas_->selectPins(selectedIds);
+            canvas_->updateProvisionalPinSelection(selectedIds);
+            if (canvas_->isPinSelected(id)) {
                 canvas_->centerOnSelectedPin();
             }
             if (onPinClick) onPinClick(idx, id);
+            if (onRedraw) onRedraw();
+        };
+
+        // Strip drag move → ghost indicator
+        strip_->onDragMove = [this](int idx, const string& id, float gx, float gy) {
+            dragActive_ = true;
+            dragGlobalX_ = gx;
+            dragGlobalY_ = gy;
+            if (onRedraw) onRedraw();
+        };
+
+        // Strip drag end → create provisional pin on map
+        strip_->onDragEnd = [this](int idx, const string& id, float gx, float gy) {
+            dragActive_ = false;
+
+            float cx, cy;
+            canvas_->globalToLocal(gx, gy, cx, cy);
+
+            if (cx >= 0 && cx <= canvas_->getWidth() && cy >= 0 && cy <= canvas_->getHeight()) {
+                auto [lat, lon] = canvas_->screenToLatLon(cx, cy);
+                canvas_->addProvisionalPin(id, idx, lat, lon);
+                strip_->setProvisionalGeotag(id, true);
+            }
             if (onRedraw) onRedraw();
         };
 
@@ -825,10 +1286,32 @@ public:
     }
 
     // ViewContainer lifecycle
-    void beginView(ViewContext& ctx) override {}
-    void endView() override {}
+    void beginView(ViewContext& ctx) override {
+        // Pass modifier key refs to strip (must be deferred from setup()
+        // because tcApp sets cmdDownRef/shiftDownRef after addChild triggers setup)
+        strip_->cmdDownRef = cmdDownRef;
+        strip_->shiftDownRef = shiftDownRef;
+    }
+    void endView() override {
+        clearProvisionalPins();
+    }
     bool wantsSearchBar() const override { return false; }
     bool wantsLeftSidebar() const override { return false; }
+
+    void endDraw() override {
+        // Ghost indicator during drag
+        if (dragActive_) {
+            float lx, ly;
+            globalToLocal(dragGlobalX_, dragGlobalY_, lx, ly);
+            setColor(0.3f, 0.65f, 1.0f, 0.5f);
+            fill();
+            drawCircle(lx, ly, 10);
+            setColor(1.0f, 1.0f, 1.0f, 0.7f);
+            fill();
+            drawCircle(lx, ly, 3);
+        }
+        RectNode::endDraw();
+    }
 
     void shutdown() {
         if (canvas_) canvas_->shutdown();
@@ -839,8 +1322,27 @@ private:
     MapCanvas::Ptr canvas_;
     PhotoStrip::Ptr strip_;
 
+    // Keep a copy of photo data for auto-geotag
+    vector<PhotoEntry> photos_;
+    vector<string> photoIds_;
+
+    // Drag ghost state
+    bool dragActive_ = false;
+    float dragGlobalX_ = 0, dragGlobalY_ = 0;
+
     void layoutChildren() {
         if (canvas_) canvas_->setRect(0, 0, getWidth(), mapHeight());
         if (strip_) strip_->setRect(0, mapHeight(), getWidth(), stripHeight());
+    }
+
+    // Sync photos_ copy with actual GPS state
+    void updatePhotoCopy(const string& photoId, double lat, double lon) {
+        for (size_t i = 0; i < photoIds_.size(); i++) {
+            if (photoIds_[i] == photoId) {
+                photos_[i].latitude = lat;
+                photos_[i].longitude = lon;
+                break;
+            }
+        }
     }
 };

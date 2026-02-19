@@ -10,6 +10,7 @@
 #include "AsyncImageLoader.h"
 #include "FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
 #include "Constants.h"   // for SELECTION_COLOR
+#include <set>
 using namespace std;
 using namespace tc;
 
@@ -19,6 +20,8 @@ public:
     using Ptr = shared_ptr<StripItem>;
 
     function<void()> onClick;
+    function<void(float globalX, float globalY)> onDragMove;
+    function<void(float globalX, float globalY)> onDragEnd;
 
     StripItem(float size) : size_(size) {
         enableEvents();
@@ -35,6 +38,9 @@ public:
 
     void setHasGps(bool v) { hasGps_ = v; }
     bool hasGps() const { return hasGps_; }
+
+    void setHasProvisionalGeotag(bool v) { hasProvisionalGeotag_ = v; }
+    bool hasProvisionalGeotag() const { return hasProvisionalGeotag_; }
 
     ThumbnailNode* getThumbnail() { return thumb_.get(); }
 
@@ -60,35 +66,79 @@ public:
     }
 
     void endDraw() override {
-        // No-GPS indicator: circle with diagonal line (top-left area)
         if (!hasGps_) {
             float iconSize = min(16.0f, size_ * 0.25f);
             float cx = 2 + iconSize * 0.5f + 2;
             float cy = 2 + iconSize * 0.5f + 2;
             float r = iconSize * 0.5f;
 
-            // Dark backdrop
-            setColor(0.0f, 0.0f, 0.0f, 0.5f);
-            fill();
-            drawRect(cx - r - 2, cy - r - 2, iconSize + 4, iconSize + 4);
-
-            // Light gray circle + diagonal line
-            setColor(0.7f, 0.7f, 0.72f);
-            noFill();
-            setStrokeWeight(1.5f);
-            drawCircle(cx, cy, r);
-            drawLine(cx - r * 0.7f, cy - r * 0.7f,
-                     cx + r * 0.7f, cy + r * 0.7f);
-            fill();  // restore fill state
+            if (hasProvisionalGeotag_) {
+                // Provisional geotag: light blue dot
+                setColor(0.0f, 0.0f, 0.0f, 0.5f);
+                fill();
+                drawRect(cx - r - 2, cy - r - 2, iconSize + 4, iconSize + 4);
+                setColor(0.3f, 0.65f, 1.0f);
+                fill();
+                drawCircle(cx, cy, r * 0.7f);
+            } else {
+                // No-GPS indicator: circle with diagonal line
+                setColor(0.0f, 0.0f, 0.0f, 0.5f);
+                fill();
+                drawRect(cx - r - 2, cy - r - 2, iconSize + 4, iconSize + 4);
+                setColor(0.7f, 0.7f, 0.72f);
+                noFill();
+                setStrokeWeight(1.5f);
+                drawCircle(cx, cy, r);
+                drawLine(cx - r * 0.7f, cy - r * 0.7f,
+                         cx + r * 0.7f, cy + r * 0.7f);
+                fill();
+            }
         }
         RectNode::endDraw();
     }
 
 protected:
     bool onMousePress(Vec2 local, int button) override {
-        (void)local;
-        if (button == 0 && onClick) onClick();
-        return RectNode::onMousePress(local, button);
+        if (button != 0) return RectNode::onMousePress(local, button);
+        if (!hasGps_ && !hasProvisionalGeotag_) {
+            // GPS-less photo: start drag detection, select immediately
+            dragPending_ = true;
+            isDragging_ = false;
+            dragStartPos_ = local;
+            if (onClick) onClick();  // select on press
+        }
+        return true;
+    }
+
+    bool onMouseDrag(Vec2 local, int button) override {
+        if (button != 0 || !dragPending_) return false;
+        float dx = local.x - dragStartPos_.x;
+        float dy = local.y - dragStartPos_.y;
+        if (!isDragging_ && (dx * dx + dy * dy) > 25.0f) {  // > 5px
+            isDragging_ = true;
+        }
+        if (isDragging_ && onDragMove) {
+            float gx, gy;
+            localToGlobal(local.x, local.y, gx, gy);
+            onDragMove(gx, gy);
+        }
+        return isDragging_;
+    }
+
+    bool onMouseRelease(Vec2 local, int button) override {
+        if (button != 0) return false;
+        if (isDragging_ && onDragEnd) {
+            float gx, gy;
+            localToGlobal(local.x, local.y, gx, gy);
+            onDragEnd(gx, gy);
+        } else if (!isDragging_ && dragPending_) {
+            // Already selected on press, no extra action needed
+        } else if (!isDragging_ && onClick) {
+            onClick();  // normal click (GPS photo)
+        }
+        dragPending_ = false;
+        isDragging_ = false;
+        return true;
     }
 
 private:
@@ -96,7 +146,13 @@ private:
     float size_;
     bool selected_ = false;
     bool hasGps_ = true;
+    bool hasProvisionalGeotag_ = false;
     bool loaded_ = false;
+
+    // Drag state
+    bool dragPending_ = false;
+    bool isDragging_ = false;
+    Vec2 dragStartPos_;
 };
 
 // PhotoStrip - horizontal scrolling strip with pool-based recycling
@@ -105,6 +161,13 @@ public:
     using Ptr = shared_ptr<PhotoStrip>;
 
     function<void(int stripIndex, const string& photoId)> onPhotoClick;
+    function<void(const set<int>& selectedIndices)> onSelectionChanged;
+    function<void(int stripIndex, const string& photoId, float globalX, float globalY)> onDragMove;
+    function<void(int stripIndex, const string& photoId, float globalX, float globalY)> onDragEnd;
+
+    // Modifier key refs (set by MapView from tcApp)
+    bool* cmdDownRef = nullptr;
+    bool* shiftDownRef = nullptr;
 
     PhotoStrip() {
         loadJapaneseFont(font_, 10);
@@ -137,41 +200,108 @@ public:
             return provider.getThumbnail(photoId, outPixels);
         });
 
-        selectedIdx_ = -1;
+        selectedIndices_.clear();
+        lastClickIdx_ = -1;
         rebuildPool();
     }
 
-    // Select a photo and scroll to center it
+    // Update provisional geotag indicators
+    void setProvisionalGeotag(const string& photoId, bool has) {
+        for (size_t i = 0; i < photoIds_.size(); i++) {
+            if (photoIds_[i] == photoId) {
+                auto it = poolMap_.find((int)i);
+                if (it != poolMap_.end()) {
+                    pool_[it->second]->setHasProvisionalGeotag(has);
+                }
+                break;
+            }
+        }
+    }
+
+    // Mark a photo as now having GPS (update data + visible pool item)
+    void setHasGps(const string& photoId, bool v) {
+        for (size_t i = 0; i < photoIds_.size(); i++) {
+            if (photoIds_[i] == photoId) {
+                if (i < hasGps_.size()) hasGps_[i] = v;
+                auto it = poolMap_.find((int)i);
+                if (it != poolMap_.end()) pool_[it->second]->setHasGps(v);
+                break;
+            }
+        }
+    }
+
+    void clearAllProvisionalGeotags() {
+        for (auto& [dataIdx, poolIdx] : poolMap_) {
+            pool_[poolIdx]->setHasProvisionalGeotag(false);
+        }
+    }
+
+    // Select a single photo and scroll to it (used for external selection, e.g. pin click)
     void selectPhoto(const string& photoId) {
         int idx = -1;
         for (size_t i = 0; i < photoIds_.size(); i++) {
             if (photoIds_[i] == photoId) { idx = (int)i; break; }
         }
         if (idx < 0) return;
-
-        // Update selection
-        int oldIdx = selectedIdx_;
-        selectedIdx_ = idx;
-
-        // Update visual state for pool items
-        if (oldIdx >= 0) {
-            auto it = poolMap_.find(oldIdx);
-            if (it != poolMap_.end()) pool_[it->second]->setSelected(false);
-        }
-        auto it = poolMap_.find(idx);
-        if (it != poolMap_.end()) pool_[it->second]->setSelected(true);
-
-        // Scroll to center
+        clearSelectionVisuals();
+        selectedIndices_.clear();
+        selectedIndices_.insert(idx);
+        lastClickIdx_ = idx;
+        applySelectionVisuals();
         scrollToIndex(idx);
         redraw();
     }
 
-    int selectedIndex() const { return selectedIdx_; }
+    // Multi-selection by click with modifiers
+    void handleSelection(int idx, bool cmd, bool shift) {
+        if (shift && lastClickIdx_ >= 0) {
+            // Range select
+            int lo = min(lastClickIdx_, idx);
+            int hi = max(lastClickIdx_, idx);
+            if (!cmd) {
+                clearSelectionVisuals();
+                selectedIndices_.clear();
+            }
+            for (int i = lo; i <= hi; i++) selectedIndices_.insert(i);
+        } else if (cmd) {
+            // Toggle
+            if (selectedIndices_.count(idx)) selectedIndices_.erase(idx);
+            else selectedIndices_.insert(idx);
+            lastClickIdx_ = idx;
+        } else {
+            // Single
+            clearSelectionVisuals();
+            selectedIndices_.clear();
+            selectedIndices_.insert(idx);
+            lastClickIdx_ = idx;
+        }
+        applySelectionVisuals();
+        if (onSelectionChanged) onSelectionChanged(selectedIndices_);
+        redraw();
+    }
+
+    const set<int>& selectedIndices() const { return selectedIndices_; }
+
+    int selectedIndex() const {
+        if (selectedIndices_.empty()) return -1;
+        return *selectedIndices_.begin();
+    }
 
     string selectedPhotoId() const {
-        if (selectedIdx_ >= 0 && selectedIdx_ < (int)photoIds_.size())
-            return photoIds_[selectedIdx_];
+        int idx = selectedIndex();
+        if (idx >= 0 && idx < (int)photoIds_.size())
+            return photoIds_[idx];
         return "";
+    }
+
+    // Get all selected photo IDs
+    vector<string> selectedPhotoIds() const {
+        vector<string> result;
+        for (int idx : selectedIndices_) {
+            if (idx >= 0 && idx < (int)photoIds_.size())
+                result.push_back(photoIds_[idx]);
+        }
+        return result;
     }
 
     void update() override {
@@ -213,7 +343,8 @@ private:
     vector<string> photoIds_;
     vector<bool> hasGps_;
     PhotoProvider* provider_ = nullptr;
-    int selectedIdx_ = -1;
+    set<int> selectedIndices_;
+    int lastClickIdx_ = -1;  // anchor for shift-range selection
 
     // Scroll
     PlainScrollContainer::Ptr scrollContainer_;
@@ -311,18 +442,23 @@ private:
                 int dataIdx = reverseMap_[poolIdx];
                 if (dataIdx < 0) return;
 
-                // Update selection
-                int oldIdx = selectedIdx_;
-                selectedIdx_ = dataIdx;
-
-                if (oldIdx >= 0) {
-                    auto oit = poolMap_.find(oldIdx);
-                    if (oit != poolMap_.end()) pool_[oit->second]->setSelected(false);
-                }
-                pool_[poolIdx]->setSelected(true);
+                bool cmd = cmdDownRef && *cmdDownRef;
+                bool shift = shiftDownRef && *shiftDownRef;
+                handleSelection(dataIdx, cmd, shift);
 
                 if (onPhotoClick) onPhotoClick(dataIdx, photoIds_[dataIdx]);
-                redraw();
+            };
+
+            item->onDragMove = [this, poolIdx](float gx, float gy) {
+                int dataIdx = reverseMap_[poolIdx];
+                if (dataIdx < 0) return;
+                if (onDragMove) onDragMove(dataIdx, photoIds_[dataIdx], gx, gy);
+            };
+
+            item->onDragEnd = [this, poolIdx](float gx, float gy) {
+                int dataIdx = reverseMap_[poolIdx];
+                if (dataIdx < 0) return;
+                if (onDragEnd) onDragEnd(dataIdx, photoIds_[dataIdx], gx, gy);
             };
 
             pool_.push_back(item);
@@ -373,7 +509,7 @@ private:
 
         // Set GPS and selection state
         item->setHasGps(dataIdx < (int)hasGps_.size() && hasGps_[dataIdx]);
-        item->setSelected(dataIdx == selectedIdx_);
+        item->setSelected(selectedIndices_.count(dataIdx) > 0);
 
         // Request thumbnail load
         item->clearImage();
@@ -420,5 +556,19 @@ private:
         targetX = clamp(targetX, 0.0f, maxScroll);
         scrollContainer_->setScrollX(targetX);
         lastScrollX_ = -99999;
+    }
+
+    // Clear selected visual state for all visible pool items
+    void clearSelectionVisuals() {
+        for (auto& [dataIdx, poolIdx] : poolMap_) {
+            pool_[poolIdx]->setSelected(false);
+        }
+    }
+
+    // Apply selected visual state based on selectedIndices_
+    void applySelectionVisuals() {
+        for (auto& [dataIdx, poolIdx] : poolMap_) {
+            pool_[poolIdx]->setSelected(selectedIndices_.count(dataIdx) > 0);
+        }
     }
 };

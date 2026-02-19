@@ -405,6 +405,16 @@ public:
         return stmt.execute();
     }
 
+    bool updateGps(const string& id, double lat, double lon) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET latitude=?1, longitude=?2 WHERE id=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, lat);
+        stmt.bind(2, lon);
+        stmt.bind(3, id);
+        return stmt.execute();
+    }
+
     bool updateLensCorrectionParams(const string& id, const string& params) {
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare("UPDATE photos SET lens_correction_params=?1 WHERE id=?2");

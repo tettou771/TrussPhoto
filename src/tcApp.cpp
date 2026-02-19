@@ -194,6 +194,13 @@ void tcApp::setup() {
         updateLayout();
     };
     mapView->onRedraw = [this]() { redraw(); };
+    mapView->cmdDownRef = &cmdDown_;
+    mapView->shiftDownRef = &shiftDown_;
+    mapView->onGeotagConfirm = [this](const string& photoId, double lat, double lon) {
+        provider_.setGps(photoId, lat, lon);
+        logNotice() << "[MapView] Geotag confirmed: " << photoId
+                     << " lat=" << lat << " lon=" << lon;
+    };
 
     // 5c2. Configure related view callbacks
     auto relatedView = viewManager_->relatedView();
@@ -308,12 +315,13 @@ void tcApp::setup() {
         lastClickIndex_ = index;
 
         auto g = grid();
-        if (cmdDown_ && shiftDown_) {
+        if (shiftDown_) {
             int anchor = g->getSelectionAnchor();
             if (anchor >= 0) {
-                bool select = !g->isSelected(index);
-                g->selectRange(anchor, index, select);
+                if (!cmdDown_) g->clearSelection();
+                g->selectRange(anchor, index, true);
             } else {
+                if (!cmdDown_) g->clearSelection();
                 g->toggleSelection(index);
             }
             updateMetadataPanel();
@@ -829,6 +837,53 @@ void tcApp::keyPressed(int key) {
                     updateMetadataPanel();
                 }
                 updateLayout();
+            }
+        }
+    } else if (viewMode() == ViewMode::Map) {
+        auto mapView = viewManager_->mapView();
+        if (key == SAPP_KEYCODE_ESCAPE) {
+            if (mapView->hasProvisionalPins()) {
+                mapView->clearProvisionalPins();
+            } else {
+                viewManager_->switchTo(ViewMode::Grid);
+                leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
+                leftTween_.finish();
+                if (metadataPanel_) {
+                    metadataPanel_->clearViewInfo();
+                    metadataPanel_->clearThumbnail();
+                    updateMetadataPanel();
+                }
+                updateLayout();
+            }
+        } else if (key == SAPP_KEYCODE_ENTER || key == SAPP_KEYCODE_KP_ENTER) {
+            if (mapView->hasProvisionalPins()) {
+                mapView->confirmAllPins();
+            }
+        } else if (key == 'A' || key == 'a') {
+            mapView->runAutoGeotag();
+        } else if (key == SAPP_KEYCODE_BACKSPACE || key == SAPP_KEYCODE_DELETE) {
+            // Collect selected photos that have GPS
+            auto allSelected = mapView->selectedPhotoIds();
+            vector<string> gpsIds;
+            for (auto& id : allSelected) {
+                auto* e = provider_.getPhoto(id);
+                if (e && e->hasGps()) gpsIds.push_back(id);
+            }
+            if (!gpsIds.empty()) {
+                int n = (int)gpsIds.size();
+                string msg = n == 1
+                    ? "Remove geotag from the selected photo?"
+                    : format("Remove geotag from {} photos?", n);
+                confirmDialogAsync("Remove Geotag", msg,
+                    [this, gpsIds](bool yes) {
+                        if (yes) {
+                            auto mv = viewManager_->mapView();
+                            for (auto& id : gpsIds) {
+                                mv->removeGeotag(id, provider_);
+                            }
+                            redraw();
+                        }
+                    });
             }
         }
     } else if (viewMode() == ViewMode::Grid) {
