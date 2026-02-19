@@ -5,10 +5,14 @@
 // =============================================================================
 
 #include <TrussC.h>
+#include <tcxCurl.h>
 #include "PhotoEntry.h"
 #include "FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
+#include <thread>
+#include <mutex>
 using namespace std;
 using namespace tc;
+using namespace tcx;
 
 // Overlay rectangle for drawing on top of the thumbnail
 // Coordinates are normalized (0-1) relative to the original image dimensions
@@ -53,8 +57,14 @@ public:
         if (entry) {
             entry_ = *entry;
             hasPhoto_ = true;
+            if (entry->hasGps()) {
+                startReverseGeocode(entry->latitude, entry->longitude);
+            } else {
+                locationName_.clear();
+            }
         } else {
             hasPhoto_ = false;
+            locationName_.clear();
         }
         overlays_.clear();
         styleHasProfile_ = false;  // reset until caller sets it
@@ -111,6 +121,19 @@ public:
     }
 
     void update() override {
+        // Process reverse geocoding result from background thread
+        {
+            lock_guard<mutex> lock(reverseGeoMutex_);
+            if (pendingLocationReady_) {
+                pendingLocationReady_ = false;
+                reverseGeoCache_[pendingCacheKey_] = pendingLocationName_;
+                if (locationCacheKey_ == pendingCacheKey_) {
+                    locationName_ = pendingLocationName_;
+                    needsRedraw_ = true;
+                }
+            }
+        }
+
         if (needsRedraw_) {
             needsRedraw_ = false;
             updateContentHeight();
@@ -156,6 +179,76 @@ private:
 
     // View info (single view only)
     ViewInfo viewInfo_;
+
+    // Reverse geocoding
+    string locationName_;
+    string locationCacheKey_;
+    std::map<string, string> reverseGeoCache_;
+    mutex reverseGeoMutex_;
+    string pendingLocationName_;
+    string pendingCacheKey_;
+    bool pendingLocationReady_ = false;
+
+    static constexpr auto NOMINATIM_URL = "https://nominatim.openstreetmap.org";
+
+    void startReverseGeocode(double lat, double lon) {
+        string key = format("{:.3f},{:.3f}", lat, lon);
+        locationCacheKey_ = key;
+
+        // Check cache
+        auto it = reverseGeoCache_.find(key);
+        if (it != reverseGeoCache_.end()) {
+            locationName_ = it->second;
+            return;
+        }
+
+        locationName_.clear();
+
+        thread([this, lat, lon, key]() {
+            HttpClient client;
+            client.addHeader("User-Agent", "TrussPhoto/1.0");
+            client.setBaseUrl("");
+            string url = format("{}/reverse?lat={}&lon={}&format=json&zoom=14&accept-language=ja",
+                NOMINATIM_URL, lat, lon);
+            auto res = client.get(url);
+
+            string name;
+            if (res.ok()) {
+                auto j = nlohmann::json::parse(res.body, nullptr, false);
+                if (j.is_object() && j.contains("address")) {
+                    auto& addr = j["address"];
+                    // Pick the most relevant locality name
+                    string locality;
+                    for (auto& field : {"city", "town", "village", "county"}) {
+                        if (addr.contains(field) && addr[field].is_string()) {
+                            locality = addr[field].get<string>();
+                            break;
+                        }
+                    }
+                    string state = addr.value("state", "");
+                    string country = addr.value("country", "");
+
+                    if (!locality.empty() && !state.empty())
+                        name = locality + ", " + state;
+                    else if (!locality.empty())
+                        name = locality;
+                    else if (!state.empty())
+                        name = state + ", " + country;
+                    else {
+                        // Fallback to display_name (truncated)
+                        string dn = j.value("display_name", "");
+                        if (dn.size() > 50) dn = dn.substr(0, 50) + "...";
+                        name = dn;
+                    }
+                }
+            }
+
+            lock_guard<mutex> lock(reverseGeoMutex_);
+            pendingLocationName_ = name;
+            pendingCacheKey_ = key;
+            pendingLocationReady_ = true;
+        }).detach();
+    }
 
     float lineH_ = 18.0f;
     float sectionGap_ = 8.0f;
@@ -228,6 +321,7 @@ private:
             y += lineH_; // header
             y += lineH_; // coordinates
             if (e.altitude != 0) y += lineH_;
+            if (!locationName_.empty()) y += lineH_;
             y += sectionGap_;
         }
 
@@ -404,6 +498,10 @@ private:
 
             if (e.altitude != 0) {
                 drawValue(format("Alt: {:.0f}m", e.altitude), y, Color(0.6f, 0.6f, 0.65f));
+            }
+
+            if (!locationName_.empty()) {
+                drawValue(locationName_, y, Color(0.7f, 0.7f, 0.75f));
             }
             y += sectionGap_;
         }

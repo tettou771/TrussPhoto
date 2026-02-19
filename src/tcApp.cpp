@@ -853,6 +853,8 @@ void tcApp::keyPressed(int key) {
         if (key == SAPP_KEYCODE_ESCAPE) {
             if (mapView->hasProvisionalPins()) {
                 mapView->clearProvisionalPins();
+            } else if (mapView->hasGpxTracks()) {
+                mapView->clearGpxTracks();
             }
             // else: do nothing (G key to go back to grid)
         } else if (key == SAPP_KEYCODE_ENTER || key == SAPP_KEYCODE_KP_ENTER) {
@@ -1117,14 +1119,61 @@ void tcApp::filesDropped(const vector<string>& files) {
 
     bool added = false;
     vector<string> filesToImport;
+    vector<string> gpxFiles;
 
     for (const auto& f : files) {
         if (fs::is_directory(f)) {
             provider_.scanFolder(f);
             added = true;
+        } else if (fs::path(f).extension() == ".gpx") {
+            gpxFiles.push_back(f);
         } else if (provider_.isSupportedFile(f)) {
             filesToImport.push_back(f);
         }
+    }
+
+    // Handle GPX files → map view
+    if (!gpxFiles.empty()) {
+        auto mapView = viewManager_->mapView();
+        for (auto& gf : gpxFiles) {
+            mapView->loadGpx(gf);
+        }
+        // Switch to map mode if not already there
+        if (viewMode() != ViewMode::Map) {
+            auto g = grid();
+            vector<string> ids;
+            vector<PhotoEntry> photos;
+            for (size_t i = 0; i < g->getPhotoIdCount(); i++) {
+                const string& id = g->getPhotoId((int)i);
+                ids.push_back(id);
+                auto* e = provider_.getPhoto(id);
+                if (e) photos.push_back(*e);
+                else photos.push_back(PhotoEntry{});
+            }
+            mapView->setPhotos(photos, ids, provider_);
+            viewManager_->switchTo(ViewMode::Map);
+
+            if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
+            leftPaneWidth_ = 0;
+            leftTween_.finish();
+            if (metadataPanel_) {
+                metadataPanel_->clearViewInfo();
+                metadataPanel_->clearThumbnail();
+            }
+            updateLayout();
+        }
+        mapView->fitGpxBounds();
+
+        // Match photos against GPX timestamps → provisional pins
+        int matchCount = mapView->countGpxMatches();
+        if (matchCount > 0) {
+            string msg = format("{}枚の写真に仮ピンを打ちますか？", matchCount);
+            if (confirmDialog("GPX ジオタグ", msg)) {
+                mapView->applyGpxGeotags();
+                logNotice() << "[GPX] Created " << matchCount << " provisional pins";
+            }
+        }
+        redraw();
     }
 
     if (!filesToImport.empty()) {

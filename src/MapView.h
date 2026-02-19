@@ -26,6 +26,21 @@ using namespace tcx;
 namespace fs = std::filesystem;
 
 // =============================================================================
+// GpxTrack - GPX track data for map overlay
+// =============================================================================
+
+struct GpxTrackPoint {
+    double lat, lon;
+    time_t time = 0;
+};
+
+struct GpxTrack {
+    vector<GpxTrackPoint> points;
+    Color color = Color(0.2f, 0.7f, 1.0f, 0.8f);
+    float width = 3.0f;
+};
+
+// =============================================================================
 // ProvisionalPin - draggable temporary pin for unconfirmed geotag assignment
 // =============================================================================
 
@@ -407,6 +422,63 @@ public:
 
     bool hasProvisionalPins() const { return !provisionalPins_.empty(); }
 
+    // --- GPX track management ---
+
+    void loadGpx(const string& path) {
+        auto track = parseGpx(path);
+        if (!track.points.empty()) {
+            gpxTracks_.push_back(std::move(track));
+            trackMeshZoom_ = -999;  // force rebuild
+            if (onRedraw) onRedraw();
+        }
+    }
+
+    void clearGpxTracks() {
+        gpxTracks_.clear();
+        trackMeshes_.clear();
+        trackMeshZoom_ = -999;
+        if (onRedraw) onRedraw();
+    }
+
+    bool hasGpxTracks() const { return !gpxTracks_.empty(); }
+
+    const vector<GpxTrack>& gpxTracks() const { return gpxTracks_; }
+
+    // Add a confirmed pin directly (for GPX geotag matching)
+    void addPin(const string& photoId, int photoIndex, double lat, double lon) {
+        pins_.push_back({lat, lon, photoIndex, photoId});
+        clusterZoom_ = -999;
+    }
+
+    void fitGpxBounds() {
+        if (gpxTracks_.empty()) return;
+        double minLat = 90, maxLat = -90, minLon = 180, maxLon = -180;
+        for (auto& track : gpxTracks_) {
+            for (auto& pt : track.points) {
+                minLat = min(minLat, pt.lat);
+                maxLat = max(maxLat, pt.lat);
+                minLon = min(minLon, pt.lon);
+                maxLon = max(maxLon, pt.lon);
+            }
+        }
+        centerLat_ = (minLat + maxLat) / 2.0;
+        centerLon_ = (minLon + maxLon) / 2.0;
+        float w = getWidth();
+        float h = getHeight();
+        if (w < 1 || h < 1) { zoom_ = 10; return; }
+        for (int z = 18; z >= 1; z--) {
+            auto pMin = latLonToPixel(maxLat, minLon, z);
+            auto pMax = latLonToPixel(minLat, maxLon, z);
+            float spanX = pMax.x - pMin.x;
+            float spanY = pMax.y - pMin.y;
+            if (spanX < w * 0.8f && spanY < h * 0.8f) {
+                zoom_ = z;
+                return;
+            }
+        }
+        zoom_ = 1;
+    }
+
     const vector<ProvisionalPin::Ptr>& provisionalPins() const { return provisionalPins_; }
 
     // Update selection highlight on provisional pins based on strip selection
@@ -620,6 +692,17 @@ public:
             }
         }
 
+        // Draw GPX tracks
+        if (!gpxTracks_.empty()) {
+            if (trackMeshZoom_ != zoom_) rebuildTrackMeshes();
+            pushMatrix();
+            translate(-left, -top);
+            for (auto& mesh : trackMeshes_) {
+                mesh->draw();
+            }
+            popMatrix();
+        }
+
         // Draw pins
         drawPins(left, top, w, h);
     }
@@ -648,7 +731,7 @@ public:
             Direction::Left, Direction::Center);
 
         // "No geotagged photos" message
-        if (pins_.empty() && provisionalPins_.empty()) {
+        if (pins_.empty() && provisionalPins_.empty() && gpxTracks_.empty()) {
             setColor(0.5f, 0.5f, 0.55f);
             font_.drawString("No geotagged photos", w / 2, h / 2,
                 Direction::Center, Direction::Center);
@@ -933,6 +1016,63 @@ private:
     thread tileThread_;
     atomic<bool> tileThreadRunning_{false};
     atomic<bool> tileThreadStop_{false};
+
+    // --- GPX tracks ---
+
+    vector<GpxTrack> gpxTracks_;
+    vector<unique_ptr<StrokeMesh>> trackMeshes_;
+    double trackMeshZoom_ = -999;
+
+    // Parse ISO 8601 GPX time: "2024-12-15T10:30:45Z" → time_t (UTC)
+    static time_t parseGpxTime(const char* s) {
+        if (!s || !*s) return 0;
+        struct tm t = {};
+        // "2024-12-15T10:30:45Z" or "2024-12-15T10:30:45+09:00"
+        if (sscanf(s, "%d-%d-%dT%d:%d:%d",
+                   &t.tm_year, &t.tm_mon, &t.tm_mday,
+                   &t.tm_hour, &t.tm_min, &t.tm_sec) < 6) return 0;
+        t.tm_year -= 1900;
+        t.tm_mon -= 1;
+        return timegm(&t);
+    }
+
+    static GpxTrack parseGpx(const string& path) {
+        GpxTrack track;
+        XmlDocument doc;
+        if (!doc.load_file(path.c_str())) return track;
+
+        // <gpx><trk><trkseg><trkpt lat="..." lon="..."><time>...</time>
+        for (auto trk : doc.child("gpx").children("trk")) {
+            for (auto seg : trk.children("trkseg")) {
+                for (auto pt : seg.children("trkpt")) {
+                    double lat = pt.attribute("lat").as_double();
+                    double lon = pt.attribute("lon").as_double();
+                    time_t time = parseGpxTime(pt.child_value("time"));
+                    track.points.push_back({lat, lon, time});
+                }
+            }
+        }
+        return track;
+    }
+
+    void rebuildTrackMeshes() {
+        trackMeshes_.clear();
+        for (auto& track : gpxTracks_) {
+            auto mesh = make_unique<StrokeMesh>();
+            mesh->setWidth(track.width);
+            mesh->setColor(track.color);
+            mesh->setJoinType(StrokeMesh::JOIN_ROUND);
+            mesh->setCapType(StrokeMesh::CAP_ROUND);
+
+            for (auto& pt : track.points) {
+                auto px = latLonToPixel(pt.lat, pt.lon, zoom_);
+                mesh->addVertex(px.x, px.y);
+            }
+            mesh->update();
+            trackMeshes_.push_back(std::move(mesh));
+        }
+        trackMeshZoom_ = zoom_;
+    }
 
     // --- Pin clustering ---
 
@@ -1285,6 +1425,29 @@ public:
 
     bool hasProvisionalPins() const { return canvas_->hasProvisionalPins(); }
 
+    // --- GPX track forwarding ---
+
+    void loadGpx(const string& path) { canvas_->loadGpx(path); }
+    void clearGpxTracks() { canvas_->clearGpxTracks(); }
+    bool hasGpxTracks() const { return canvas_->hasGpxTracks(); }
+    void fitGpxBounds() { canvas_->fitGpxBounds(); }
+
+    // Count how many photos can be matched against GPX timestamps (dry run)
+    int countGpxMatches() const {
+        return (int)findGpxMatches().size();
+    }
+
+    // Create provisional (blue) pins for photos matched against GPX timestamps
+    int applyGpxGeotags() {
+        auto matches = findGpxMatches();
+        for (auto& m : matches) {
+            canvas_->addProvisionalPin(photoIds_[m.photoIdx], (int)m.photoIdx, m.lat, m.lon);
+            strip_->setProvisionalGeotag(photoIds_[m.photoIdx], true);
+        }
+        if (!matches.empty() && onRedraw) onRedraw();
+        return (int)matches.size();
+    }
+
     // Get the selected pin's photoId (empty if none)
     string selectedPhotoId() const { return canvas_->selectedPhotoId(); }
 
@@ -1574,6 +1737,73 @@ private:
     void layoutChildren() {
         if (canvas_) canvas_->setRect(0, 0, getWidth(), mapHeight());
         if (strip_) strip_->setRect(0, mapHeight(), getWidth(), stripHeight());
+    }
+
+    // GPX matching helper
+    struct GpxMatch {
+        size_t photoIdx;
+        double lat, lon;
+    };
+
+    vector<GpxMatch> findGpxMatches() const {
+        vector<GpxMatch> results;
+        auto& tracks = canvas_->gpxTracks();
+
+        // Build sorted timeline from all tracks
+        struct GpxTimePoint { time_t time; double lat, lon; };
+        vector<GpxTimePoint> timeline;
+        for (auto& track : tracks) {
+            for (auto& pt : track.points) {
+                if (pt.time > 0) timeline.push_back({pt.time, pt.lat, pt.lon});
+            }
+        }
+        sort(timeline.begin(), timeline.end(),
+             [](const GpxTimePoint& a, const GpxTimePoint& b) { return a.time < b.time; });
+
+        if (timeline.empty()) return results;
+
+        constexpr double MAX_GAP = 86400;  // 24h max gap between GPX points
+        constexpr double MAX_EDGE = 3600;  // 1h extrapolation at track edges
+
+        for (size_t i = 0; i < photos_.size(); i++) {
+            if (photos_[i].hasGps()) continue;
+
+            time_t photoTime = PhotoEntry::parseDateTimeOriginal(photos_[i].dateTimeOriginal);
+            if (photoTime == 0) continue;
+
+            // Binary search in GPX timeline
+            auto it = lower_bound(timeline.begin(), timeline.end(), photoTime,
+                [](const GpxTimePoint& p, time_t t) { return p.time < t; });
+
+            double lat = 0, lon = 0;
+            bool found = false;
+
+            if (it == timeline.end()) {
+                auto& last = timeline.back();
+                if (difftime(photoTime, last.time) < MAX_EDGE) {
+                    lat = last.lat; lon = last.lon; found = true;
+                }
+            } else if (it == timeline.begin()) {
+                if (difftime(it->time, photoTime) < MAX_EDGE) {
+                    lat = it->lat; lon = it->lon; found = true;
+                }
+            } else {
+                auto& after = *it;
+                auto& before = *(it - 1);
+                double gap = difftime(after.time, before.time);
+                if (gap < MAX_GAP) {
+                    double t = difftime(photoTime, before.time) / gap;
+                    lat = before.lat + (after.lat - before.lat) * t;
+                    lon = before.lon + (after.lon - before.lon) * t;
+                    found = true;
+                }
+            }
+
+            if (found) {
+                results.push_back({i, lat, lon});
+            }
+        }
+        return results;
     }
 
     // Sync photos_ copy with actual GPS state
