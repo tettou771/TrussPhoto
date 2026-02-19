@@ -473,8 +473,9 @@ private:
         return values[nc - 1];
     }
 
-    // Compute minimum auto-scale so distortion remap never samples outside source bounds.
-    // Binary searches over output boundary points. Returns s >= 1.0.
+    // Compute minimum auto-scale so distortion remap never samples outside
+    // the DefaultCrop bounds (manufacturer's declared effective pixel area).
+    // For no-crop case, cropCx/cropCy = image center and bounds = full image.
     float computeExifAutoScale(int srcW, int srcH, int outW, int outH,
                                 float cropCx, float cropCy,
                                 float srcCx, float srcCy, float invDiag) const {
@@ -496,8 +497,12 @@ private:
             {0, outHalfH}, {(float)(outW-1), outHalfH},
         };
         constexpr int nTests = 8;
-        float srcMaxX = (float)(srcW - 1);
-        float srcMaxY = (float)(srcH - 1);
+        // Valid sampling area = DefaultCrop bounds (effective pixels only).
+        // For no-crop: cropCx ± outHalfW naturally gives [0, w-1].
+        float validMinX = cropCx - outHalfW;
+        float validMinY = cropCy - outHalfH;
+        float validMaxX = cropCx + outHalfW;
+        float validMaxY = cropCy + outHalfH;
 
         auto checkScale = [&](float s) -> bool {
             float inv = 1.0f / s;
@@ -509,14 +514,15 @@ private:
                 float dr = interpSpline(knots, distVals, nc, radius);
                 float sx = dr * px + srcCx;
                 float sy = dr * py + srcCy;
-                if (sx < 0 || sx > srcMaxX || sy < 0 || sy > srcMaxY) return false;
+                if (sx < validMinX || sx > validMaxX ||
+                    sy < validMinY || sy > validMaxY) return false;
                 if (doTca) {
                     float drR = dr * interpSpline(knots, caR, nc, radius);
-                    if (drR * px + srcCx < 0 || drR * px + srcCx > srcMaxX ||
-                        drR * py + srcCy < 0 || drR * py + srcCy > srcMaxY) return false;
+                    if (drR * px + srcCx < validMinX || drR * px + srcCx > validMaxX ||
+                        drR * py + srcCy < validMinY || drR * py + srcCy > validMaxY) return false;
                     float drB = dr * interpSpline(knots, caB, nc, radius);
-                    if (drB * px + srcCx < 0 || drB * px + srcCx > srcMaxX ||
-                        drB * py + srcCy < 0 || drB * py + srcCy > srcMaxY) return false;
+                    if (drB * px + srcCx < validMinX || drB * px + srcCx > validMaxX ||
+                        drB * py + srcCy < validMinY || drB * py + srcCy > validMaxY) return false;
                 }
             }
             return true;
@@ -761,8 +767,11 @@ private:
         DngWarpPlane wp[3];
         for (int i = 0; i < 3; i++) wp[i] = dngWarp_[min(i, np - 1)];
         double cx = dngCx_, cy = dngCy_;
-        float srcMaxX = (float)(srcW - 1);
-        float srcMaxY = (float)(srcH - 1);
+        // Valid sampling area = DefaultCrop bounds
+        float validMinX = cropCx - outHalfW;
+        float validMinY = cropCy - outHalfH;
+        float validMaxX = cropCx + outHalfW;
+        float validMaxY = cropCy + outHalfH;
 
         struct Pt { float x, y; };
         Pt tests[] = {
@@ -788,7 +797,8 @@ private:
                     double factor = p.kr[0] + p.kr[1] * r2 + p.kr[2] * r4 + p.kr[3] * r6;
                     float sx = (float)((factor * nx + cx) * (srcW - 1));
                     float sy = (float)((factor * ny + cy) * (srcH - 1));
-                    if (sx < 0 || sx > srcMaxX || sy < 0 || sy > srcMaxY) return false;
+                    if (sx < validMinX || sx > validMaxX ||
+                        sy < validMinY || sy > validMaxY) return false;
                 }
             }
             return true;
