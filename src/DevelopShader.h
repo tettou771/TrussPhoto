@@ -2,6 +2,8 @@
 
 // =============================================================================
 // DevelopShader.h - Unified develop shader (lens + crop + LUT in one pass)
+// Renders to an offscreen RGB10A2 FBO for 10-bit color output.
+// Result texture can be drawn by the Node tree like any other texture.
 // =============================================================================
 
 #include <TrussC.h>
@@ -28,16 +30,17 @@ public:
             return false;
         }
 
-        // Pipeline
+        // Offscreen pipeline (RGB10A2, no blend, no depth)
         sg_pipeline_desc pip_desc = {};
         pip_desc.shader = shader_;
         pip_desc.layout.attrs[ATTR_develop_develop_position].format = SG_VERTEXFORMAT_FLOAT2;
         pip_desc.layout.attrs[ATTR_develop_develop_texcoord0].format = SG_VERTEXFORMAT_FLOAT2;
-        pip_desc.colors[0].blend.enabled = true;
-        pip_desc.colors[0].blend.src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA;
-        pip_desc.colors[0].blend.dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+        pip_desc.colors[0].pixel_format = SG_PIXELFORMAT_RGB10A2;
+        pip_desc.colors[0].blend.enabled = false;
+        pip_desc.depth.pixel_format = SG_PIXELFORMAT_NONE;
+        pip_desc.sample_count = 1;
         pip_desc.index_type = SG_INDEXTYPE_UINT16;
-        pip_desc.label = "develop_pipeline";
+        pip_desc.label = "develop_offscreen_pipeline";
         pipeline_ = sg_make_pipeline(&pip_desc);
 
         // Fullscreen quad vertices (NDC)
@@ -182,6 +185,18 @@ public:
         lensEnabled_ = enabled;
     }
 
+    // -------------------------------------------------------------------------
+    // Exposure / White balance
+    // -------------------------------------------------------------------------
+
+    void setExposure(float ev) { exposure_ = ev; }
+    void setWbTemp(float t) { wbTemp_ = t; }
+    void setWbTint(float t) { wbTint_ = t; }
+
+    float getExposure() const { return exposure_; }
+    float getWbTemp() const { return wbTemp_; }
+    float getWbTint() const { return wbTint_; }
+
     void clearLensData() {
         hasLensLut_ = false;
         hasVigMap_ = false;
@@ -189,34 +204,40 @@ public:
     }
 
     // -------------------------------------------------------------------------
-    // Draw
+    // Offscreen rendering (RGB10A2 FBO)
     // -------------------------------------------------------------------------
 
-    void draw(float x, float y, float w, float h) {
+    // Render develop shader to offscreen FBO.
+    // Call from tcApp::draw() BEFORE the Node tree draws.
+    // Uses suspend/resumeSwapchainPass to do an offscreen pass mid-frame.
+    void renderOffscreen(int outW, int outH) {
         if (!loaded_ || !srcView_.id) return;
 
-        // Flush sokol_gl before custom drawing
-        sgl_draw();
+        ensureFbo(outW, outH);
 
+        // Suspend swapchain pass (flushes sgl, ends current pass)
+        bool wasInSwapchain = isInSwapchainPass();
+        if (wasInSwapchain) suspendSwapchainPass();
+
+        // Begin offscreen pass to RGB10A2 FBO
+        sg_pass pass = {};
+        pass.attachments.colors[0] = fboAttView_;
+        pass.action.colors[0].load_action = SG_LOADACTION_CLEAR;
+        pass.action.colors[0].clear_value = {0, 0, 0, 1};
+        sg_begin_pass(&pass);
+
+        sg_apply_viewportf(0, 0, (float)outW, (float)outH, true);
+        sg_apply_scissor_rectf(0, 0, (float)outW, (float)outH, true);
         sg_apply_pipeline(pipeline_);
-
-        float dpi = sapp_dpi_scale();
-        float winW = (float)sapp_width();
-        float winH = (float)sapp_height();
-
-        sg_apply_viewportf(x * dpi, y * dpi, w * dpi, h * dpi, true);
-        sg_apply_scissor_rectf(x * dpi, y * dpi, w * dpi, h * dpi, true);
 
         // Bindings
         sg_bindings bind = {};
         bind.vertex_buffers[0] = vertexBuf_;
         bind.index_buffer = indexBuf_;
 
-        // Texture bindings (must match shader slot numbers)
         bind.views[VIEW_develop_srcTex] = srcView_;
         bind.samplers[SMP_develop_srcSmp] = srcSmp_;
 
-        // LUT (3D)
         if (lutPtr_ && lutPtr_->isAllocated() && lutBlend_ > 0.0f) {
             bind.views[VIEW_develop_lutTex] = lutPtr_->getView();
             bind.samplers[SMP_develop_lutSmp] = lutPtr_->getSampler();
@@ -225,7 +246,6 @@ public:
             bind.samplers[SMP_develop_lutSmp] = linearSmp_;
         }
 
-        // Lens LUT (1D as 2D)
         if (hasLensLut_) {
             bind.views[VIEW_develop_lensLutTex] = lensLutView_;
             bind.samplers[SMP_develop_lensLutSmp] = linearSmp_;
@@ -234,7 +254,6 @@ public:
             bind.samplers[SMP_develop_lensLutSmp] = linearSmp_;
         }
 
-        // Vignetting map
         if (hasVigMap_) {
             bind.views[VIEW_develop_vigTex] = vigView_;
             bind.samplers[SMP_develop_vigSmp] = linearSmp_;
@@ -258,23 +277,30 @@ public:
         params.vigEnabled = (lensEnabled_ && hasVigMap_) ? 1.0f : 0.0f;
         params._imageSize[0] = imageSize_[0];
         params._imageSize[1] = imageSize_[1];
+        params.exposure = exposure_;
+        params.wbTemp = wbTemp_;
+        params.wbTint = wbTint_;
 
         sg_range range = { &params, sizeof(params) };
         sg_apply_uniforms(UB_develop_fs_develop_params, &range);
 
         sg_draw(0, 6, 1);
+        sg_end_pass();
 
-        // Restore viewport
-        sg_apply_viewportf(0, 0, winW, winH, true);
-        sg_apply_scissor_rectf(0, 0, winW, winH, true);
+        // Resume swapchain pass
+        if (wasInSwapchain) resumeSwapchainPass();
 
-        // Restore sokol_gl state
-        sgl_defaults();
-        sgl_matrix_mode_projection();
-        sgl_ortho(0.0f, winW / dpi, winH / dpi, 0.0f, -10000.0f, 10000.0f);
-        sgl_matrix_mode_modelview();
-        sgl_load_identity();
+        fboReady_ = true;
     }
+
+    // Result FBO accessors (for sgl drawing in Node tree)
+    bool isFboReady() const { return fboReady_; }
+    sg_view getFboView() const { return fboTexView_; }
+    sg_sampler getFboSampler() const { return linearSmp_; }
+    int getFboWidth() const { return fboW_; }
+    int getFboHeight() const { return fboH_; }
+
+    void invalidateFbo() { fboReady_ = false; }
 
 private:
     bool loaded_ = false;
@@ -303,6 +329,11 @@ private:
     sg_view vigView_ = {};
     bool hasVigMap_ = false;
 
+    // Exposure / WB
+    float exposure_ = 0.0f;
+    float wbTemp_ = 0.0f;
+    float wbTint_ = 0.0f;
+
     // Lens uniform state
     bool lensEnabled_ = false;
     float autoScale_ = 1.0f;
@@ -316,6 +347,48 @@ private:
     sg_view dummyView_ = {};
     sg_image dummyLut3DImg_ = {};
     sg_view dummyLut3DView_ = {};
+
+    // Offscreen FBO (RGB10A2)
+    sg_image fboImg_ = {};
+    sg_view fboAttView_ = {};   // attachment view (render target)
+    sg_view fboTexView_ = {};   // texture view (for sampling)
+    int fboW_ = 0, fboH_ = 0;
+    bool fboReady_ = false;
+
+    void ensureFbo(int w, int h) {
+        if (fboImg_.id && fboW_ == w && fboH_ == h) return;
+
+        // Destroy old FBO
+        if (fboImg_.id) {
+            sg_destroy_view(fboTexView_);
+            sg_destroy_view(fboAttView_);
+            sg_destroy_image(fboImg_);
+        }
+
+        // Create RGB10A2 render target
+        sg_image_desc desc = {};
+        desc.usage.color_attachment = true;
+        desc.width = w;
+        desc.height = h;
+        desc.pixel_format = SG_PIXELFORMAT_RGB10A2;
+        desc.sample_count = 1;
+        desc.label = "develop_fbo_img";
+        fboImg_ = sg_make_image(&desc);
+
+        // Attachment view (for rendering)
+        sg_view_desc att = {};
+        att.color_attachment.image = fboImg_;
+        fboAttView_ = sg_make_view(&att);
+
+        // Texture view (for sampling)
+        sg_view_desc tex = {};
+        tex.texture.image = fboImg_;
+        fboTexView_ = sg_make_view(&tex);
+
+        fboW_ = w;
+        fboH_ = h;
+        fboReady_ = false;
+    }
 
     void createDummyTextures() {
         // 2D white pixel (for lens LUT / vig when disabled)
@@ -362,6 +435,11 @@ private:
             sg_destroy_image(dummyImg_);
             sg_destroy_view(dummyLut3DView_);
             sg_destroy_image(dummyLut3DImg_);
+        }
+        if (fboImg_.id) {
+            sg_destroy_view(fboTexView_);
+            sg_destroy_view(fboAttView_);
+            sg_destroy_image(fboImg_);
         }
         if (lensLutImg_.id) {
             sg_destroy_view(lensLutView_);

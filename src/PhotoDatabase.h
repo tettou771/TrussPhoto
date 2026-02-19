@@ -15,7 +15,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 10;
+    static constexpr int SCHEMA_VERSION = 12;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -84,7 +84,12 @@ public:
                 "  subsec_time_original TEXT NOT NULL DEFAULT '',"
                 "  companion_files     TEXT NOT NULL DEFAULT '',"
                 "  chroma_denoise      REAL NOT NULL DEFAULT 0.5,"
-                "  luma_denoise        REAL NOT NULL DEFAULT 0.0"
+                "  luma_denoise        REAL NOT NULL DEFAULT 0.0,"
+                "  stack_id            TEXT NOT NULL DEFAULT '',"
+                "  stack_primary       INTEGER NOT NULL DEFAULT 0,"
+                "  dev_exposure        REAL NOT NULL DEFAULT 0.0,"
+                "  dev_wb_temp         REAL NOT NULL DEFAULT 0.0,"
+                "  dev_wb_tint         REAL NOT NULL DEFAULT 0.0"
                 ")"
             );
             if (!ok) return false;
@@ -243,8 +248,43 @@ public:
                     return false;
                 }
             }
+            version = 10;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v9 -> v10";
+        }
+
+        // v10 -> v11: add stacking columns
+        if (version == 10) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN stack_id TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN stack_primary INTEGER NOT NULL DEFAULT 0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v10->v11 failed: " << sql;
+                    return false;
+                }
+            }
+            version = 11;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v10 -> v11";
+        }
+
+        // v11 -> v12: add exposure + white balance develop settings
+        if (version == 11) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN dev_exposure REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN dev_wb_temp REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN dev_wb_tint REAL NOT NULL DEFAULT 0.0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v11->v12 failed: " << sql;
+                    return false;
+                }
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v9 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v11 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -265,10 +305,11 @@ public:
             "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
             "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
             "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
-            "subsec_time_original, companion_files, chroma_denoise, luma_denoise) "
+            "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
+            "stack_id, stack_primary, dev_exposure, dev_wb_temp, dev_wb_tint) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
-            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50)"
+            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55)"
         );
         if (!stmt.valid()) return false;
         bindEntry(stmt, e);
@@ -373,6 +414,32 @@ public:
         stmt.bind(1, (double)chroma);
         stmt.bind(2, (double)luma);
         stmt.bind(3, id);
+        return stmt.execute();
+    }
+
+    bool updateStackId(const string& id, const string& stackId, bool primary) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET stack_id=?1, stack_primary=?2 WHERE id=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, stackId);
+        stmt.bind(2, primary ? 1 : 0);
+        stmt.bind(3, id);
+        return stmt.execute();
+    }
+
+    bool updateDevelop(const string& id, float exposure, float wbTemp, float wbTint,
+                       float chroma, float luma) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "UPDATE photos SET dev_exposure=?1, dev_wb_temp=?2, dev_wb_tint=?3, "
+            "chroma_denoise=?4, luma_denoise=?5 WHERE id=?6");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, (double)exposure);
+        stmt.bind(2, (double)wbTemp);
+        stmt.bind(3, (double)wbTint);
+        stmt.bind(4, (double)chroma);
+        stmt.bind(5, (double)luma);
+        stmt.bind(6, id);
         return stmt.execute();
     }
 
@@ -485,10 +552,11 @@ public:
             "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
             "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
             "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
-            "subsec_time_original, companion_files, chroma_denoise, luma_denoise) "
+            "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
+            "stack_id, stack_primary, dev_exposure, dev_wb_temp, dev_wb_tint) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
-            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50)"
+            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55)"
         );
         if (!stmt.valid()) {
             db_.rollback();
@@ -522,7 +590,9 @@ public:
             "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
             "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
             "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
-            "subsec_time_original, companion_files, chroma_denoise, luma_denoise "
+            "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
+            "stack_id, stack_primary, "
+            "dev_exposure, dev_wb_temp, dev_wb_tint "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -579,6 +649,11 @@ public:
             e.companionFiles     = stmt.getText(47);
             e.chromaDenoise      = (float)stmt.getDouble(48);
             e.lumaDenoise        = (float)stmt.getDouble(49);
+            e.stackId            = stmt.getText(50);
+            e.stackPrimary       = stmt.getInt(51) != 0;
+            e.devExposure        = (float)stmt.getDouble(52);
+            e.devWbTemp          = (float)stmt.getDouble(53);
+            e.devWbTint          = (float)stmt.getDouble(54);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -1202,5 +1277,10 @@ private:
         stmt.bind(48, e.companionFiles);
         stmt.bind(49, (double)e.chromaDenoise);
         stmt.bind(50, (double)e.lumaDenoise);
+        stmt.bind(51, e.stackId);
+        stmt.bind(52, e.stackPrimary ? 1 : 0);
+        stmt.bind(53, (double)e.devExposure);
+        stmt.bind(54, (double)e.devWbTemp);
+        stmt.bind(55, (double)e.devWbTint);
     }
 };

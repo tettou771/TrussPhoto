@@ -66,6 +66,9 @@ struct PhotoEntry {
     // Develop settings (per-photo)
     float chromaDenoise = 0.5f;  // 0-1, chroma noise reduction strength
     float lumaDenoise = 0.0f;    // 0-1, luma noise reduction strength
+    float devExposure = 0.0f;    // EV stops (-3 to +3)
+    float devWbTemp = 0.0f;      // temperature shift (-1 to +1)
+    float devWbTint = 0.0f;      // tint shift (-1 to +1)
 
     // Lens correction (JSON: Sony EXIF spline, DNG polynomial, or Fuji MakerNote)
     string lensCorrectionParams;
@@ -82,6 +85,10 @@ struct PhotoEntry {
     float subjectDistance = 0; // meters
     string subsecTimeOriginal; // "625" etc (for pairing timestamp)
     string companionFiles;     // JSON array: companion paths (future use)
+
+    // Stacking (RAW+JPG, Live Photo grouping)
+    string stackId;              // same value = same stack ("" = not stacked)
+    bool stackPrimary = false;   // true = visible in grid, false = hidden companion
 
     // State
     SyncState syncState = SyncState::LocalOnly;
@@ -144,6 +151,9 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"isManaged", e.isManaged},
         {"chromaDenoise", e.chromaDenoise},
         {"lumaDenoise", e.lumaDenoise},
+        {"devExposure", e.devExposure},
+        {"devWbTemp", e.devWbTemp},
+        {"devWbTint", e.devWbTint},
         {"lensCorrectionParams", e.lensCorrectionParams},
         {"exposureTime", e.exposureTime},
         {"exposureBias", e.exposureBias},
@@ -155,7 +165,9 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"lensSerial", e.lensSerial},
         {"subjectDistance", e.subjectDistance},
         {"subsecTimeOriginal", e.subsecTimeOriginal},
-        {"companionFiles", e.companionFiles}
+        {"companionFiles", e.companionFiles},
+        {"stackId", e.stackId},
+        {"stackPrimary", e.stackPrimary}
     };
 }
 
@@ -199,6 +211,9 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.isManaged = j.value("isManaged", true);
     e.chromaDenoise = j.value("chromaDenoise", 0.5f);
     e.lumaDenoise = j.value("lumaDenoise", 0.0f);
+    e.devExposure = j.value("devExposure", 0.0f);
+    e.devWbTemp = j.value("devWbTemp", 0.0f);
+    e.devWbTint = j.value("devWbTint", 0.0f);
 
     e.lensCorrectionParams = j.value("lensCorrectionParams", string(""));
     e.exposureTime = j.value("exposureTime", string(""));
@@ -212,6 +227,8 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.subjectDistance = j.value("subjectDistance", 0.0f);
     e.subsecTimeOriginal = j.value("subsecTimeOriginal", string(""));
     e.companionFiles = j.value("companionFiles", string(""));
+    e.stackId = j.value("stackId", string(""));
+    e.stackPrimary = j.value("stackPrimary", false);
 
     int state = j.value("syncState", 0);
     e.syncState = static_cast<SyncState>(state);

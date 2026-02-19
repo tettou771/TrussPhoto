@@ -42,7 +42,13 @@ public:
     bool wantsLeftSidebar() const override { return false; }
 
     // Callback when photo changes (for DevelopPanel slider sync)
-    function<void(float chroma, float luma)> onDenoiseRestored;
+    function<void(float exposure, float wbTemp, float wbTint,
+                  float chroma, float luma)> onDevelopRestored;
+
+    void setup() override {
+        enableEvents();
+        setClipping(true);
+    }
 
     // Initialize GPU resources (call once from tcApp::setup after addChild)
     void init(const string& profileDir) {
@@ -72,10 +78,17 @@ public:
         // Clean up previous state
         cleanupState();
 
-        // Restore NR settings from entry
+        // Restore develop settings from entry
+        exposure_ = entry->devExposure;
+        wbTemp_ = entry->devWbTemp;
+        wbTint_ = entry->devWbTint;
         chromaDenoise_ = entry->chromaDenoise;
         lumaDenoise_ = entry->lumaDenoise;
-        if (onDenoiseRestored) onDenoiseRestored(chromaDenoise_, lumaDenoise_);
+        developShader_.setExposure(exposure_);
+        developShader_.setWbTemp(wbTemp_);
+        developShader_.setWbTint(wbTint_);
+        if (onDevelopRestored) onDevelopRestored(exposure_, wbTemp_, wbTint_,
+                                                 chromaDenoise_, lumaDenoise_);
 
         bool loaded = false;
         isSmartPreview_ = false;
@@ -255,21 +268,37 @@ public:
         rawLoadCompleted_ = false;
     }
 
-    // Draw the image
-    void drawView() {
+    // Render develop shader to offscreen FBO (call from tcApp::draw() before Node tree)
+    // Uses suspend/resumeSwapchainPass internally; safe to call mid-frame.
+    void renderDevelopFbo() {
+        if (isVideo_) return;
+        if (!isRawImage_ || !intermediateTexture_.isAllocated()) return;
+        if (!needsFboRender_) return;
+
+        developShader_.renderOffscreen(displayW_, displayH_);
+        needsFboRender_ = false;
+    }
+
+    // Draw the image (called by Node tree with clipping + local transform)
+    void draw() override {
+        // Fill background to cover any framebuffer artifacts from
+        // suspend/resumeSwapchainPass during offscreen FBO rendering
+        setColor(0.07f, 0.07f, 0.09f);
+        fill();
+        drawRect(0, 0, getWidth(), getHeight());
+
         if (isVideo_) {
             drawVideoView();
             return;
         }
 
-        bool hasIntermediate = isRawImage_ && intermediateTexture_.isAllocated();
+        bool hasFbo = isRawImage_ && developShader_.isFboReady();
         bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
-        bool hasImage = isRawImage_ ? (hasIntermediate || hasPreviewRaw) : fullImage_.isAllocated();
+        bool hasImage = hasFbo || hasPreviewRaw || fullImage_.isAllocated();
         if (!hasImage) return;
 
-        // Display dimensions: crop output or full texture
         float imgW, imgH;
-        if (hasIntermediate) {
+        if (hasFbo) {
             imgW = (float)displayW_;
             imgH = (float)displayH_;
         } else if (hasPreviewRaw) {
@@ -280,38 +309,16 @@ public:
             imgH = fullImage_.getHeight();
         }
 
-        float winW = getWidth();
-        float winH = getHeight();
-        float fitScale = min(winW / imgW, winH / imgH);
-        float scale = fitScale * zoomLevel_;
-        float drawW = imgW * scale;
-        float drawH = imgH * scale;
-
-        // Clamp pan offset
-        if (drawW <= winW) panOffset_.x = 0;
-        else {
-            float maxPanX = (drawW - winW) / 2;
-            panOffset_.x = clamp(panOffset_.x, -maxPanX, maxPanX);
-        }
-        if (drawH <= winH) panOffset_.y = 0;
-        else {
-            float maxPanY = (drawH - winH) / 2;
-            panOffset_.y = clamp(panOffset_.y, -maxPanY, maxPanY);
-        }
-
-        float x = (winW - drawW) / 2 + panOffset_.x;
-        float y = (winH - drawH) / 2 + panOffset_.y;
+        auto [x, y, drawW, drawH] = calcDrawRect(imgW, imgH);
 
         setColor(1.0f, 1.0f, 1.0f);
-
-        if (hasIntermediate) {
-            // DevelopShader handles lens + crop + LUT in one pass
-            developShader_.draw(x, y, drawW, drawH);
+        if (hasFbo) {
+            // Draw FBO result texture via sgl (10-bit RGB10A2)
+            drawTextureView(developShader_.getFboView(), developShader_.getFboSampler(),
+                            x, y, drawW, drawH);
         } else if (hasPreviewRaw) {
-            // Embedded JPEG preview: draw directly (already has camera style)
             previewTexture_.draw(x, y, drawW, drawH);
         } else {
-            // Non-RAW image: draw directly
             fullImage_.draw(x, y, drawW, drawH);
         }
     }
@@ -353,6 +360,7 @@ public:
             if (hasProfileLut_) {
                 profileEnabled_ = !profileEnabled_;
                 developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+                needsFboRender_ = true;
                 logNotice() << "[Profile] " << (profileEnabled_ ? "ON" : "OFF");
             }
             return true;
@@ -361,6 +369,7 @@ public:
             if (hasProfileLut_) {
                 profileBlend_ = clamp(profileBlend_ - 0.1f, 0.0f, 1.0f);
                 developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+                needsFboRender_ = true;
                 logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
             }
             return true;
@@ -369,6 +378,7 @@ public:
             if (hasProfileLut_) {
                 profileBlend_ = clamp(profileBlend_ + 0.1f, 0.0f, 1.0f);
                 developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+                needsFboRender_ = true;
                 logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
             }
             return true;
@@ -415,6 +425,7 @@ public:
                         << " (" << lensCorrector_.correctionSource() << ")";
             // GPU uniform change only — instant!
             developShader_.setLensEnabled(lensEnabled_);
+            needsFboRender_ = true;
             updateDisplayDimensions();
             return true;
         }
@@ -422,32 +433,49 @@ public:
         return false;
     }
 
-    // Called when DevelopPanel NR sliders change
-    void onDenoiseChanged(float chroma, float luma) {
-        chromaDenoise_ = chroma;
-        lumaDenoise_ = luma;
+    // Called when DevelopPanel sliders change
+    void onDevelopChanged(float exposure, float wbTemp, float wbTint,
+                          float chroma, float luma) {
+        // GPU-only params: update shader uniforms
+        bool gpuChanged = (exposure_ != exposure || wbTemp_ != wbTemp || wbTint_ != wbTint);
+        exposure_ = exposure;
+        wbTemp_ = wbTemp;
+        wbTint_ = wbTint;
+        developShader_.setExposure(exposure_);
+        developShader_.setWbTemp(wbTemp_);
+        developShader_.setWbTint(wbTint_);
 
-        if (!isRawImage_ || !rawPixels_.isAllocated()) return;
+        // NR: needs CPU re-processing (only if changed)
+        bool nrChanged = (chromaDenoise_ != chroma || lumaDenoise_ != luma);
+        if (nrChanged) {
+            chromaDenoise_ = chroma;
+            lumaDenoise_ = luma;
 
-        // Re-apply NR to raw pixels and re-upload
-        nrPixels_ = rawPixels_.clone();
-        if (chromaDenoise_ > 0 || lumaDenoise_ > 0) {
-            tp::guidedDenoise(nrPixels_, chromaDenoise_, lumaDenoise_);
+            if (isRawImage_ && rawPixels_.isAllocated()) {
+                nrPixels_ = rawPixels_.clone();
+                if (chromaDenoise_ > 0 || lumaDenoise_ > 0) {
+                    tp::guidedDenoise(nrPixels_, chromaDenoise_, lumaDenoise_);
+                }
+                intermediateTexture_.allocate(nrPixels_, TextureUsage::Immutable, true);
+                developShader_.setSourceTexture(intermediateTexture_);
+            }
         }
-        intermediateTexture_.allocate(nrPixels_, TextureUsage::Immutable, true);
-        developShader_.setSourceTexture(intermediateTexture_);
 
-        // Save to DB
+        if (gpuChanged || nrChanged) needsFboRender_ = true;
+
+        // Save all develop settings to DB
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
             const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
-            ctx_->provider->setDenoise(pid, chroma, luma);
+            ctx_->provider->setDevelop(pid, exposure_, wbTemp_, wbTint_,
+                                       chromaDenoise_, lumaDenoise_);
         }
 
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
-    // Handle mouse input
-    bool handleMousePress(Vec2 pos, int button) {
+protected:
+    // Node event handlers (dispatched by the Node tree, not tcApp)
+    bool onMousePress(Vec2 pos, int button) override {
         if (button == 0) {
             if (isVideo_) {
                 float barY = getHeight() - seekBarHeight_;
@@ -466,7 +494,8 @@ public:
         return false;
     }
 
-    bool handleMouseRelease(int button) {
+    bool onMouseRelease(Vec2 pos, int button) override {
+        (void)pos;
         if (button == 0) {
             if (seekDragging_) { seekDragging_ = false; return true; }
             isDragging_ = false;
@@ -475,7 +504,7 @@ public:
         return false;
     }
 
-    bool handleMouseDrag(Vec2 pos, int button) {
+    bool onMouseDrag(Vec2 pos, int button) override {
         if (button == 0) {
             if (seekDragging_ && isVideo_) {
                 float pct = clamp(pos.x / getWidth(), 0.0f, 1.0f);
@@ -494,7 +523,7 @@ public:
         return false;
     }
 
-    bool handleMouseScroll(Vec2 delta) {
+    bool onMouseScroll(Vec2 pos, Vec2 scroll) override {
         if (isVideo_) return false;
 
         bool hasIntermediate = isRawImage_ && intermediateTexture_.isAllocated();
@@ -502,38 +531,23 @@ public:
         bool hasImage = isRawImage_ ? (hasIntermediate || hasPreviewRaw) : fullImage_.isAllocated();
         if (!hasImage) return false;
 
-        float imgW, imgH;
-        if (hasIntermediate) {
-            imgW = (float)displayW_;
-            imgH = (float)displayH_;
-        } else if (hasPreviewRaw) {
-            imgW = previewTexture_.getWidth();
-            imgH = previewTexture_.getHeight();
-        } else {
-            imgW = fullImage_.getWidth();
-            imgH = fullImage_.getHeight();
-        }
-
-        float winW = getWidth();
-        float winH = getHeight();
-
         float oldZoom = zoomLevel_;
-        zoomLevel_ *= (1.0f + delta.y * 0.1f);
+        zoomLevel_ *= (1.0f + scroll.y * 0.1f);
         zoomLevel_ = clamp(zoomLevel_, 1.0f, 10.0f);
 
-        Vec2 mousePos(getGlobalMouseX(), getGlobalMouseY());
-        mousePos.x -= getX();
-        mousePos.y -= getY();
-
-        Vec2 windowCenter(winW / 2.0f, winH / 2.0f);
+        // pos is already in local coords
+        Vec2 windowCenter(getWidth() / 2.0f, getHeight() / 2.0f);
         Vec2 imageCenter = windowCenter + panOffset_;
-        Vec2 toMouse = mousePos - imageCenter;
+        Vec2 toMouse = pos - imageCenter;
 
         float zoomRatio = zoomLevel_ / oldZoom;
         panOffset_ = panOffset_ - toMouse * (zoomRatio - 1.0f);
 
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         return true;
     }
+
+public:
 
     // Accessors
     int selectedIndex() const { return selectedIndex_; }
@@ -604,6 +618,7 @@ private:
     Texture previewTexture_;
     bool isRawImage_ = false;
     bool isSmartPreview_ = false;
+    bool needsFboRender_ = false;
 
     // Display dimensions (after crop, for fit-to-window calculation)
     int displayW_ = 0, displayH_ = 0;
@@ -637,6 +652,11 @@ private:
     LensCorrector lensCorrector_;
     bool lensEnabled_ = true;
 
+    // Develop settings (GPU)
+    float exposure_ = 0.0f;
+    float wbTemp_ = 0.0f;
+    float wbTint_ = 0.0f;
+
     // Noise reduction
     float chromaDenoise_ = 0.5f;
     float lumaDenoise_ = 0.0f;
@@ -646,6 +666,48 @@ private:
     bool isVideo_ = false;
     bool seekDragging_ = false;
     float seekBarHeight_ = 40.0f;
+
+    // Draw a texture by view+sampler via sgl (for FBO result)
+    void drawTextureView(sg_view view, sg_sampler sampler,
+                         float x, float y, float w, float h) {
+        sgl_enable_texture();
+        sgl_texture(view, sampler);
+        Color col = getDefaultContext().getColor();
+        sgl_begin_quads();
+        sgl_c4f(col.r, col.g, col.b, col.a);
+        sgl_v2f_t2f(x, y, 0, 0);
+        sgl_v2f_t2f(x + w, y, 1, 0);
+        sgl_v2f_t2f(x + w, y + h, 1, 1);
+        sgl_v2f_t2f(x, y + h, 0, 1);
+        sgl_end();
+        sgl_disable_texture();
+    }
+
+    // Calculate draw rect (local coords) with pan clamping
+    struct DrawRect { float x, y, w, h; };
+    DrawRect calcDrawRect(float imgW, float imgH) {
+        float winW = getWidth();
+        float winH = getHeight();
+        float fitScale = min(winW / imgW, winH / imgH);
+        float scale = fitScale * zoomLevel_;
+        float drawW = imgW * scale;
+        float drawH = imgH * scale;
+
+        if (drawW <= winW) panOffset_.x = 0;
+        else {
+            float maxPanX = (drawW - winW) / 2;
+            panOffset_.x = clamp(panOffset_.x, -maxPanX, maxPanX);
+        }
+        if (drawH <= winH) panOffset_.y = 0;
+        else {
+            float maxPanY = (drawH - winH) / 2;
+            panOffset_.y = clamp(panOffset_.y, -maxPanY, maxPanY);
+        }
+
+        float x = (winW - drawW) / 2 + panOffset_.x;
+        float y = (winH - drawH) / 2 + panOffset_.y;
+        return {x, y, drawW, drawH};
+    }
 
     void cleanupState() {
         if (isVideo_) {
@@ -714,6 +776,8 @@ private:
             developShader_.setLut(profileLut_);
             developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
         }
+
+        needsFboRender_ = true;
     }
 
     void setupDevelopShaderParams(int srcW, int srcH) {
@@ -846,11 +910,13 @@ private:
             currentProfilePath_ = cubePath;
             developShader_.setLut(profileLut_);
             developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+            needsFboRender_ = true;
             logNotice() << "[Profile] Loaded: " << cubePath;
         } else {
             hasProfileLut_ = false;
             currentProfilePath_.clear();
             developShader_.clearLut();
+            needsFboRender_ = true;
             logWarning() << "[Profile] Failed to load: " << cubePath;
         }
     }
