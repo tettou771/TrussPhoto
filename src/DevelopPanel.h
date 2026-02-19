@@ -29,6 +29,8 @@ public:
         // Create sliders
         chromaSlider_ = make_shared<DevelopSlider>("Chroma NR", 0.5f, 0.0f, 1.0f);
         lumaSlider_ = make_shared<DevelopSlider>("Luma NR", 0.0f, 0.0f, 1.0f);
+        chromaSlider_->setDebounceTime(0.2);
+        lumaSlider_->setDebounceTime(0.2);
 
         chromaSlider_->onChange = [this](float v) {
             if (onSettingsChanged) onSettingsChanged();

@@ -27,6 +27,9 @@ public:
     DevelopSlider(const string& lbl, float def, float lo = 0.0f, float hi = 1.0f)
         : label(lbl), value(def), minVal(lo), maxVal(hi), defaultVal(def) {}
 
+    // Set debounce time in seconds. 0 = immediate (default).
+    void setDebounceTime(double seconds) { debounceSec_ = seconds; }
+
     void setup() override {
         enableEvents();
     }
@@ -80,7 +83,7 @@ public:
 
             if (elapsed < 350) {
                 value = defaultVal;
-                if (onChange) onChange(value);
+                fireImmediate();
                 redraw();
                 return true;
             }
@@ -99,13 +102,45 @@ public:
     }
 
     bool onMouseRelease(Vec2 pos, int button) override {
+        if (dragging_) {
+            // On release: cancel pending debounce and fire immediately
+            cancelPending();
+            if (onChange) onChange(value);
+        }
         dragging_ = false;
         return true;
     }
 
 private:
     bool dragging_ = false;
+    double debounceSec_ = 0;
+    uint64_t pendingTimerId_ = 0;
     chrono::steady_clock::time_point lastClickTime_;
+
+    void cancelPending() {
+        if (pendingTimerId_ != 0) {
+            cancelTimer(pendingTimerId_);
+            pendingTimerId_ = 0;
+        }
+    }
+
+    void fireImmediate() {
+        cancelPending();
+        if (onChange) onChange(value);
+    }
+
+    void fireDebounced() {
+        if (debounceSec_ <= 0) {
+            if (onChange) onChange(value);
+            return;
+        }
+        // Cancel previous pending call, schedule new one
+        cancelPending();
+        pendingTimerId_ = callAfter(debounceSec_, [this]() {
+            pendingTimerId_ = 0;
+            if (onChange) onChange(value);
+        });
+    }
 
     void updateFromMouse(float mx) {
         float pad = 8.0f;
@@ -116,7 +151,7 @@ private:
         float t = (mx - trackLeft) / trackW;
         t = clamp(t, 0.0f, 1.0f);
         value = minVal + t * (maxVal - minVal);
-        if (onChange) onChange(value);
+        fireDebounced();
         redraw();
     }
 };
