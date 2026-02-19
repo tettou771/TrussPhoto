@@ -270,21 +270,23 @@ public:
         // Draw pins
         drawPins(left, top, w, h);
 
-        // Zoom level indicator
-        setColor(0.0f, 0.0f, 0.0f, 0.5f);
+        // Zoom level indicator (bottom-left, flush to edges)
+        float overlayH = 20;
+        float overlayY = h - overlayH + 3;
+        setColor(0.0f, 0.0f, 0.0f, 0.3f);
         fill();
-        drawRect(8, h - 28, 80, 20);
-        setColor(0.8f, 0.8f, 0.85f);
-        fontSmall_.drawString(format("Zoom: {:.1f}", zoom_), 14, h - 18,
+        drawRect(0, overlayY, 88, overlayH);
+        setColor(1.0f, 1.0f, 1.0f);
+        fontSmall_.drawString(format("Zoom: {:.1f}", zoom_), 6, overlayY + overlayH / 2,
             Direction::Left, Direction::Center);
 
-        // OSM attribution
-        setColor(0.0f, 0.0f, 0.0f, 0.5f);
+        // OSM attribution (bottom-right, flush to edges)
+        float attrW = 184;
+        setColor(0.0f, 0.0f, 0.0f, 0.3f);
         fill();
-        float attrW = 180;
-        drawRect(w - attrW - 4, h - 28, attrW, 20);
-        setColor(0.6f, 0.6f, 0.65f);
-        fontSmall_.drawString("(C) OpenStreetMap contributors", w - attrW, h - 18,
+        drawRect(w - attrW, overlayY, attrW, overlayH);
+        setColor(1.0f, 1.0f, 1.0f);
+        fontSmall_.drawString("(C) OpenStreetMap contributors", w - attrW + 4, overlayY + overlayH / 2,
             Direction::Left, Direction::Center);
 
         // "No geotagged photos" message
@@ -540,34 +542,41 @@ private:
         float qLeft = centerPxQ.x * (float)scaleFactor - w / 2.0f;
         float qTop  = centerPxQ.y * (float)scaleFactor - h / 2.0f;
 
-        // Find which cluster contains the selected pin (to draw it last)
-        int selectedClusterIdx = -1;
-        if (selectedPinIdx_ >= 0) {
-            for (size_t ci = 0; ci < cachedClusters_.size(); ci++) {
-                auto& c = cachedClusters_[ci];
-                if (c.count == 1 && c.firstPinIdx == selectedPinIdx_) {
-                    selectedClusterIdx = (int)ci;
-                    break;
-                }
+        // Draw all clusters (normal pins)
+        for (const auto& cluster : cachedClusters_) {
+            drawCluster(cluster, scaleFactor, qLeft, qTop, w, h);
+        }
+
+        // Draw selected pin on top (independently from clusters)
+        if (selectedPinIdx_ >= 0 && selectedPinIdx_ < (int)pins_.size()) {
+            auto& pin = pins_[selectedPinIdx_];
+            auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
+            float sx = pinPx.x - left;
+            float sy = pinPx.y - top;
+
+            if (sx >= -30 && sx <= w + 30 && sy >= -30 && sy <= h + 30) {
+                float r = PIN_RADIUS + 2;
+
+                // Shadow
+                setColor(0.0f, 0.0f, 0.0f, 0.4f);
+                fill();
+                drawCircle(sx + 1, sy + 1, r);
+
+                // Orange selection pin
+                setColor(SEL_R, SEL_G, SEL_B);
+                fill();
+                drawCircle(sx, sy, r);
+
+                // White inner dot
+                setColor(1.0f, 1.0f, 1.0f);
+                fill();
+                drawCircle(sx, sy, 3);
             }
-        }
-
-        // Draw all non-selected pins first
-        for (size_t ci = 0; ci < cachedClusters_.size(); ci++) {
-            if ((int)ci == selectedClusterIdx) continue;
-            drawSingleCluster(cachedClusters_[ci], scaleFactor, qLeft, qTop, w, h, false);
-        }
-
-        // Draw selected pin last (on top)
-        if (selectedClusterIdx >= 0) {
-            drawSingleCluster(cachedClusters_[selectedClusterIdx], scaleFactor,
-                              qLeft, qTop, w, h, true);
         }
     }
 
-    void drawSingleCluster(const Cluster& cluster, double scaleFactor,
-                           float qLeft, float qTop, float w, float h,
-                           bool isSelected) {
+    void drawCluster(const Cluster& cluster, double scaleFactor,
+                     float qLeft, float qTop, float w, float h) {
         float sx = cluster.wx * (float)scaleFactor - qLeft;
         float sy = cluster.wy * (float)scaleFactor - qTop;
 
@@ -591,12 +600,7 @@ private:
         drawCircle(sx + 1, sy + 1, r);
 
         // Pin body
-        if (isSelected) {
-            setColor(SEL_R, SEL_G, SEL_B);
-            r += 2;  // slightly larger for selected
-        } else {
-            setColor(PIN_COLOR);
-        }
+        setColor(PIN_COLOR);
         fill();
         drawCircle(sx, sy, r);
 
