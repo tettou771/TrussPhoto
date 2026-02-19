@@ -48,20 +48,29 @@ public:
         setSize(SIZE, SIZE);
     }
 
+    void setSelected(bool v) { selected_ = v; }
+    bool isSelected() const { return selected_; }
+
     void draw() override {
         float cx = SIZE / 2;
         float cy = SIZE / 2;
-        float r = SIZE / 2 - 1;
 
-        // Shadow
-        setColor(0.0f, 0.0f, 0.0f, 0.35f);
-        fill();
-        drawCircle(cx + 1, cy + 1, r);
+        // Orange selection ring
+        if (selected_) {
+            setColor(SEL_R, SEL_G, SEL_B);
+            fill();
+            drawCircle(cx, cy, 10);
+        } else {
+            // Shadow (only when not selected)
+            setColor(0.0f, 0.0f, 0.0f, 0.35f);
+            fill();
+            drawCircle(cx + 1, cy + 1, 7);
+        }
 
         // Pin body (light blue)
         setColor(COLOR);
         fill();
-        drawCircle(cx, cy, r);
+        drawCircle(cx, cy, 7);
 
         // White inner dot
         setColor(1.0f, 1.0f, 1.0f);
@@ -77,6 +86,7 @@ protected:
 private:
     MapCanvas* canvas_;
     bool draggingPin_ = false;
+    bool selected_ = false;
 };
 
 // =============================================================================
@@ -263,6 +273,14 @@ public:
     bool hasProvisionalPins() const { return !provisionalPins_.empty(); }
 
     const vector<ProvisionalPin::Ptr>& provisionalPins() const { return provisionalPins_; }
+
+    // Update selection highlight on provisional pins based on strip selection
+    void updateProvisionalPinSelection(const vector<string>& selectedIds) {
+        unordered_set<string> sel(selectedIds.begin(), selectedIds.end());
+        for (auto& pp : provisionalPins_) {
+            pp->setSelected(sel.count(pp->photoId) > 0);
+        }
+    }
 
     // Convert local screen coords to lat/lon
     pair<double, double> screenToLatLon(float sx, float sy) {
@@ -597,7 +615,7 @@ public:
     }
 
 private:
-    static constexpr float PIN_RADIUS = 8.0f;
+    static constexpr float PIN_RADIUS = 7.0f;
     inline static const Color PIN_COLOR = Color(0.9f, 0.2f, 0.2f);
 
     // Map state
@@ -737,17 +755,15 @@ private:
             float sy = pinPx.y - top;
 
             if (sx >= -30 && sx <= w + 30 && sy >= -30 && sy <= h + 30) {
-                float r = PIN_RADIUS + 2;
-
                 // Shadow
                 setColor(0.0f, 0.0f, 0.0f, 0.4f);
                 fill();
-                drawCircle(sx + 1, sy + 1, r);
+                drawCircle(sx + 1, sy + 1, 10);
 
                 // Orange selection pin
                 setColor(SEL_R, SEL_G, SEL_B);
                 fill();
-                drawCircle(sx, sy, r);
+                drawCircle(sx, sy, 10);
 
                 // White inner dot
                 setColor(1.0f, 1.0f, 1.0f);
@@ -1013,11 +1029,16 @@ public:
     // Get the selected pin's photoId (empty if none)
     string selectedPhotoId() const { return canvas_->selectedPhotoId(); }
 
+    // Get all selected photo IDs from strip
+    vector<string> selectedPhotoIds() const { return strip_->selectedPhotoIds(); }
+
     // Remove geotag from a photo: clear GPS in provider, remove pin from map, update strip
     void removeGeotag(const string& photoId, PhotoProvider& provider) {
         provider.setGps(photoId, 0, 0);
         canvas_->removePin(photoId);
         strip_->setHasGps(photoId, false);
+        // Update local photos_ copy so auto-geotag sees the change
+        updatePhotoCopy(photoId, 0, 0);
         logNotice() << "[MapView] Geotag removed: " << photoId;
     }
 
@@ -1201,6 +1222,7 @@ public:
         canvas_->onGeotagConfirm = [this](const string& id, double lat, double lon) {
             strip_->setProvisionalGeotag(id, false);
             strip_->setHasGps(id, true);
+            updatePhotoCopy(id, lat, lon);
             if (onGeotagConfirm) onGeotagConfirm(id, lat, lon);
         };
         canvas_->onRedraw = [this]() {
@@ -1213,6 +1235,8 @@ public:
             if (hasGps) {
                 canvas_->centerOnSelectedPin();
             }
+            // Update provisional pin selection highlights
+            canvas_->updateProvisionalPinSelection(strip_->selectedPhotoIds());
             if (onPinClick) onPinClick(idx, id);
             if (onRedraw) onRedraw();
         };
@@ -1291,5 +1315,16 @@ private:
     void layoutChildren() {
         if (canvas_) canvas_->setRect(0, 0, getWidth(), mapHeight());
         if (strip_) strip_->setRect(0, mapHeight(), getWidth(), stripHeight());
+    }
+
+    // Sync photos_ copy with actual GPS state
+    void updatePhotoCopy(const string& photoId, double lat, double lon) {
+        for (size_t i = 0; i < photoIds_.size(); i++) {
+            if (photoIds_[i] == photoId) {
+                photos_[i].latitude = lat;
+                photos_[i].longitude = lon;
+                break;
+            }
+        }
     }
 };

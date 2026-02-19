@@ -862,13 +862,25 @@ void tcApp::keyPressed(int key) {
         } else if (key == 'A' || key == 'a') {
             mapView->runAutoGeotag();
         } else if (key == SAPP_KEYCODE_BACKSPACE || key == SAPP_KEYCODE_DELETE) {
-            string photoId = mapView->selectedPhotoId();
-            if (!photoId.empty()) {
-                confirmDialogAsync("Remove Geotag",
-                    "Remove geotag from the selected photo?",
-                    [this, photoId](bool yes) {
+            // Collect selected photos that have GPS
+            auto allSelected = mapView->selectedPhotoIds();
+            vector<string> gpsIds;
+            for (auto& id : allSelected) {
+                auto* e = provider_.getPhoto(id);
+                if (e && e->hasGps()) gpsIds.push_back(id);
+            }
+            if (!gpsIds.empty()) {
+                int n = (int)gpsIds.size();
+                string msg = n == 1
+                    ? "Remove geotag from the selected photo?"
+                    : format("Remove geotag from {} photos?", n);
+                confirmDialogAsync("Remove Geotag", msg,
+                    [this, gpsIds](bool yes) {
                         if (yes) {
-                            viewManager_->mapView()->removeGeotag(photoId, provider_);
+                            auto mv = viewManager_->mapView();
+                            for (auto& id : gpsIds) {
+                                mv->removeGeotag(id, provider_);
+                            }
                             redraw();
                         }
                     });
