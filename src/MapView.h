@@ -290,7 +290,10 @@ public:
         panFromLon_ = centerLon_;
         panToLat_ = pin.lat;
         panToLon_ = pin.lon;
-        panProgress_ = 0.0f;
+        panFromZoom_ = zoom_;
+        panToZoom_ = zoom_;
+        panStartTime_ = getElapsedTimef();
+        panDuration_ = 0.5f;
     }
 
     void centerOn(double lat, double lon, double z) {
@@ -306,9 +309,10 @@ public:
 
     void fitBounds() {
         if (pins_.empty()) {
-            centerLat_ = 35.68;
-            centerLon_ = 139.77;
-            zoom_ = 5;
+            // Default to Japan
+            centerLat_ = 36.5;
+            centerLon_ = 138.0;
+            zoom_ = 6;
             return;
         }
 
@@ -322,7 +326,6 @@ public:
 
         centerLat_ = (minLat + maxLat) / 2.0;
         centerLon_ = (minLon + maxLon) / 2.0;
-
         float w = getWidth();
         float h = getHeight();
         if (w < 1 || h < 1) { zoom_ = 10; return; }
@@ -333,7 +336,14 @@ public:
             float spanX = pMax.x - pMin.x;
             float spanY = pMax.y - pMin.y;
             if (spanX < w * 0.8f && spanY < h * 0.8f) {
-                zoom_ = z;
+                if (z <= 3) {
+                    // Too zoomed out (world-scale) — default to Japan
+                    centerLat_ = 36.5;
+                    centerLon_ = 138.0;
+                    zoom_ = 6;
+                } else {
+                    zoom_ = z;
+                }
                 return;
             }
         }
@@ -480,17 +490,19 @@ public:
             if (hasQueue) startTileThread();
         }
 
-        // Pan animation
+        // Pan animation (time-based)
         if (panAnimating_) {
-            panProgress_ += 0.04f;  // ~15 frames at 60fps
-            if (panProgress_ >= 1.0f) {
-                panProgress_ = 1.0f;
-                panAnimating_ = false;
-            }
-            // Ease out cubic
-            float t = 1.0f - (1.0f - panProgress_) * (1.0f - panProgress_) * (1.0f - panProgress_);
+            float elapsed = getElapsedTimef() - panStartTime_;
+            float p = clamp(elapsed / panDuration_, 0.0f, 1.0f);
+            if (p >= 1.0f) panAnimating_ = false;
+
+            // Ease in-out quint
+            float t = p < 0.5f
+                ? 16.0f * p * p * p * p * p
+                : 1.0f - powf(-2.0f * p + 2.0f, 5.0f) / 2.0f;
             centerLat_ = panFromLat_ + (panToLat_ - panFromLat_) * t;
             centerLon_ = panFromLon_ + (panToLon_ - panFromLon_) * t;
+            zoom_ = panFromZoom_ + (panToZoom_ - panFromZoom_) * t;
             if (onRedraw) onRedraw();
         }
 
@@ -512,8 +524,10 @@ public:
                 panFromLon_ = centerLon_;
                 panToLat_ = searchResult_.lat;
                 panToLon_ = searchResult_.lon;
-                panProgress_ = 0.0f;
-                zoom_ = 14.0;
+                panFromZoom_ = zoom_;
+                panToZoom_ = searchResult_.zoom;
+                panStartTime_ = getElapsedTimef();
+                panDuration_ = 1.5f;
                 if (onRedraw) onRedraw();
             }
         }
@@ -779,7 +793,10 @@ private:
     // Search bar
     MapSearchBar::Ptr searchBar_;
 
-    struct SearchResult { bool valid = false; double lat = 0, lon = 0; };
+    struct SearchResult {
+        bool valid = false;
+        double lat = 0, lon = 0, zoom = 14.0;
+    };
     SearchResult searchResult_;
 
     static string urlEncode(const string& s) {
@@ -797,7 +814,9 @@ private:
     }
 
     void searchLocation(const string& query) {
-        thread([this, query]() {
+        float viewW = getWidth();
+        float viewH = getHeight();
+        thread([this, query, viewW, viewH]() {
             HttpClient client;
             client.addHeader("User-Agent", "TrussPhoto/1.0");
             client.setBaseUrl("");
@@ -810,8 +829,32 @@ private:
                 if (j.is_array() && !j.empty()) {
                     double lat = stod(j[0]["lat"].get<string>());
                     double lon = stod(j[0]["lon"].get<string>());
+                    double zoom = 14.0;
+
+                    // Use boundingbox to calculate zoom (show ~2x bbox area)
+                    if (j[0].contains("boundingbox") && j[0]["boundingbox"].is_array()
+                        && j[0]["boundingbox"].size() == 4) {
+                        auto& bb = j[0]["boundingbox"];
+                        double south = stod(bb[0].get<string>());
+                        double north = stod(bb[1].get<string>());
+                        double west  = stod(bb[2].get<string>());
+                        double east  = stod(bb[3].get<string>());
+
+                        // Find zoom (0.1 steps) where bbox * 2 fits viewport
+                        for (double z = 18.0; z >= 1.0; z -= 0.1) {
+                            auto pSW = latLonToPixel(south, west, z);
+                            auto pNE = latLonToPixel(north, east, z);
+                            float bboxW = abs(pNE.x - pSW.x);
+                            float bboxH = abs(pSW.y - pNE.y);
+                            if (bboxW * 2.0f < viewW && bboxH * 2.0f < viewH) {
+                                zoom = ceil(z * 10.0) / 10.0;
+                                break;
+                            }
+                        }
+                    }
+
                     lock_guard<mutex> lock(tileMutex_);
-                    searchResult_ = {true, lat, lon};
+                    searchResult_ = {true, lat, lon, zoom};
                 }
             }
         }).detach();
@@ -868,7 +911,9 @@ private:
     bool panAnimating_ = false;
     double panFromLat_ = 0, panFromLon_ = 0;
     double panToLat_ = 0, panToLon_ = 0;
-    float panProgress_ = 0;
+    double panFromZoom_ = 0, panToZoom_ = 0;
+    float panStartTime_ = 0;
+    float panDuration_ = 0.5f;
 
     chrono::steady_clock::time_point lastPinClickTime_;
     int lastPinClickIndex_ = -1;
