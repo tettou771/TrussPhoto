@@ -678,9 +678,13 @@ void tcApp::draw() {
 
     clear(0.06f, 0.06f, 0.08f);
 
+    // DevelopShader must draw in global sgl context (before Node tree)
+    // because it uses raw sg_ commands + sgl_defaults() which break Node transforms
     if (viewMode() == ViewMode::Single) {
-        viewManager_->singleView()->drawView();
-    } else if (viewMode() == ViewMode::Grid) {
+        viewManager_->singleView()->drawDevelop();
+    }
+
+    if (viewMode() == ViewMode::Grid) {
         // Show hint if no images
         if (provider_.getCount() == 0) {
             float leftW = leftPaneWidth_;
@@ -1129,17 +1133,12 @@ void tcApp::keyReleased(int key) {
 }
 
 void tcApp::mousePressed(Vec2 pos, int button) {
-    if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related || viewMode() == ViewMode::People) return;
-    if (viewMode() == ViewMode::Single) {
-        viewManager_->singleView()->handleMousePress(pos, button);
-    }
+    if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related ||
+        viewMode() == ViewMode::People || viewMode() == ViewMode::Single) return;
 }
 
 void tcApp::mouseReleased(Vec2 pos, int button) {
     (void)pos;
-    if (viewMode() == ViewMode::Single) {
-        viewManager_->singleView()->handleMouseRelease(button);
-    }
     if (button == 0) {
         redraw();
     }
@@ -1150,18 +1149,12 @@ void tcApp::mouseMoved(Vec2 pos) {
 }
 
 void tcApp::mouseDragged(Vec2 pos, int button) {
-    if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related || viewMode() == ViewMode::People) return;
-    if (viewMode() == ViewMode::Single) {
-        viewManager_->singleView()->handleMouseDrag(pos, button);
-    }
+    if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related ||
+        viewMode() == ViewMode::People || viewMode() == ViewMode::Single) return;
 }
 
 void tcApp::mouseScrolled(Vec2 delta) {
     redraw();
-    if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related || viewMode() == ViewMode::People) return;
-    if (viewMode() != ViewMode::Single) return;
-
-    viewManager_->singleView()->handleMouseScroll(delta);
 }
 
 void tcApp::windowResized(int width, int height) {

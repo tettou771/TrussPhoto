@@ -44,6 +44,11 @@ public:
     // Callback when photo changes (for DevelopPanel slider sync)
     function<void(float chroma, float luma)> onDenoiseRestored;
 
+    void setup() override {
+        enableEvents();
+        setClipping(true);
+    }
+
     // Initialize GPU resources (call once from tcApp::setup after addChild)
     void init(const string& profileDir) {
         profileManager_.setProfileDir(profileDir);
@@ -255,24 +260,23 @@ public:
         rawLoadCompleted_ = false;
     }
 
-    // Draw the image
-    void drawView() {
+    // Draw non-DevelopShader content (called by Node tree with clipping)
+    void draw() override {
         if (isVideo_) {
             drawVideoView();
             return;
         }
 
+        // DevelopShader case is drawn by drawDevelop() from tcApp::draw()
         bool hasIntermediate = isRawImage_ && intermediateTexture_.isAllocated();
+        if (hasIntermediate) return;
+
         bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
-        bool hasImage = isRawImage_ ? (hasIntermediate || hasPreviewRaw) : fullImage_.isAllocated();
+        bool hasImage = hasPreviewRaw || fullImage_.isAllocated();
         if (!hasImage) return;
 
-        // Display dimensions: crop output or full texture
         float imgW, imgH;
-        if (hasIntermediate) {
-            imgW = (float)displayW_;
-            imgH = (float)displayH_;
-        } else if (hasPreviewRaw) {
+        if (hasPreviewRaw) {
             imgW = previewTexture_.getWidth();
             imgH = previewTexture_.getHeight();
         } else {
@@ -280,40 +284,30 @@ public:
             imgH = fullImage_.getHeight();
         }
 
-        float winW = getWidth();
-        float winH = getHeight();
-        float fitScale = min(winW / imgW, winH / imgH);
-        float scale = fitScale * zoomLevel_;
-        float drawW = imgW * scale;
-        float drawH = imgH * scale;
-
-        // Clamp pan offset
-        if (drawW <= winW) panOffset_.x = 0;
-        else {
-            float maxPanX = (drawW - winW) / 2;
-            panOffset_.x = clamp(panOffset_.x, -maxPanX, maxPanX);
-        }
-        if (drawH <= winH) panOffset_.y = 0;
-        else {
-            float maxPanY = (drawH - winH) / 2;
-            panOffset_.y = clamp(panOffset_.y, -maxPanY, maxPanY);
-        }
-
-        float x = (winW - drawW) / 2 + panOffset_.x;
-        float y = (winH - drawH) / 2 + panOffset_.y;
+        auto [x, y, drawW, drawH] = calcDrawRect(imgW, imgH);
 
         setColor(1.0f, 1.0f, 1.0f);
-
-        if (hasIntermediate) {
-            // DevelopShader handles lens + crop + LUT in one pass
-            developShader_.draw(x, y, drawW, drawH);
-        } else if (hasPreviewRaw) {
-            // Embedded JPEG preview: draw directly (already has camera style)
+        if (hasPreviewRaw) {
             previewTexture_.draw(x, y, drawW, drawH);
         } else {
-            // Non-RAW image: draw directly
             fullImage_.draw(x, y, drawW, drawH);
         }
+    }
+
+    // Draw DevelopShader — called from tcApp::draw() in global sgl context
+    // (DevelopShader uses raw sg_ commands + sgl_defaults, incompatible with Node tree)
+    void drawDevelop() {
+        if (isVideo_) return;
+        if (!isRawImage_ || !intermediateTexture_.isAllocated()) return;
+
+        float imgW = (float)displayW_;
+        float imgH = (float)displayH_;
+        auto [x, y, drawW, drawH] = calcDrawRect(imgW, imgH);
+
+        // Convert local coords to global for DevelopShader viewport
+        float gx, gy;
+        localToGlobal(x, y, gx, gy);
+        developShader_.draw(gx, gy, drawW, drawH);
     }
 
     // Handle key input
@@ -446,8 +440,9 @@ public:
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
-    // Handle mouse input
-    bool handleMousePress(Vec2 pos, int button) {
+protected:
+    // Node event handlers (dispatched by the Node tree, not tcApp)
+    bool onMousePress(Vec2 pos, int button) override {
         if (button == 0) {
             if (isVideo_) {
                 float barY = getHeight() - seekBarHeight_;
@@ -466,7 +461,8 @@ public:
         return false;
     }
 
-    bool handleMouseRelease(int button) {
+    bool onMouseRelease(Vec2 pos, int button) override {
+        (void)pos;
         if (button == 0) {
             if (seekDragging_) { seekDragging_ = false; return true; }
             isDragging_ = false;
@@ -475,7 +471,7 @@ public:
         return false;
     }
 
-    bool handleMouseDrag(Vec2 pos, int button) {
+    bool onMouseDrag(Vec2 pos, int button) override {
         if (button == 0) {
             if (seekDragging_ && isVideo_) {
                 float pct = clamp(pos.x / getWidth(), 0.0f, 1.0f);
@@ -494,7 +490,7 @@ public:
         return false;
     }
 
-    bool handleMouseScroll(Vec2 delta) {
+    bool onMouseScroll(Vec2 pos, Vec2 scroll) override {
         if (isVideo_) return false;
 
         bool hasIntermediate = isRawImage_ && intermediateTexture_.isAllocated();
@@ -502,38 +498,23 @@ public:
         bool hasImage = isRawImage_ ? (hasIntermediate || hasPreviewRaw) : fullImage_.isAllocated();
         if (!hasImage) return false;
 
-        float imgW, imgH;
-        if (hasIntermediate) {
-            imgW = (float)displayW_;
-            imgH = (float)displayH_;
-        } else if (hasPreviewRaw) {
-            imgW = previewTexture_.getWidth();
-            imgH = previewTexture_.getHeight();
-        } else {
-            imgW = fullImage_.getWidth();
-            imgH = fullImage_.getHeight();
-        }
-
-        float winW = getWidth();
-        float winH = getHeight();
-
         float oldZoom = zoomLevel_;
-        zoomLevel_ *= (1.0f + delta.y * 0.1f);
+        zoomLevel_ *= (1.0f + scroll.y * 0.1f);
         zoomLevel_ = clamp(zoomLevel_, 1.0f, 10.0f);
 
-        Vec2 mousePos(getGlobalMouseX(), getGlobalMouseY());
-        mousePos.x -= getX();
-        mousePos.y -= getY();
-
-        Vec2 windowCenter(winW / 2.0f, winH / 2.0f);
+        // pos is already in local coords
+        Vec2 windowCenter(getWidth() / 2.0f, getHeight() / 2.0f);
         Vec2 imageCenter = windowCenter + panOffset_;
-        Vec2 toMouse = mousePos - imageCenter;
+        Vec2 toMouse = pos - imageCenter;
 
         float zoomRatio = zoomLevel_ / oldZoom;
         panOffset_ = panOffset_ - toMouse * (zoomRatio - 1.0f);
 
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         return true;
     }
+
+public:
 
     // Accessors
     int selectedIndex() const { return selectedIndex_; }
@@ -646,6 +627,32 @@ private:
     bool isVideo_ = false;
     bool seekDragging_ = false;
     float seekBarHeight_ = 40.0f;
+
+    // Calculate draw rect (local coords) with pan clamping
+    struct DrawRect { float x, y, w, h; };
+    DrawRect calcDrawRect(float imgW, float imgH) {
+        float winW = getWidth();
+        float winH = getHeight();
+        float fitScale = min(winW / imgW, winH / imgH);
+        float scale = fitScale * zoomLevel_;
+        float drawW = imgW * scale;
+        float drawH = imgH * scale;
+
+        if (drawW <= winW) panOffset_.x = 0;
+        else {
+            float maxPanX = (drawW - winW) / 2;
+            panOffset_.x = clamp(panOffset_.x, -maxPanX, maxPanX);
+        }
+        if (drawH <= winH) panOffset_.y = 0;
+        else {
+            float maxPanY = (drawH - winH) / 2;
+            panOffset_.y = clamp(panOffset_.y, -maxPanY, maxPanY);
+        }
+
+        float x = (winW - drawW) / 2 + panOffset_.x;
+        float y = (winH - drawH) / 2 + panOffset_.y;
+        return {x, y, drawW, drawH};
+    }
 
     void cleanupState() {
         if (isVideo_) {

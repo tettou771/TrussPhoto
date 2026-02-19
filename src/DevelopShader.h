@@ -264,11 +264,12 @@ public:
 
         sg_draw(0, 6, 1);
 
-        // Restore viewport
+        // Restore viewport + scissor to full window
         sg_apply_viewportf(0, 0, winW, winH, true);
         sg_apply_scissor_rectf(0, 0, winW, winH, true);
 
-        // Restore sokol_gl state
+        // Restore sokol_gl state (pipeline + projection)
+        // Must be called from global draw context, NOT from Node tree draw()
         sgl_defaults();
         sgl_matrix_mode_projection();
         sgl_ortho(0.0f, winW / dpi, winH / dpi, 0.0f, -10000.0f, 10000.0f);
