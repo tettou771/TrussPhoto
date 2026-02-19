@@ -75,6 +75,12 @@ void tcApp::setup() {
 
         // Resolve stacks after lrcat import (RAW+JPG, Live Photo grouping)
         provider_.resolveStacks();
+
+        // Backfill EXIF metadata for imported references
+        int exifQueued = provider_.queueAllMissingExifData();
+        if (exifQueued > 0) {
+            logNotice() << "[LrcatImport] EXIF backfill queued: " << exifQueued;
+        }
     }
 
     // 7. Save bootstrap (remember catalog path for next launch)
@@ -585,15 +591,8 @@ void tcApp::update() {
         }
     }
 
-    // Process EXIF backfill results + auto-queue (one-shot)
+    // Process EXIF backfill results
     provider_.processExifBackfillResults();
-    if (!exifBackfillQueued_) {
-        exifBackfillQueued_ = true;
-        int queued = provider_.queueAllMissingExifData();
-        if (queued > 0) {
-            logNotice() << "[ExifBackfill] Auto-queued " << queued << " photos";
-        }
-    }
 
     // Process embedding generation results
     provider_.processEmbeddingResults();

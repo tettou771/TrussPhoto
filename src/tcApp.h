@@ -85,7 +85,6 @@ private:
 
     // Background pipeline flags
     bool spQueued_ = false;
-    bool exifBackfillQueued_ = false;
     bool embeddingsQueued_ = false;
     bool visionModelUnloaded_ = false;
 

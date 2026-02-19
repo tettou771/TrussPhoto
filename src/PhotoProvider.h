@@ -2248,6 +2248,7 @@ public:
         spThreads_.clear();
         if (copyThread_.joinable()) copyThread_.join();
         if (consolidateThread_.joinable()) consolidateThread_.join();
+        if (exifBackfillThread_.joinable()) exifBackfillThread_.join();
     }
 
 private:
@@ -2331,6 +2332,7 @@ private:
     mutable mutex exifBackfillMutex_;
     vector<ExifBackfillResult> completedExifBackfills_;
     atomic<bool> exifBackfillRunning_{false};
+    thread exifBackfillThread_;
     static constexpr int EXIF_BACKFILL_WORKERS = 2;
 
     // CLIP embedding
@@ -3684,6 +3686,8 @@ private:
         if (exifBackfillRunning_) return;
         exifBackfillRunning_ = true;
 
+        if (exifBackfillThread_.joinable()) exifBackfillThread_.join();
+
         auto jobs = make_shared<vector<pair<string, string>>>();
         jobs->reserve(ids.size());
         for (const auto& id : ids) {
@@ -3696,7 +3700,7 @@ private:
         logNotice() << "[ExifBackfill] Starting " << jobs->size() << " jobs with "
                      << EXIF_BACKFILL_WORKERS << " workers";
 
-        thread([this, jobs]() {
+        exifBackfillThread_ = thread([this, jobs]() {
             // Suppress exiv2 warnings/errors during bulk backfill
             // (Sony2/Olympus MakerNote parse errors are harmless but noisy)
             auto prevLevel = Exiv2::LogMsg::level();
@@ -3706,7 +3710,7 @@ private:
             int total = (int)jobs->size();
 
             auto worker = [&]() {
-                while (true) {
+                while (!stopping_) {
                     int idx = nextIdx.fetch_add(1);
                     if (idx >= total) break;
 
@@ -3809,6 +3813,6 @@ private:
 
             logNotice() << "[ExifBackfill] Complete: " << total << " photos processed";
             exifBackfillRunning_ = false;
-        }).detach();
+        });
     }
 };
