@@ -105,7 +105,7 @@ public:
 
     void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids) {
         pins_.clear();
-        selectedPinIdx_ = -1;
+        selectedPinIds_.clear();
         for (size_t i = 0; i < photos.size(); i++) {
             if (photos[i].hasGps()) {
                 pins_.push_back({photos[i].latitude, photos[i].longitude, (int)i, ids[i]});
@@ -114,34 +114,45 @@ public:
         clusterZoom_ = -999;
     }
 
-    // Select a pin by photoId. Returns true if the photo has GPS (pin found).
+    // Select a single pin by photoId. Returns true if the photo has GPS (pin found).
     bool selectPin(const string& photoId) {
-        selectedPinIdx_ = -1;
-        for (size_t i = 0; i < pins_.size(); i++) {
-            if (pins_[i].photoId == photoId) {
-                selectedPinIdx_ = (int)i;
+        selectedPinIds_.clear();
+        for (auto& pin : pins_) {
+            if (pin.photoId == photoId) {
+                selectedPinIds_.insert(photoId);
                 return true;
             }
         }
         return false;
     }
 
-    // Get selected pin's photoId (empty if none)
+    // Select multiple pins by photoId set
+    void selectPins(const vector<string>& photoIds) {
+        selectedPinIds_.clear();
+        unordered_set<string> pinIds;
+        for (auto& pin : pins_) pinIds.insert(pin.photoId);
+        for (auto& id : photoIds) {
+            if (pinIds.count(id)) selectedPinIds_.insert(id);
+        }
+    }
+
+    // Get first selected pin's photoId (empty if none)
     string selectedPhotoId() const {
-        if (selectedPinIdx_ >= 0 && selectedPinIdx_ < (int)pins_.size())
-            return pins_[selectedPinIdx_].photoId;
+        if (!selectedPinIds_.empty()) return *selectedPinIds_.begin();
         return "";
+    }
+
+    bool isPinSelected(const string& photoId) const {
+        return selectedPinIds_.count(photoId) > 0;
     }
 
     // Remove a pin by photoId and return true if found
     bool removePin(const string& photoId) {
         for (auto it = pins_.begin(); it != pins_.end(); ++it) {
             if (it->photoId == photoId) {
-                bool wasSelected = (selectedPinIdx_ == (int)(it - pins_.begin()));
+                selectedPinIds_.erase(photoId);
                 pins_.erase(it);
                 clusterZoom_ = -999;
-                if (wasSelected) selectedPinIdx_ = -1;
-                else if (selectedPinIdx_ >= (int)pins_.size()) selectedPinIdx_ = -1;
                 if (onRedraw) onRedraw();
                 return true;
             }
@@ -149,10 +160,16 @@ public:
         return false;
     }
 
-    // Center map on pin if it's outside the viewport. Keep zoom level, animate.
+    // Center map on first selected pin if it's outside the viewport. Animate.
     void centerOnSelectedPin() {
-        if (selectedPinIdx_ < 0 || selectedPinIdx_ >= (int)pins_.size()) return;
-        auto& pin = pins_[selectedPinIdx_];
+        if (selectedPinIds_.empty()) return;
+        // Find the first selected pin
+        Pin* found = nullptr;
+        for (auto& pin : pins_) {
+            if (selectedPinIds_.count(pin.photoId)) { found = &pin; break; }
+        }
+        if (!found) return;
+        auto& pin = *found;
 
         // Check if pin is within the visible viewport (with margin)
         auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
@@ -662,8 +679,8 @@ private:
     Vec2 dragStart_;
     double dragStartLat_ = 0, dragStartLon_ = 0;
 
-    // Selected pin
-    int selectedPinIdx_ = -1;
+    // Selected pins (by photoId)
+    unordered_set<string> selectedPinIds_;
 
     // Pan animation
     bool panAnimating_ = false;
@@ -747,14 +764,15 @@ private:
             drawCluster(cluster, scaleFactor, qLeft, qTop, w, h);
         }
 
-        // Draw selected pin on top (independently from clusters)
-        if (selectedPinIdx_ >= 0 && selectedPinIdx_ < (int)pins_.size()) {
-            auto& pin = pins_[selectedPinIdx_];
-            auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
-            float sx = pinPx.x - left;
-            float sy = pinPx.y - top;
+        // Draw selected pins on top (independently from clusters)
+        if (!selectedPinIds_.empty()) {
+            for (auto& pin : pins_) {
+                if (!selectedPinIds_.count(pin.photoId)) continue;
+                auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
+                float sx = pinPx.x - left;
+                float sy = pinPx.y - top;
+                if (sx < -30 || sx > w + 30 || sy < -30 || sy > h + 30) continue;
 
-            if (sx >= -30 && sx <= w + 30 && sy >= -30 && sy <= h + 30) {
                 // Shadow
                 setColor(0.0f, 0.0f, 0.0f, 0.4f);
                 fill();
@@ -1229,14 +1247,14 @@ public:
             if (onRedraw) onRedraw();
         };
 
-        // Strip click → select pin + center map if GPS
+        // Strip click → select pins + center map if GPS
         strip_->onPhotoClick = [this](int idx, const string& id) {
-            bool hasGps = canvas_->selectPin(id);
-            if (hasGps) {
+            auto selectedIds = strip_->selectedPhotoIds();
+            canvas_->selectPins(selectedIds);
+            canvas_->updateProvisionalPinSelection(selectedIds);
+            if (canvas_->isPinSelected(id)) {
                 canvas_->centerOnSelectedPin();
             }
-            // Update provisional pin selection highlights
-            canvas_->updateProvisionalPinSelection(strip_->selectedPhotoIds());
             if (onPinClick) onPinClick(idx, id);
             if (onRedraw) onRedraw();
         };
