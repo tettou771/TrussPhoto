@@ -653,28 +653,33 @@ public:
     function<void(int index, const string& photoId)> onPinDoubleClick;
     function<void()> onRedraw;
 
+    MapView() {
+        // Create children in constructor (not setup!) so setPhotos() etc.
+        // can be called before setup() runs. addChild() is deferred to setup().
+        canvas_ = make_shared<MapCanvas>();
+        strip_ = make_shared<PhotoStrip>();
+    }
+
     void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids,
                    PhotoProvider& provider) {
-        if (canvas_) canvas_->setPhotos(photos, ids);
+        canvas_->setPhotos(photos, ids);
 
-        // Populate strip with all photos (GPS and non-GPS)
         vector<bool> hasGps(ids.size());
         for (size_t i = 0; i < photos.size(); i++)
             hasGps[i] = photos[i].hasGps();
-        if (strip_) strip_->setPhotos(ids, hasGps, provider);
+        strip_->setPhotos(ids, hasGps, provider);
     }
 
     void setStripSelection(const string& photoId) {
-        if (strip_) strip_->selectPhoto(photoId);
+        strip_->selectPhoto(photoId);
     }
 
     void setTileCacheDir(const string& dir) {
-        if (canvas_) canvas_->setTileCacheDir(dir);
-        else pendingTileCacheDir_ = dir;
+        canvas_->setTileCacheDir(dir);
     }
 
     void fitBounds() {
-        if (canvas_) canvas_->fitBounds();
+        canvas_->fitBounds();
     }
 
     // Layout helpers
@@ -687,9 +692,9 @@ public:
     }
 
     void setup() override {
-        // Map canvas (top)
-        canvas_ = make_shared<MapCanvas>();
+        // addChild deferred to setup (needs shared_from_this)
         addChild(canvas_);
+        addChild(strip_);
 
         // Forward callbacks
         canvas_->onPinClick = [this](int idx, const string& id) {
@@ -701,15 +706,6 @@ public:
         canvas_->onRedraw = [this]() {
             if (onRedraw) onRedraw();
         };
-
-        if (!pendingTileCacheDir_.empty()) {
-            canvas_->setTileCacheDir(pendingTileCacheDir_);
-            pendingTileCacheDir_.clear();
-        }
-
-        // Photo strip (bottom)
-        strip_ = make_shared<PhotoStrip>();
-        addChild(strip_);
         strip_->onPhotoClick = [this](int idx, const string& id) {
             if (onPinClick) onPinClick(idx, id);
         };
@@ -731,7 +727,6 @@ public:
 private:
     MapCanvas::Ptr canvas_;
     PhotoStrip::Ptr strip_;
-    string pendingTileCacheDir_;
 
     void layoutChildren() {
         if (canvas_) canvas_->setRect(0, 0, getWidth(), mapHeight());
