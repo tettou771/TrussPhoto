@@ -83,6 +83,10 @@ struct PhotoEntry {
     string subsecTimeOriginal; // "625" etc (for pairing timestamp)
     string companionFiles;     // JSON array: companion paths (future use)
 
+    // Stacking (RAW+JPG, Live Photo grouping)
+    string stackId;              // same value = same stack ("" = not stacked)
+    bool stackPrimary = false;   // true = visible in grid, false = hidden companion
+
     // State
     SyncState syncState = SyncState::LocalOnly;
 
@@ -155,7 +159,9 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"lensSerial", e.lensSerial},
         {"subjectDistance", e.subjectDistance},
         {"subsecTimeOriginal", e.subsecTimeOriginal},
-        {"companionFiles", e.companionFiles}
+        {"companionFiles", e.companionFiles},
+        {"stackId", e.stackId},
+        {"stackPrimary", e.stackPrimary}
     };
 }
 
@@ -212,6 +218,8 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.subjectDistance = j.value("subjectDistance", 0.0f);
     e.subsecTimeOriginal = j.value("subsecTimeOriginal", string(""));
     e.companionFiles = j.value("companionFiles", string(""));
+    e.stackId = j.value("stackId", string(""));
+    e.stackPrimary = j.value("stackPrimary", false);
 
     int state = j.value("syncState", 0);
     e.syncState = static_cast<SyncState>(state);

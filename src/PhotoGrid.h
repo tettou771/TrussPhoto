@@ -238,6 +238,13 @@ protected:
             }
         };
 
+        item->onStackClick = [this, poolIdx]() {
+            int dataIdx = reverseMap_[poolIdx];
+            if (dataIdx >= 0) {
+                toggleCompanionPreview(dataIdx);
+            }
+        };
+
         item->onRequestLoad = [this](int idx) {
             requestLoad(idx);
         };
@@ -259,7 +266,8 @@ protected:
         item->setClipMatch(clipMatch);
 
         bool video = photo ? photo->isVideo : false;
-        item->rebindAndLoad(dataIdx, stem, sync, selected, video, &labelFont_);
+        int stackSize = provider_->getStackSize(photoIds_[dataIdx]);
+        item->rebindAndLoad(dataIdx, stem, sync, selected, video, &labelFont_, stackSize);
     }
 
     void onUnbind(int dataIdx, ItemPtr& item) override {
@@ -275,6 +283,22 @@ protected:
     void onUpdate() override {
         scrollBar_->updateFromContainer();
         processLoadResults();
+    }
+
+    bool onMousePress(Vec2 local, int button) override {
+        // Dismiss companion preview on click outside
+        if (companionPreview_ && companionPreview_->isShowing() && button == 0) {
+            // Check if click is inside the preview
+            float px = companionPreview_->getX();
+            float py = companionPreview_->getY();
+            float pw = companionPreview_->getWidth();
+            float ph = companionPreview_->getHeight();
+            if (local.x < px || local.x > px + pw || local.y < py || local.y > py + ph) {
+                companionPreview_->hide();
+                redraw();
+            }
+        }
+        return RecyclerGrid<PhotoItem>::onMousePress(local, button);
     }
 
     Vec2 getItemPosition(int dataIdx) override {
@@ -307,6 +331,78 @@ private:
     // --- Grid params ---
     float itemSize_ = 140;
 
+    // --- Stack companion preview ---
+    CompanionPreview::Ptr companionPreview_;
+    int companionDataIdx_ = -1;
+    string companionId_;
+    bool companionLoading_ = false;
+
+    void ensureCompanionPreview() {
+        if (companionPreview_) return;
+        companionPreview_ = make_shared<CompanionPreview>();
+        companionPreview_->onClick = [this]() {
+            // Open the primary photo in SingleView (companion's parent)
+            if (companionDataIdx_ >= 0 && onItemClick) {
+                companionPreview_->hide();
+                onItemClick(companionDataIdx_);
+            }
+        };
+        addChild(companionPreview_);
+    }
+
+    // =========================================================================
+    // Stack companion preview (toggle on badge click)
+    // =========================================================================
+
+    void toggleCompanionPreview(int dataIdx) {
+        if (!provider_ || dataIdx < 0 || dataIdx >= (int)photoIds_.size()) return;
+        ensureCompanionPreview();
+
+        // Toggle off if same item clicked again
+        if (companionPreview_->isShowing() && companionDataIdx_ == dataIdx) {
+            companionPreview_->hide();
+            redraw();
+            return;
+        }
+
+        auto companions = provider_->getStackCompanions(photoIds_[dataIdx]);
+        if (companions.empty()) return;
+
+        companionDataIdx_ = dataIdx;
+        companionId_ = companions[0];
+
+        // Calculate position
+        auto it = poolMap_.find(dataIdx);
+        if (it == poolMap_.end()) return;
+        auto& item = pool_[it->second];
+
+        Vec2 itemContentPos = getItemPosition(dataIdx);
+        float scrollY = scrollContainer_->getScrollY();
+        float previewSize = itemSize_ * 0.7f;
+        float ox = itemContentPos.x + item->getWidth() * 0.5f;
+        float oy = itemContentPos.y + item->getHeight() * 0.5f - scrollY;
+
+        // Clamp to grid bounds
+        if (ox + previewSize > getWidth()) ox = getWidth() - previewSize - 4;
+        if (oy + previewSize + 14 > getHeight()) oy = getHeight() - previewSize - 18;
+
+        // Get extension label
+        string ext;
+        auto* photo = provider_->getPhoto(companionId_);
+        if (photo) {
+            ext = fs::path(photo->filename).extension().string();
+            transform(ext.begin(), ext.end(), ext.begin(), ::toupper);
+            if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+        }
+
+        companionPreview_->show(ox, oy, previewSize, ext);
+
+        // Load companion thumbnail in background
+        companionLoading_ = true;
+        loader_.requestLoad(-1000 - dataIdx, companionId_);
+        redraw();
+    }
+
     // =========================================================================
     // Load management
     // =========================================================================
@@ -320,6 +416,15 @@ private:
         LoadResult result;
         while (loader_.tryGetResult(result)) {
             if (!result.success) continue;
+
+            // Companion preview load result (negative IDs)
+            if (result.id < -999) {
+                if (companionLoading_ && companionPreview_ && companionPreview_->isShowing()) {
+                    companionPreview_->setPixels(std::move(result.pixels));
+                    companionLoading_ = false;
+                }
+                continue;
+            }
 
             auto it = poolMap_.find(result.id);
             if (it == poolMap_.end()) continue;
