@@ -1572,7 +1572,10 @@ public:
                            photo.orientation == 1 && photo.focalLength35mm == 0;
             // Also queue if basic metadata is missing (e.g. DNG dimension issue)
             bool needsBasic = (photo.width == 0 || photo.height == 0);
-            if (needsV9 || needsBasic) {
+            // RAW files with no lens correction data may need re-extraction
+            // (e.g. new format support added: Fuji, etc.)
+            bool needsLensCorr = photo.isRaw && photo.lensCorrectionParams.empty();
+            if (needsV9 || needsBasic || needsLensCorr) {
                 ids.push_back(id);
             }
         }
@@ -2796,12 +2799,16 @@ private:
                 }
             }
 
-            // Creative Style / Color Mode
+            // Creative Style / Color Mode / Film Simulation
             // Sony: parsed by exiv2 natively
             string style = getString("Exif.Sony2.CreativeStyle");
             // Sigma: exiv2 doesn't parse Sigma MakerNote, read tag 0x003d from raw binary
             if (style.empty()) {
                 style = extractSigmaColorMode(exif);
+            }
+            // Fujifilm: Film Simulation
+            if (style.empty()) {
+                style = getString("Exif.Fujifilm.FilmMode");
             }
             if (!style.empty()) {
                 photo.creativeStyle = style;
@@ -2867,7 +2874,7 @@ private:
                 photo.subsecTimeOriginal = getString("Exif.Photo.SubSecTimeOriginal");
             }
 
-            // --- Lens correction parameters (Sony EXIF / DNG OpcodeList) ---
+            // --- Lens correction parameters (Sony EXIF / DNG OpcodeList / Fuji MakerNote) ---
             extractLensCorrectionParams(exif, photo);
 
         } catch (...) {
@@ -2875,7 +2882,7 @@ private:
         }
     }
 
-    // Extract Sony or DNG lens correction data from EXIF and store as JSON
+    // Extract Sony, DNG, or Fuji lens correction data from EXIF and store as JSON
     static void extractLensCorrectionParams(const Exiv2::ExifData& exif, PhotoEntry& photo) {
         // Try Sony SubImage1 correction params first
         auto distIt = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DistortionCorrParams"));
@@ -2886,6 +2893,12 @@ private:
             auto opIt = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.OpcodeList3"));
             if (opIt != exif.end()) {
                 extractDngLensCorrection(exif, photo);
+            } else {
+                // Try Fujifilm MakerNote
+                auto fujiIt = exif.findKey(Exiv2::ExifKey("Exif.Fujifilm.GeometricDistortionParams"));
+                if (fujiIt != exif.end()) {
+                    extractFujiLensCorrection(exif, photo);
+                }
             }
         }
 
@@ -2896,16 +2909,20 @@ private:
         if (!photo.lensCorrectionParams.empty()) {
             try {
                 auto j = nlohmann::json::parse(photo.lensCorrectionParams);
-                auto cropOrig = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropOrigin"));
-                auto cropSize = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropSize"));
-                if (cropOrig != exif.end() && cropSize != exif.end() &&
-                    cropOrig->count() >= 2 && cropSize->count() >= 2) {
-                    j["cropX"] = (int)cropOrig->toInt64(0);
-                    j["cropY"] = (int)cropOrig->toInt64(1);
-                    j["cropW"] = (int)cropSize->toInt64(0);
-                    j["cropH"] = (int)cropSize->toInt64(1);
-                    j["orient"] = photo.orientation;
-                    photo.lensCorrectionParams = j.dump();
+                // Only append DefaultCrop for Sony/DNG (Fuji doesn't use it)
+                string type = j.value("type", string(""));
+                if (type != "fuji") {
+                    auto cropOrig = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropOrigin"));
+                    auto cropSize = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropSize"));
+                    if (cropOrig != exif.end() && cropSize != exif.end() &&
+                        cropOrig->count() >= 2 && cropSize->count() >= 2) {
+                        j["cropX"] = (int)cropOrig->toInt64(0);
+                        j["cropY"] = (int)cropOrig->toInt64(1);
+                        j["cropW"] = (int)cropSize->toInt64(0);
+                        j["cropH"] = (int)cropSize->toInt64(1);
+                        j["orient"] = photo.orientation;
+                        photo.lensCorrectionParams = j.dump();
+                    }
                 }
             } catch (...) {}
         }
@@ -3114,6 +3131,69 @@ private:
             }
             pos += paramBytes;
         }
+    }
+
+    // Decode Fujifilm MakerNote lens correction params -> JSON
+    // Pre-computes values to Sony-compatible format:
+    //   distortion: factor = value/100 + 1 (darktable formula)
+    //   CA: factor = value + 1
+    //   vignetting: factor = value/100 (fractional brightness)
+    static void extractFujiLensCorrection(const Exiv2::ExifData& exif, PhotoEntry& photo) {
+        try {
+            auto distIt = exif.findKey(Exiv2::ExifKey("Exif.Fujifilm.GeometricDistortionParams"));
+            if (distIt == exif.end()) return;
+
+            int count = (int)distIt->count();
+            int nc;
+            if (count == 19) nc = 9;        // X-Trans IV/V
+            else if (count == 23) nc = 11;   // X-Trans I/II/III
+            else return;
+
+            nlohmann::json j;
+            j["type"] = "fuji";
+            j["nc"] = nc;
+
+            // Knot positions (values[1..nc])
+            nlohmann::json knots = nlohmann::json::array();
+            for (int i = 0; i < nc; i++)
+                knots.push_back(distIt->toFloat(1 + i));
+            j["knots"] = knots;
+
+            // Distortion: values[nc+1..2*nc], factor = value/100 + 1
+            nlohmann::json dist = nlohmann::json::array();
+            for (int i = 0; i < nc; i++)
+                dist.push_back(distIt->toFloat(1 + nc + i) / 100.0f + 1.0f);
+            j["dist"] = dist;
+
+            // Chromatic Aberration (R + B channels)
+            auto caIt = exif.findKey(Exiv2::ExifKey("Exif.Fujifilm.ChromaticAberrationParams"));
+            if (caIt != exif.end()) {
+                int caCount = (int)caIt->count();
+                // IV/V: 29 = 1 header + 9 knots + 9 R + 9 B + 1 trailer
+                // I/II/III: 31 = 1 header + 10 knots + 10 R + 10 B (+ 1?)
+                if ((nc == 9 && caCount == 29) || (nc == 11 && caCount >= 31)) {
+                    nlohmann::json caR = nlohmann::json::array();
+                    nlohmann::json caB = nlohmann::json::array();
+                    for (int i = 0; i < nc; i++) {
+                        caR.push_back(caIt->toFloat(1 + nc + i) + 1.0f);
+                        caB.push_back(caIt->toFloat(1 + nc * 2 + i) + 1.0f);
+                    }
+                    j["caR"] = caR;
+                    j["caB"] = caB;
+                }
+            }
+
+            // Vignetting: factor = value/100 (fractional brightness)
+            auto vigIt = exif.findKey(Exiv2::ExifKey("Exif.Fujifilm.VignettingParams"));
+            if (vigIt != exif.end() && (int)vigIt->count() == count) {
+                nlohmann::json vig = nlohmann::json::array();
+                for (int i = 0; i < nc; i++)
+                    vig.push_back(vigIt->toFloat(1 + nc + i) / 100.0f);
+                j["vig"] = vig;
+            }
+
+            photo.lensCorrectionParams = j.dump();
+        } catch (...) {}
     }
 
     // Convert "YYYY:MM:DD HH:MM:SS" to "YYYY/MM/DD", fallback to mtime or "unknown"
@@ -3491,9 +3571,10 @@ private:
                         temp.subjectDistance = getFloat("Exif.Photo.SubjectDistance");
                         temp.subsecTimeOriginal = getString("Exif.Photo.SubSecTimeOriginal");
 
-                        // Creative Style
+                        // Creative Style / Film Simulation
                         string style = getString("Exif.Sony2.CreativeStyle");
                         if (style.empty()) style = extractSigmaColorMode(exif);
+                        if (style.empty()) style = getString("Exif.Fujifilm.FilmMode");
                         temp.creativeStyle = style;
 
                         // Lens correction

@@ -3,9 +3,10 @@
 // =============================================================================
 // LensCorrector - Lens correction from EXIF / DNG embedded data
 // =============================================================================
-// Supports two correction sources:
+// Supports three correction sources:
 //   1. Sony ARW: EXIF SubImage1 spline-based distortion/TCA/vignetting
 //   2. DNG: OpcodeList WarpRectilinear (polynomial per-plane) + GainMap
+//   3. Fujifilm RAF: MakerNote spline-based (same apply as Sony)
 //
 // Data can be loaded directly from RAW file (setupFromExif) or restored
 // from DB-cached JSON (setupFromJson).
@@ -23,10 +24,11 @@ public:
 
     bool isReady() const { return ready_; }
 
-    // "sony", "dng", or "none"
+    // "sony", "dng", "fuji", or "none"
     string correctionSource() const {
         if (!ready_) return "none";
         if (useDng_) return "dng";
+        if (useFuji_) return "fuji";
         return "sony";
     }
 
@@ -34,6 +36,7 @@ public:
     void reset() {
         ready_ = false;
         useDng_ = false;
+        useFuji_ = false;
         hasExifTca_ = false;
         hasExifVig_ = false;
         exifKnotCount_ = 0;
@@ -177,6 +180,11 @@ public:
                 correctionFound = setupDngFromExif(exif);
             }
 
+            // --- Try Fujifilm MakerNote correction params ---
+            if (!correctionFound) {
+                correctionFound = setupFujiFromExif(exif);
+            }
+
             if (!correctionFound) return false;
 
             // --- DefaultCropOrigin/Size (common to Sony and DNG) ---
@@ -247,6 +255,8 @@ public:
                 return setupSonyFromJson(j, width, height);
             } else if (type == "dng") {
                 return setupDngFromJson(j, width, height);
+            } else if (type == "fuji") {
+                return setupFujiFromJson(j, width, height);
             }
         } catch (const exception& e) {
             logWarning() << "[LensCorrector] JSON parse error: " << e.what();
@@ -262,6 +272,7 @@ public:
         if (useDng_) {
             return pixels.isFloat() ? applyDngFloat(pixels) : applyDngU8(pixels);
         }
+        // Sony and Fuji use the same spline-based apply (data pre-computed to same format)
         return pixels.isFloat() ? applyExifFloat(pixels) : applyExifU8(pixels);
     }
 
@@ -287,8 +298,9 @@ private:
     bool hasExifTca_ = false;
     bool hasExifVig_ = false;
 
-    // DNG data
+    // Source flags
     bool useDng_ = false;
+    bool useFuji_ = false;
     struct DngWarpPlane { double kr[4] = {}; double kt[2] = {}; };
     int dngWarpPlanes_ = 0;
     DngWarpPlane dngWarp_[3] = {};
@@ -395,7 +407,59 @@ private:
     }
 
     // =========================================================================
-    // Sony EXIF apply (F32 and U8)
+    // Fujifilm JSON restore
+    // =========================================================================
+    bool setupFujiFromJson(const nlohmann::json& j, int w, int h) {
+        auto knotsArr = j.value("knots", nlohmann::json::array());
+        auto distArr = j.value("dist", nlohmann::json::array());
+        auto caRArr = j.value("caR", nlohmann::json::array());
+        auto caBArr = j.value("caB", nlohmann::json::array());
+        auto vigArr = j.value("vig", nlohmann::json::array());
+
+        int nc = (int)knotsArr.size();
+        if (nc < 2 || nc > 16) return false;
+
+        exifKnotCount_ = nc;
+
+        // Fuji stores explicit knot positions
+        for (int i = 0; i < nc; i++)
+            exifKnots_[i] = knotsArr[i].get<float>();
+
+        // Distortion: pre-computed scale factors (value/100 + 1)
+        if ((int)distArr.size() == nc) {
+            for (int i = 0; i < nc; i++)
+                exifDistortion_[i] = distArr[i].get<float>();
+        } else {
+            for (int i = 0; i < nc; i++)
+                exifDistortion_[i] = 1.0f;
+        }
+
+        // CA: pre-computed factors (value + 1)
+        if ((int)caRArr.size() == nc && (int)caBArr.size() == nc) {
+            for (int i = 0; i < nc; i++) {
+                exifCaR_[i] = caRArr[i].get<float>();
+                exifCaB_[i] = caBArr[i].get<float>();
+            }
+            hasExifTca_ = true;
+        }
+
+        // Vignetting: pre-computed fractional brightness (value/100)
+        if ((int)vigArr.size() == nc) {
+            for (int i = 0; i < nc; i++)
+                exifVignetting_[i] = vigArr[i].get<float>();
+            hasExifVig_ = true;
+        }
+
+        useFuji_ = true;
+        width_ = w;
+        height_ = h;
+        ready_ = true;
+        logNotice() << "[LensCorrector] Restored Fuji correction from JSON (nc=" << nc << ")";
+        return true;
+    }
+
+    // =========================================================================
+    // Spline-based apply (shared by Sony and Fuji, F32 and U8)
     // =========================================================================
 
     static float interpSpline(const float* knots, const float* values, int nc, float r) {
@@ -855,6 +919,69 @@ private:
         float f;
         memcpy(&f, &v, 4);
         return f;
+    }
+
+    // Parse Fujifilm MakerNote lens correction params directly from EXIF
+    // Values are pre-computed to Sony-compatible format so applyExifFloat/U8 works as-is
+    bool setupFujiFromExif(const Exiv2::ExifData& exif) {
+        auto distIt = exif.findKey(Exiv2::ExifKey("Exif.Fujifilm.GeometricDistortionParams"));
+        if (distIt == exif.end()) return false;
+
+        int count = (int)distIt->count();
+        // X-Trans IV/V: 19 values (1 header + 9 knots + 9 coeffs)
+        // X-Trans I/II/III: 23 values (1 header + 11 knots + 11 coeffs)
+        int nc;
+        if (count == 19) nc = 9;
+        else if (count == 23) nc = 11;
+        else return false;
+
+        exifKnotCount_ = nc;
+
+        // Read knot positions (values[1..nc]) — explicit normalized radius
+        for (int i = 0; i < nc; i++)
+            exifKnots_[i] = distIt->toFloat(1 + i);
+
+        // Distortion: values[nc+1..2*nc] → factor = value / 100 + 1
+        for (int i = 0; i < nc; i++)
+            exifDistortion_[i] = distIt->toFloat(1 + nc + i) / 100.0f + 1.0f;
+
+        logNotice() << "[LensCorrector] Fuji distortion: nc=" << nc
+                    << " first=" << exifDistortion_[0]
+                    << " last=" << exifDistortion_[nc - 1];
+
+        // Chromatic Aberration (R + B channels)
+        auto caIt = exif.findKey(Exiv2::ExifKey("Exif.Fujifilm.ChromaticAberrationParams"));
+        if (caIt != exif.end()) {
+            int caCount = (int)caIt->count();
+            // IV/V: 29 = 1 header + 9 knots + 9 R + 9 B + 1 trailer
+            // I/II/III: 31 = 1 header + 10 knots + 10 R + 10 B (knot 0 at index 0)
+            if ((nc == 9 && caCount == 29) || (nc == 11 && caCount >= 31)) {
+                for (int i = 0; i < nc; i++) {
+                    exifCaR_[i] = caIt->toFloat(1 + nc + i) + 1.0f;
+                    exifCaB_[i] = caIt->toFloat(1 + nc * 2 + i) + 1.0f;
+                }
+                hasExifTca_ = true;
+            }
+        }
+
+        // Vignetting
+        auto vigIt = exif.findKey(Exiv2::ExifKey("Exif.Fujifilm.VignettingParams"));
+        if (vigIt != exif.end()) {
+            int vigCount = (int)vigIt->count();
+            if (vigCount == count) {  // same structure as distortion
+                for (int i = 0; i < nc; i++) {
+                    // Fuji vignetting is percentage brightness (e.g., 95.7 = 95.7%)
+                    // Convert to fractional: 95.7 / 100 = 0.957
+                    exifVignetting_[i] = vigIt->toFloat(1 + nc + i) / 100.0f;
+                }
+                hasExifVig_ = true;
+            }
+        }
+
+        useFuji_ = true;
+        logNotice() << "[LensCorrector] Using Fuji EXIF correction"
+                    << " tca=" << hasExifTca_ << " vig=" << hasExifVig_;
+        return true;
     }
 
     // Parse DNG OpcodeList3/2 directly from EXIF data into member variables

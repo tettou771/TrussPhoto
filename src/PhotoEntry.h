@@ -63,7 +63,7 @@ struct PhotoEntry {
 
     bool hasGps() const { return latitude != 0 || longitude != 0; }
 
-    // Lens correction (JSON: Sony EXIF spline or DNG polynomial)
+    // Lens correction (JSON: Sony EXIF spline, DNG polynomial, or Fuji MakerNote)
     string lensCorrectionParams;
 
     // Additional shooting info (available without RAW file)
