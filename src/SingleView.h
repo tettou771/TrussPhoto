@@ -260,23 +260,34 @@ public:
         rawLoadCompleted_ = false;
     }
 
-    // Draw non-DevelopShader content (called by Node tree with clipping)
+    // Render develop shader to offscreen FBO (call from tcApp::draw() before Node tree)
+    // Uses suspend/resumeSwapchainPass internally; safe to call mid-frame.
+    void renderDevelopFbo() {
+        if (isVideo_) return;
+        if (!isRawImage_ || !intermediateTexture_.isAllocated()) return;
+        if (!needsFboRender_) return;
+
+        developShader_.renderOffscreen(displayW_, displayH_);
+        needsFboRender_ = false;
+    }
+
+    // Draw the image (called by Node tree with clipping + local transform)
     void draw() override {
         if (isVideo_) {
             drawVideoView();
             return;
         }
 
-        // DevelopShader case is drawn by drawDevelop() from tcApp::draw()
-        bool hasIntermediate = isRawImage_ && intermediateTexture_.isAllocated();
-        if (hasIntermediate) return;
-
+        bool hasFbo = isRawImage_ && developShader_.isFboReady();
         bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
-        bool hasImage = hasPreviewRaw || fullImage_.isAllocated();
+        bool hasImage = hasFbo || hasPreviewRaw || fullImage_.isAllocated();
         if (!hasImage) return;
 
         float imgW, imgH;
-        if (hasPreviewRaw) {
+        if (hasFbo) {
+            imgW = (float)displayW_;
+            imgH = (float)displayH_;
+        } else if (hasPreviewRaw) {
             imgW = previewTexture_.getWidth();
             imgH = previewTexture_.getHeight();
         } else {
@@ -287,27 +298,15 @@ public:
         auto [x, y, drawW, drawH] = calcDrawRect(imgW, imgH);
 
         setColor(1.0f, 1.0f, 1.0f);
-        if (hasPreviewRaw) {
+        if (hasFbo) {
+            // Draw FBO result texture via sgl (10-bit RGB10A2)
+            drawTextureView(developShader_.getFboView(), developShader_.getFboSampler(),
+                            x, y, drawW, drawH);
+        } else if (hasPreviewRaw) {
             previewTexture_.draw(x, y, drawW, drawH);
         } else {
             fullImage_.draw(x, y, drawW, drawH);
         }
-    }
-
-    // Draw DevelopShader — called from tcApp::draw() in global sgl context
-    // (DevelopShader uses raw sg_ commands + sgl_defaults, incompatible with Node tree)
-    void drawDevelop() {
-        if (isVideo_) return;
-        if (!isRawImage_ || !intermediateTexture_.isAllocated()) return;
-
-        float imgW = (float)displayW_;
-        float imgH = (float)displayH_;
-        auto [x, y, drawW, drawH] = calcDrawRect(imgW, imgH);
-
-        // Convert local coords to global for DevelopShader viewport
-        float gx, gy;
-        localToGlobal(x, y, gx, gy);
-        developShader_.draw(gx, gy, drawW, drawH);
     }
 
     // Handle key input
@@ -347,6 +346,7 @@ public:
             if (hasProfileLut_) {
                 profileEnabled_ = !profileEnabled_;
                 developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+                needsFboRender_ = true;
                 logNotice() << "[Profile] " << (profileEnabled_ ? "ON" : "OFF");
             }
             return true;
@@ -355,6 +355,7 @@ public:
             if (hasProfileLut_) {
                 profileBlend_ = clamp(profileBlend_ - 0.1f, 0.0f, 1.0f);
                 developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+                needsFboRender_ = true;
                 logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
             }
             return true;
@@ -363,6 +364,7 @@ public:
             if (hasProfileLut_) {
                 profileBlend_ = clamp(profileBlend_ + 0.1f, 0.0f, 1.0f);
                 developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+                needsFboRender_ = true;
                 logNotice() << "[Profile] Blend: " << (int)(profileBlend_ * 100) << "%";
             }
             return true;
@@ -409,6 +411,7 @@ public:
                         << " (" << lensCorrector_.correctionSource() << ")";
             // GPU uniform change only — instant!
             developShader_.setLensEnabled(lensEnabled_);
+            needsFboRender_ = true;
             updateDisplayDimensions();
             return true;
         }
@@ -430,6 +433,7 @@ public:
         }
         intermediateTexture_.allocate(nrPixels_, TextureUsage::Immutable, true);
         developShader_.setSourceTexture(intermediateTexture_);
+        needsFboRender_ = true;
 
         // Save to DB
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
@@ -585,6 +589,7 @@ private:
     Texture previewTexture_;
     bool isRawImage_ = false;
     bool isSmartPreview_ = false;
+    bool needsFboRender_ = false;
 
     // Display dimensions (after crop, for fit-to-window calculation)
     int displayW_ = 0, displayH_ = 0;
@@ -627,6 +632,22 @@ private:
     bool isVideo_ = false;
     bool seekDragging_ = false;
     float seekBarHeight_ = 40.0f;
+
+    // Draw a texture by view+sampler via sgl (for FBO result)
+    void drawTextureView(sg_view view, sg_sampler sampler,
+                         float x, float y, float w, float h) {
+        sgl_enable_texture();
+        sgl_texture(view, sampler);
+        Color col = getDefaultContext().getColor();
+        sgl_begin_quads();
+        sgl_c4f(col.r, col.g, col.b, col.a);
+        sgl_v2f_t2f(x, y, 0, 0);
+        sgl_v2f_t2f(x + w, y, 1, 0);
+        sgl_v2f_t2f(x + w, y + h, 1, 1);
+        sgl_v2f_t2f(x, y + h, 0, 1);
+        sgl_end();
+        sgl_disable_texture();
+    }
 
     // Calculate draw rect (local coords) with pan clamping
     struct DrawRect { float x, y, w, h; };
@@ -721,6 +742,8 @@ private:
             developShader_.setLut(profileLut_);
             developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
         }
+
+        needsFboRender_ = true;
     }
 
     void setupDevelopShaderParams(int srcW, int srcH) {
@@ -853,11 +876,13 @@ private:
             currentProfilePath_ = cubePath;
             developShader_.setLut(profileLut_);
             developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+            needsFboRender_ = true;
             logNotice() << "[Profile] Loaded: " << cubePath;
         } else {
             hasProfileLut_ = false;
             currentProfilePath_.clear();
             developShader_.clearLut();
+            needsFboRender_ = true;
             logWarning() << "[Profile] Failed to load: " << cubePath;
         }
     }

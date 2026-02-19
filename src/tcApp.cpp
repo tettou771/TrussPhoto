@@ -678,10 +678,9 @@ void tcApp::draw() {
 
     clear(0.06f, 0.06f, 0.08f);
 
-    // DevelopShader must draw in global sgl context (before Node tree)
-    // because it uses raw sg_ commands + sgl_defaults() which break Node transforms
+    // Render develop shader to offscreen FBO (before Node tree draws)
     if (viewMode() == ViewMode::Single) {
-        viewManager_->singleView()->drawDevelop();
+        viewManager_->singleView()->renderDevelopFbo();
     }
 
     if (viewMode() == ViewMode::Grid) {
