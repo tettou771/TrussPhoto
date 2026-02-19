@@ -39,7 +39,10 @@ layout(binding=0) uniform fs_develop_params {
     float invDiag;       // 1 / diagonal_half (pixel space)
     float vigEnabled;
     vec2 imageSize;      // source image size in pixels
-    vec2 _pad1;
+    float exposure;      // EV stops (-3 to +3), default 0
+    float wbTemp;        // temperature shift (-1 to +1), default 0
+    float wbTint;        // tint shift (-1 to +1), default 0
+    float _pad1;
 };
 
 in vec2 uv;
@@ -80,7 +83,19 @@ void main() {
         color = texture(sampler2D(srcTex, srcSmp), texUV).rgb;
     }
 
-    // 5. Camera profile LUT
+    // 5. Exposure (EV stops)
+    if (exposure != 0.0) {
+        color *= pow(2.0, exposure);
+    }
+
+    // 6. White balance (simplified RGB multiplier)
+    if (wbTemp != 0.0 || wbTint != 0.0) {
+        color.r *= 1.0 + wbTemp * 0.2;
+        color.b *= 1.0 - wbTemp * 0.2;
+        color.g *= 1.0 - wbTint * 0.2;
+    }
+
+    // 7. Camera profile LUT
     if (lutBlend > 0.0) {
         float scale = (lutSize - 1.0) / lutSize;
         float offset = 0.5 / lutSize;

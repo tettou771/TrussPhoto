@@ -288,7 +288,10 @@ void tcApp::setup() {
     developPanel_->onSettingsChanged = [this]() {
         auto sv = viewManager_->singleView();
         if (viewMode() == ViewMode::Single && sv) {
-            sv->onDenoiseChanged(developPanel_->getChromaDenoise(),
+            sv->onDevelopChanged(developPanel_->getExposure(),
+                                 developPanel_->getTemperature(),
+                                 developPanel_->getTint(),
+                                 developPanel_->getChromaDenoise(),
                                  developPanel_->getLumaDenoise());
         }
     };
@@ -511,9 +514,10 @@ void tcApp::setup() {
     viewManager_->singleView()->init(getDataPath("profiles"));
 
     // Sync DevelopPanel sliders when photo changes
-    viewManager_->singleView()->onDenoiseRestored = [this](float chroma, float luma) {
+    viewManager_->singleView()->onDevelopRestored = [this](float exp, float temp, float tint,
+                                                            float chroma, float luma) {
         if (developPanel_ && showDevelop_) {
-            developPanel_->setValues(chroma, luma);
+            developPanel_->setValues(exp, temp, tint, chroma, luma);
         }
     };
 
@@ -865,7 +869,9 @@ void tcApp::keyPressed(int key) {
                     string photoId = singleView->currentPhotoId();
                     auto* entry = provider_.getPhoto(photoId);
                     if (entry) {
-                        developPanel_->setValues(entry->chromaDenoise, entry->lumaDenoise);
+                        developPanel_->setValues(entry->devExposure, entry->devWbTemp,
+                                                 entry->devWbTint,
+                                                 entry->chromaDenoise, entry->lumaDenoise);
                     }
                 }
                 if (metadataPanel_) metadataPanel_->setActive(false);

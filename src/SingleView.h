@@ -42,7 +42,8 @@ public:
     bool wantsLeftSidebar() const override { return false; }
 
     // Callback when photo changes (for DevelopPanel slider sync)
-    function<void(float chroma, float luma)> onDenoiseRestored;
+    function<void(float exposure, float wbTemp, float wbTint,
+                  float chroma, float luma)> onDevelopRestored;
 
     void setup() override {
         enableEvents();
@@ -77,10 +78,17 @@ public:
         // Clean up previous state
         cleanupState();
 
-        // Restore NR settings from entry
+        // Restore develop settings from entry
+        exposure_ = entry->devExposure;
+        wbTemp_ = entry->devWbTemp;
+        wbTint_ = entry->devWbTint;
         chromaDenoise_ = entry->chromaDenoise;
         lumaDenoise_ = entry->lumaDenoise;
-        if (onDenoiseRestored) onDenoiseRestored(chromaDenoise_, lumaDenoise_);
+        developShader_.setExposure(exposure_);
+        developShader_.setWbTemp(wbTemp_);
+        developShader_.setWbTint(wbTint_);
+        if (onDevelopRestored) onDevelopRestored(exposure_, wbTemp_, wbTint_,
+                                                 chromaDenoise_, lumaDenoise_);
 
         bool loaded = false;
         isSmartPreview_ = false;
@@ -273,6 +281,12 @@ public:
 
     // Draw the image (called by Node tree with clipping + local transform)
     void draw() override {
+        // Fill background to cover any framebuffer artifacts from
+        // suspend/resumeSwapchainPass during offscreen FBO rendering
+        setColor(0.07f, 0.07f, 0.09f);
+        fill();
+        drawRect(0, 0, getWidth(), getHeight());
+
         if (isVideo_) {
             drawVideoView();
             return;
@@ -419,26 +433,41 @@ public:
         return false;
     }
 
-    // Called when DevelopPanel NR sliders change
-    void onDenoiseChanged(float chroma, float luma) {
-        chromaDenoise_ = chroma;
-        lumaDenoise_ = luma;
+    // Called when DevelopPanel sliders change
+    void onDevelopChanged(float exposure, float wbTemp, float wbTint,
+                          float chroma, float luma) {
+        // GPU-only params: update shader uniforms
+        bool gpuChanged = (exposure_ != exposure || wbTemp_ != wbTemp || wbTint_ != wbTint);
+        exposure_ = exposure;
+        wbTemp_ = wbTemp;
+        wbTint_ = wbTint;
+        developShader_.setExposure(exposure_);
+        developShader_.setWbTemp(wbTemp_);
+        developShader_.setWbTint(wbTint_);
 
-        if (!isRawImage_ || !rawPixels_.isAllocated()) return;
+        // NR: needs CPU re-processing (only if changed)
+        bool nrChanged = (chromaDenoise_ != chroma || lumaDenoise_ != luma);
+        if (nrChanged) {
+            chromaDenoise_ = chroma;
+            lumaDenoise_ = luma;
 
-        // Re-apply NR to raw pixels and re-upload
-        nrPixels_ = rawPixels_.clone();
-        if (chromaDenoise_ > 0 || lumaDenoise_ > 0) {
-            tp::guidedDenoise(nrPixels_, chromaDenoise_, lumaDenoise_);
+            if (isRawImage_ && rawPixels_.isAllocated()) {
+                nrPixels_ = rawPixels_.clone();
+                if (chromaDenoise_ > 0 || lumaDenoise_ > 0) {
+                    tp::guidedDenoise(nrPixels_, chromaDenoise_, lumaDenoise_);
+                }
+                intermediateTexture_.allocate(nrPixels_, TextureUsage::Immutable, true);
+                developShader_.setSourceTexture(intermediateTexture_);
+            }
         }
-        intermediateTexture_.allocate(nrPixels_, TextureUsage::Immutable, true);
-        developShader_.setSourceTexture(intermediateTexture_);
-        needsFboRender_ = true;
 
-        // Save to DB
+        if (gpuChanged || nrChanged) needsFboRender_ = true;
+
+        // Save all develop settings to DB
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
             const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
-            ctx_->provider->setDenoise(pid, chroma, luma);
+            ctx_->provider->setDevelop(pid, exposure_, wbTemp_, wbTint_,
+                                       chromaDenoise_, lumaDenoise_);
         }
 
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
@@ -622,6 +651,11 @@ private:
     // Lens correction
     LensCorrector lensCorrector_;
     bool lensEnabled_ = true;
+
+    // Develop settings (GPU)
+    float exposure_ = 0.0f;
+    float wbTemp_ = 0.0f;
+    float wbTint_ = 0.0f;
 
     // Noise reduction
     float chromaDenoise_ = 0.5f;

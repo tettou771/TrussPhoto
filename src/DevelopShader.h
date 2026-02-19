@@ -185,6 +185,18 @@ public:
         lensEnabled_ = enabled;
     }
 
+    // -------------------------------------------------------------------------
+    // Exposure / White balance
+    // -------------------------------------------------------------------------
+
+    void setExposure(float ev) { exposure_ = ev; }
+    void setWbTemp(float t) { wbTemp_ = t; }
+    void setWbTint(float t) { wbTint_ = t; }
+
+    float getExposure() const { return exposure_; }
+    float getWbTemp() const { return wbTemp_; }
+    float getWbTint() const { return wbTint_; }
+
     void clearLensData() {
         hasLensLut_ = false;
         hasVigMap_ = false;
@@ -265,6 +277,9 @@ public:
         params.vigEnabled = (lensEnabled_ && hasVigMap_) ? 1.0f : 0.0f;
         params._imageSize[0] = imageSize_[0];
         params._imageSize[1] = imageSize_[1];
+        params.exposure = exposure_;
+        params.wbTemp = wbTemp_;
+        params.wbTint = wbTint_;
 
         sg_range range = { &params, sizeof(params) };
         sg_apply_uniforms(UB_develop_fs_develop_params, &range);
@@ -313,6 +328,11 @@ private:
     sg_image vigImg_ = {};
     sg_view vigView_ = {};
     bool hasVigMap_ = false;
+
+    // Exposure / WB
+    float exposure_ = 0.0f;
+    float wbTemp_ = 0.0f;
+    float wbTint_ = 0.0f;
 
     // Lens uniform state
     bool lensEnabled_ = false;

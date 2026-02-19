@@ -679,6 +679,19 @@ public:
         return true;
     }
 
+    bool setDevelop(const string& id, float exposure, float wbTemp, float wbTint,
+                    float chroma, float luma) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        it->second.devExposure = exposure;
+        it->second.devWbTemp = wbTemp;
+        it->second.devWbTint = wbTint;
+        it->second.chromaDenoise = chroma;
+        it->second.lumaDenoise = luma;
+        db_.updateDevelop(id, exposure, wbTemp, wbTint, chroma, luma);
+        return true;
+    }
+
     bool setColorLabel(const string& id, const string& label) {
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
