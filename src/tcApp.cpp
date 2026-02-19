@@ -137,10 +137,7 @@ void tcApp::setup() {
             runTextSearch(g, parsed.text);
         } else {
             // Has @location → async Nominatim query
-            // Apply text filter immediately, geo will come later
-            if (!parsed.text.empty()) {
-                runTextSearch(g, parsed.text);
-            }
+            // Don't search yet — wait for geo result, then search with bbox + text together
             searchLocation(parsed.location, parsed.text);
         }
         redraw();
@@ -1589,6 +1586,19 @@ void tcApp::searchLocation(const string& location, const string& textQuery) {
                     north = lat + 0.05;
                     west  = lon - 0.05;
                     east  = lon + 0.05;
+                }
+
+                // Ensure minimum bbox span (~5km each direction)
+                constexpr double MIN_SPAN = 0.05;
+                double latCenter = (south + north) * 0.5;
+                double lonCenter = (west + east) * 0.5;
+                if (north - south < MIN_SPAN) {
+                    south = latCenter - MIN_SPAN;
+                    north = latCenter + MIN_SPAN;
+                }
+                if (east - west < MIN_SPAN) {
+                    west = lonCenter - MIN_SPAN;
+                    east = lonCenter + MIN_SPAN;
                 }
 
                 lock_guard<mutex> lock(geoMutex_);
