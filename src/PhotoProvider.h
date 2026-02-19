@@ -675,6 +675,15 @@ public:
         return true;
     }
 
+    // Update lens correction params JSON (e.g., to add intW/intH after first RAW load)
+    bool updateLensCorrectionParams(const string& id, const string& params) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        it->second.lensCorrectionParams = params;
+        db_.updateLensCorrectionParams(id, params);
+        return true;
+    }
+
     // --- Folder tree ---
 
     // Folder info for tree display
@@ -2854,13 +2863,33 @@ private:
         auto distIt = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DistortionCorrParams"));
         if (distIt != exif.end()) {
             extractSonyLensCorrection(exif, photo);
-            return;
+        } else {
+            // Try DNG OpcodeList
+            auto opIt = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.OpcodeList3"));
+            if (opIt != exif.end()) {
+                extractDngLensCorrection(exif, photo);
+            }
         }
-        // Try DNG OpcodeList
-        auto opIt = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.OpcodeList3"));
-        if (opIt != exif.end()) {
-            extractDngLensCorrection(exif, photo);
-            return;
+
+        // Append DefaultCropOrigin/Size + orientation to lens correction JSON.
+        // Crop coords are stored in EXIF's native landscape orientation here.
+        // They get transformed to pixel-space (rotation-aware) when the RAW
+        // is first displayed and written back via processRawLoadCompletion.
+        if (!photo.lensCorrectionParams.empty()) {
+            try {
+                auto j = nlohmann::json::parse(photo.lensCorrectionParams);
+                auto cropOrig = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropOrigin"));
+                auto cropSize = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropSize"));
+                if (cropOrig != exif.end() && cropSize != exif.end() &&
+                    cropOrig->count() >= 2 && cropSize->count() >= 2) {
+                    j["cropX"] = (int)cropOrig->toInt64(0);
+                    j["cropY"] = (int)cropOrig->toInt64(1);
+                    j["cropW"] = (int)cropSize->toInt64(0);
+                    j["cropH"] = (int)cropSize->toInt64(1);
+                    j["orient"] = photo.orientation;
+                    photo.lensCorrectionParams = j.dump();
+                }
+            } catch (...) {}
         }
     }
 

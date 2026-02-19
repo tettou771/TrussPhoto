@@ -392,6 +392,15 @@ public:
         return stmt.execute();
     }
 
+    bool updateLensCorrectionParams(const string& id, const string& params) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET lens_correction_params=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, params);
+        stmt.bind(2, id);
+        return stmt.execute();
+    }
+
     bool deletePhoto(const string& id) {
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare("DELETE FROM photos WHERE id=?1");

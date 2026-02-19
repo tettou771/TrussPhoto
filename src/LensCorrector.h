@@ -40,6 +40,77 @@ public:
         dngGainRows_ = 0;
         dngGainCols_ = 0;
         dngGainMap_.clear();
+        hasDefaultCrop_ = false;
+        cropX_ = cropY_ = cropW_ = cropH_ = 0;
+        intW_ = intH_ = 0;
+    }
+
+    // DefaultCrop from EXIF/DNG (applied after lens correction)
+    bool hasDefaultCrop() const { return hasDefaultCrop_; }
+    int intermediateWidth() const { return intW_; }
+    int intermediateHeight() const { return intH_; }
+    int cropX() const { return cropX_; }
+    int cropY() const { return cropY_; }
+    int cropW() const { return cropW_; }
+    int cropH() const { return cropH_; }
+
+    // Apply DefaultCrop to pixels. Handles two cases:
+    // 1. Full-size: pixels match intermediate dimensions → direct crop
+    // 2. Smart preview: pixels are scaled down → scale crop coordinates
+    bool applyDefaultCrop(Pixels& pixels) {
+        if (!hasDefaultCrop_) return false;
+        int w = pixels.getWidth(), h = pixels.getHeight();
+
+        int cx, cy, cw, ch_crop;
+
+        // Full-size path
+        if (w >= cropX_ + cropW_ && h >= cropY_ + cropH_) {
+            if (w == cropW_ && h == cropH_) return false;  // already at target
+            cx = cropX_;
+            cy = cropY_;
+            cw = cropW_;
+            ch_crop = cropH_;
+        }
+        // Scaled path (smart preview): need intW/intH to compute scale
+        else if (intW_ > 0 && intH_ > 0 && w > 0 && h > 0) {
+            float scaleX = (float)w / intW_;
+            float scaleY = (float)h / intH_;
+            cx = (int)round(cropX_ * scaleX);
+            cy = (int)round(cropY_ * scaleY);
+            cw = (int)round(cropW_ * scaleX);
+            ch_crop = (int)round(cropH_ * scaleY);
+            // Clamp to pixel bounds
+            if (cx + cw > w) cw = w - cx;
+            if (cy + ch_crop > h) ch_crop = h - cy;
+            if (cw <= 0 || ch_crop <= 0) return false;
+            if (cw == w && ch_crop == h) return false;  // no meaningful crop
+        } else {
+            return false;
+        }
+
+        int nch = pixels.getChannels();
+        Pixels cropped;
+        if (pixels.isFloat()) {
+            cropped.allocate(cw, ch_crop, nch, PixelFormat::F32);
+            const float* src = pixels.getDataF32();
+            float* dst = cropped.getDataF32();
+            for (int y = 0; y < ch_crop; y++) {
+                memcpy(dst + y * cw * nch,
+                       src + ((y + cy) * w + cx) * nch,
+                       cw * nch * sizeof(float));
+            }
+        } else {
+            cropped.allocate(cw, ch_crop, nch);
+            const unsigned char* src = pixels.getData();
+            unsigned char* dst = cropped.getData();
+            for (int y = 0; y < ch_crop; y++) {
+                memcpy(dst + y * cw * nch,
+                       src + ((y + cy) * w + cx) * nch,
+                       cw * nch * sizeof(unsigned char));
+            }
+        }
+        pixels = std::move(cropped);
+        return true;
     }
 
     // =========================================================================
@@ -101,6 +172,61 @@ public:
                 }
             }
 
+            // Read DefaultCropOrigin/Size for post-correction crop.
+            // EXIF stores these in the sensor's native (landscape) orientation.
+            // LibRaw rotates output according to EXIF Orientation, so for portrait
+            // photos we must transform crop coordinates to match the rotated image.
+            auto cropOrig = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropOrigin"));
+            auto cropSize = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropSize"));
+            if (cropOrig != exif.end() && cropSize != exif.end() &&
+                cropOrig->count() >= 2 && cropSize->count() >= 2) {
+                int cx = (int)cropOrig->toInt64(0);
+                int cy = (int)cropOrig->toInt64(1);
+                int cw = (int)cropSize->toInt64(0);
+                int ch = (int)cropSize->toInt64(1);
+
+                // Detect rotation: if crop is landscape but image is portrait,
+                // the image was rotated by LibRaw.
+                bool cropIsLandscape = (cw > ch);
+                bool imageIsPortrait = (width < height);
+
+                if (cropIsLandscape && imageIsPortrait) {
+                    // Read EXIF Orientation to determine rotation direction
+                    int orient = 1;
+                    auto orientTag = exif.findKey(Exiv2::ExifKey("Exif.Image.Orientation"));
+                    if (orientTag != exif.end()) orient = (int)orientTag->toInt64();
+
+                    if (orient == 6) {
+                        // 90° CW: landscape (x,y,w,h) → portrait
+                        // In landscape space, the "height" axis = width in portrait
+                        cropX_ = width - cy - ch;
+                        cropY_ = cx;
+                        cropW_ = ch;
+                        cropH_ = cw;
+                    } else if (orient == 8) {
+                        // 90° CCW: landscape (x,y,w,h) → portrait
+                        cropX_ = cy;
+                        cropY_ = height - cx - cw;
+                        cropW_ = ch;
+                        cropH_ = cw;
+                    } else {
+                        // Unknown rotation, use as-is
+                        cropX_ = cx; cropY_ = cy; cropW_ = cw; cropH_ = ch;
+                    }
+
+                    logNotice() << "[LensCorrector] DefaultCrop (rotated orient=" << orient
+                                << "): origin=(" << cropX_ << "," << cropY_
+                                << ") size=" << cropW_ << "x" << cropH_;
+                } else {
+                    cropX_ = cx; cropY_ = cy; cropW_ = cw; cropH_ = ch;
+                    logNotice() << "[LensCorrector] DefaultCrop: origin=(" << cropX_ << "," << cropY_
+                                << ") size=" << cropW_ << "x" << cropH_;
+                }
+                hasDefaultCrop_ = true;
+            }
+
+            intW_ = width;
+            intH_ = height;
             width_ = width;
             height_ = height;
             ready_ = true;
@@ -121,6 +247,44 @@ public:
 
         try {
             auto j = nlohmann::json::parse(jsonStr);
+
+            // Parse DefaultCrop info (common to Sony/DNG)
+            if (j.contains("cropX") && j.contains("cropW")) {
+                cropX_ = j.value("cropX", 0);
+                cropY_ = j.value("cropY", 0);
+                cropW_ = j.value("cropW", 0);
+                cropH_ = j.value("cropH", 0);
+                hasDefaultCrop_ = (cropW_ > 0 && cropH_ > 0);
+            }
+
+            // Intermediate image dimensions (for scaling crop to SP)
+            intW_ = j.value("intW", 0);
+            intH_ = j.value("intH", 0);
+
+            // Crop coords in JSON may be in EXIF's native landscape orientation.
+            // If the image pixels are portrait but crop is landscape, transform.
+            // After processRawLoadCompletion writes back transformed coords,
+            // this branch won't trigger (cropW < cropH matches portrait pixels).
+            if (hasDefaultCrop_ && cropW_ > cropH_ && width < height) {
+                int orient = j.value("orient", 1);
+                int cx = cropX_, cy = cropY_, cw = cropW_, ch = cropH_;
+                // Need intermediate dims for transformation.
+                // Use intW/intH if available, otherwise approximate from pixel dims.
+                int iw = (intW_ > 0) ? intW_ : width;
+                int ih = (intH_ > 0) ? intH_ : height;
+                if (orient == 6) {
+                    cropX_ = iw - cy - ch;
+                    cropY_ = cx;
+                    cropW_ = ch;
+                    cropH_ = cw;
+                } else if (orient == 8) {
+                    cropX_ = cy;
+                    cropY_ = ih - cx - cw;
+                    cropW_ = ch;
+                    cropH_ = cw;
+                }
+            }
+
             string type = j.value("type", string(""));
 
             if (type == "sony") {
@@ -148,6 +312,14 @@ public:
 private:
     bool ready_ = false;
     int width_ = 0, height_ = 0;
+
+    // DefaultCrop (post-correction crop to EXIF declared dimensions)
+    bool hasDefaultCrop_ = false;
+    int cropX_ = 0, cropY_ = 0, cropW_ = 0, cropH_ = 0;
+
+    // Intermediate image dimensions (zero-cropped, before DefaultCrop).
+    // Needed to scale crop coordinates for smart preview display.
+    int intW_ = 0, intH_ = 0;
 
     // Sony EXIF spline data
     int exifKnotCount_ = 0;
