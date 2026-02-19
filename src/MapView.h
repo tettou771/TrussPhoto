@@ -6,6 +6,7 @@
 
 #include <TrussC.h>
 #include <tcxCurl.h>
+#include <tcxIME.h>
 #include "PhotoEntry.h"
 #include "ViewContainer.h"
 #include "PhotoStrip.h"
@@ -90,6 +91,104 @@ private:
 };
 
 // =============================================================================
+// MapSearchBar - floating search bar for geocoding (child of MapCanvas)
+// =============================================================================
+
+class MapSearchBar : public RectNode {
+public:
+    using Ptr = shared_ptr<MapSearchBar>;
+
+    function<void(const string& query)> onSearch;
+    function<void()> onRedraw;
+
+    bool isFocused() const { return focused_; }
+
+    void blur() {
+        if (!focused_) return;
+        focused_ = false;
+        ime_.disable();
+        ime_.clear();
+        if (onRedraw) onRedraw();
+    }
+
+    void setup() override {
+        enableEvents();
+        setSize(BAR_W, BAR_H);
+        setPos(BAR_MARGIN, BAR_MARGIN);
+        loadJapaneseFont(font_, 14);
+        ime_.setFont(&font_);
+        ime_.onEnter = [this]() {
+            string q = ime_.getString();
+            if (!q.empty() && onSearch) onSearch(q);
+        };
+    }
+
+    void update() override {
+        if (!focused_) return;
+        bool cursorOn = fmod(getElapsedTimef(), 1.0f) < 0.5f;
+        if (cursorOn != lastCursorOn_) {
+            lastCursorOn_ = cursorOn;
+            if (onRedraw) onRedraw();
+        }
+    }
+
+    void draw() override {
+        float w = getWidth();
+        float h = getHeight();
+
+        // Background
+        setColor(0.1f, 0.1f, 0.12f, 0.85f);
+        fill();
+        drawRect(0, 0, w, h);
+
+        // Border
+        setColor(focused_ ? Color(0.5f, 0.5f, 0.55f) : Color(0.3f, 0.3f, 0.35f));
+        noFill();
+        drawRect(0, 0, w, h);
+
+        float textX = 10;
+        float textY = h / 2.0f;
+
+        if (focused_) {
+            setColor(1.0f, 1.0f, 1.0f);
+            ime_.draw(textX, textY - font_.getAscent() / 2.0f);
+        } else {
+            string q = const_cast<tcxIME&>(ime_).getString();
+            if (q.empty()) {
+                setColor(0.45f, 0.45f, 0.5f);
+                font_.drawString("Search location...", textX, textY,
+                    Direction::Left, Direction::Center);
+            } else {
+                setColor(0.8f, 0.8f, 0.85f);
+                font_.drawString(q, textX, textY,
+                    Direction::Left, Direction::Center);
+            }
+        }
+    }
+
+    bool onMousePress(Vec2 pos, int button) override {
+        (void)pos;
+        if (button != 0) return false;
+        if (!focused_) {
+            focused_ = true;
+            ime_.enable();
+            if (onRedraw) onRedraw();
+        }
+        return true;
+    }
+
+private:
+    tcxIME ime_;
+    Font font_;
+    bool focused_ = false;
+    bool lastCursorOn_ = false;
+
+    static constexpr float BAR_W = 260;
+    static constexpr float BAR_H = 32;
+    static constexpr float BAR_MARGIN = 10;
+};
+
+// =============================================================================
 // MapCanvas - map tile rendering, pins, and interaction (child RectNode)
 // =============================================================================
 
@@ -102,6 +201,9 @@ public:
     function<void(int index, const string& photoId)> onPinDoubleClick;
     function<void(const string& photoId, double lat, double lon)> onGeotagConfirm;
     function<void()> onRedraw;
+
+    bool isSearchFocused() const { return searchBar_ && searchBar_->isFocused(); }
+    void blurSearch() { if (searchBar_) searchBar_->blur(); }
 
     void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids) {
         pins_.clear();
@@ -335,6 +437,16 @@ public:
         loadJapaneseFont(font_, 12);
         loadJapaneseFont(fontSmall_, 10);
         tileClient_.addHeader("User-Agent", "TrussPhoto/1.0");
+
+        // Search bar
+        searchBar_ = make_shared<MapSearchBar>();
+        addChild(searchBar_);
+        searchBar_->onSearch = [this](const string& query) {
+            searchLocation(query);
+        };
+        searchBar_->onRedraw = [this]() {
+            if (onRedraw) onRedraw();
+        };
     }
 
     void update() override {
@@ -388,6 +500,22 @@ public:
         // Keep provisional pins in sync with map pan/zoom
         if (!provisionalPins_.empty()) {
             updateProvisionalPinPositions();
+        }
+
+        // Apply geocoding search result
+        {
+            lock_guard<mutex> lock(tileMutex_);
+            if (searchResult_.valid) {
+                searchResult_.valid = false;
+                panAnimating_ = true;
+                panFromLat_ = centerLat_;
+                panFromLon_ = centerLon_;
+                panToLat_ = searchResult_.lat;
+                panToLon_ = searchResult_.lon;
+                panProgress_ = 0.0f;
+                zoom_ = 14.0;
+                if (onRedraw) onRedraw();
+            }
         }
     }
 
@@ -523,6 +651,11 @@ public:
     bool onMousePress(Vec2 pos, int button) override {
         if (button != 0) return false;
 
+        // Blur search bar when clicking on map
+        if (searchBar_ && searchBar_->isFocused()) {
+            searchBar_->blur();
+        }
+
         // Hit test against cached clusters
         double qZoom = quantizeZoom(zoom_);
         double sf = pow(2.0, zoom_ - qZoom);
@@ -640,6 +773,49 @@ public:
 private:
     static constexpr float PIN_RADIUS = 7.0f;
     inline static const Color PIN_COLOR = Color(0.9f, 0.2f, 0.2f);
+    static constexpr auto TILE_URL_BASE = "https://tile.openstreetmap.org";
+    static constexpr auto NOMINATIM_URL = "https://nominatim.openstreetmap.org";
+
+    // Search bar
+    MapSearchBar::Ptr searchBar_;
+
+    struct SearchResult { bool valid = false; double lat = 0, lon = 0; };
+    SearchResult searchResult_;
+
+    static string urlEncode(const string& s) {
+        string out;
+        for (unsigned char c : s) {
+            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                out += (char)c;
+            } else {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%%%02X", c);
+                out += buf;
+            }
+        }
+        return out;
+    }
+
+    void searchLocation(const string& query) {
+        thread([this, query]() {
+            HttpClient client;
+            client.addHeader("User-Agent", "TrussPhoto/1.0");
+            client.setBaseUrl("");
+            string url = string(NOMINATIM_URL)
+                + "/search?q=" + urlEncode(query)
+                + "&format=json&limit=1";
+            auto res = client.get(url);
+            if (res.ok()) {
+                auto j = nlohmann::json::parse(res.body, nullptr, false);
+                if (j.is_array() && !j.empty()) {
+                    double lat = stod(j[0]["lat"].get<string>());
+                    double lon = stod(j[0]["lon"].get<string>());
+                    lock_guard<mutex> lock(tileMutex_);
+                    searchResult_ = {true, lat, lon};
+                }
+            }
+        }).detach();
+    }
 
     // Map state
     double centerLat_ = 35.68;
@@ -908,8 +1084,8 @@ private:
                     tileQueue_.pop_front();
                 }
 
-                string url = format("https://tile.openstreetmap.org/{}/{}/{}.png",
-                    req.z, req.x, req.y);
+                string url = format("{}/{}/{}/{}.png",
+                    TILE_URL_BASE, req.z, req.x, req.y);
 
                 HttpClient client;
                 client.addHeader("User-Agent", "TrussPhoto/1.0");
@@ -1011,6 +1187,10 @@ public:
     function<void(int index, const string& photoId)> onPinDoubleClick;
     function<void(const string& photoId, double lat, double lon)> onGeotagConfirm;
     function<void()> onRedraw;
+
+    // Search bar forwarding
+    bool isSearchFocused() const { return canvas_ && canvas_->isSearchFocused(); }
+    void blurSearch() { if (canvas_) canvas_->blurSearch(); }
 
     // Modifier key refs (set by tcApp)
     bool* cmdDownRef = nullptr;

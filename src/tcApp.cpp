@@ -841,20 +841,20 @@ void tcApp::keyPressed(int key) {
         }
     } else if (viewMode() == ViewMode::Map) {
         auto mapView = viewManager_->mapView();
+        if (mapView->isSearchFocused()) {
+            // While search bar is focused, only ESC blurs it;
+            // all other keys go to IME (don't process map shortcuts)
+            if (key == SAPP_KEYCODE_ESCAPE) {
+                mapView->blurSearch();
+            }
+            redraw();
+            return;
+        }
         if (key == SAPP_KEYCODE_ESCAPE) {
             if (mapView->hasProvisionalPins()) {
                 mapView->clearProvisionalPins();
-            } else {
-                viewManager_->switchTo(ViewMode::Grid);
-                leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
-                leftTween_.finish();
-                if (metadataPanel_) {
-                    metadataPanel_->clearViewInfo();
-                    metadataPanel_->clearThumbnail();
-                    updateMetadataPanel();
-                }
-                updateLayout();
             }
+            // else: do nothing (G key to go back to grid)
         } else if (key == SAPP_KEYCODE_ENTER || key == SAPP_KEYCODE_KP_ENTER) {
             if (mapView->hasProvisionalPins()) {
                 mapView->confirmAllPins();
