@@ -26,7 +26,7 @@ struct ViewInfo {
     bool lensEnabled = false;
     bool hasLensData = false;
     bool isSmartPreview = false;
-    bool isExifLens = false;
+    string lensSource = "none";
 };
 
 class MetadataPanel : public RectNode {
@@ -478,8 +478,7 @@ private:
             }
 
             if (vi.hasLensData) {
-                string lensSource = vi.isExifLens ? "EXIF" : "lensfun";
-                drawValue(format("Lens: {} ({})", vi.lensEnabled ? "ON" : "OFF", lensSource), y,
+                drawValue(format("Lens: {} ({})", vi.lensEnabled ? "ON" : "OFF", vi.lensSource), y,
                     Color(0.6f, 0.6f, 0.65f));
             } else {
                 drawValue("Lens: No Data", y, Color(0.5f, 0.4f, 0.4f));

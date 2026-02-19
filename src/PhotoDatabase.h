@@ -15,7 +15,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 8;
+    static constexpr int SCHEMA_VERSION = 9;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -70,7 +70,19 @@ public:
                 "  altitude             REAL NOT NULL DEFAULT 0,"
                 "  develop_settings     TEXT NOT NULL DEFAULT '',"
                 "  is_managed           INTEGER NOT NULL DEFAULT 1,"
-                "  face_scanned        INTEGER NOT NULL DEFAULT 0"
+                "  face_scanned        INTEGER NOT NULL DEFAULT 0,"
+                "  lens_correction_params TEXT NOT NULL DEFAULT '',"
+                "  exposure_time       TEXT NOT NULL DEFAULT '',"
+                "  exposure_bias       REAL NOT NULL DEFAULT 0,"
+                "  orientation         INTEGER NOT NULL DEFAULT 1,"
+                "  white_balance       TEXT NOT NULL DEFAULT '',"
+                "  focal_length_35mm   INTEGER NOT NULL DEFAULT 0,"
+                "  offset_time         TEXT NOT NULL DEFAULT '',"
+                "  body_serial         TEXT NOT NULL DEFAULT '',"
+                "  lens_serial         TEXT NOT NULL DEFAULT '',"
+                "  subject_distance    REAL NOT NULL DEFAULT 0,"
+                "  subsec_time_original TEXT NOT NULL DEFAULT '',"
+                "  companion_files     TEXT NOT NULL DEFAULT ''"
                 ")"
             );
             if (!ok) return false;
@@ -185,8 +197,35 @@ public:
                 logError() << "[PhotoDatabase] Migration v7->v8 failed";
                 return false;
             }
+            version = 8;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v7 -> v8";
+        }
+
+        // v8 -> v9: add lens correction params + extended EXIF data
+        if (version == 8) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN lens_correction_params TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN exposure_time TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN exposure_bias REAL NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN orientation INTEGER NOT NULL DEFAULT 1",
+                "ALTER TABLE photos ADD COLUMN white_balance TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN focal_length_35mm INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN offset_time TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN body_serial TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN lens_serial TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN subject_distance REAL NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN subsec_time_original TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN companion_files TEXT NOT NULL DEFAULT ''",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v8->v9 failed: " << sql;
+                    return false;
+                }
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v7 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v8 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -204,9 +243,13 @@ public:
             "focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
             "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned) "
+            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
+            "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
+            "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
+            "subsec_time_original, companion_files) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36)"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
+            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48)"
         );
         if (!stmt.valid()) return false;
         bindEntry(stmt, e);
@@ -322,6 +365,33 @@ public:
         return stmt.execute();
     }
 
+    // Bulk update extended EXIF data (for backfill)
+    bool updateExifData(const PhotoEntry& e) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "UPDATE photos SET "
+            "lens_correction_params=?1, exposure_time=?2, exposure_bias=?3, "
+            "orientation=?4, white_balance=?5, focal_length_35mm=?6, "
+            "offset_time=?7, body_serial=?8, lens_serial=?9, "
+            "subject_distance=?10, subsec_time_original=?11, companion_files=?12 "
+            "WHERE id=?13");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, e.lensCorrectionParams);
+        stmt.bind(2, e.exposureTime);
+        stmt.bind(3, (double)e.exposureBias);
+        stmt.bind(4, e.orientation);
+        stmt.bind(5, e.whiteBalance);
+        stmt.bind(6, e.focalLength35mm);
+        stmt.bind(7, e.offsetTime);
+        stmt.bind(8, e.bodySerial);
+        stmt.bind(9, e.lensSerial);
+        stmt.bind(10, (double)e.subjectDistance);
+        stmt.bind(11, e.subsecTimeOriginal);
+        stmt.bind(12, e.companionFiles);
+        stmt.bind(13, e.id);
+        return stmt.execute();
+    }
+
     bool deletePhoto(const string& id) {
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare("DELETE FROM photos WHERE id=?1");
@@ -351,9 +421,13 @@ public:
             "focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
             "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned) "
+            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
+            "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
+            "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
+            "subsec_time_original, companion_files) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36)"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
+            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48)"
         );
         if (!stmt.valid()) {
             db_.rollback();
@@ -384,7 +458,10 @@ public:
             "width, height, is_raw, is_video, creative_style, focal_length, aperture, iso, sync_state, "
             "rating, color_label, flag, memo, tags, "
             "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned "
+            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
+            "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
+            "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
+            "subsec_time_original, companion_files "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -427,6 +504,18 @@ public:
             e.developSettings    = stmt.getText(33);
             e.isManaged          = stmt.getInt(34) != 0;
             e.faceScanned        = stmt.getInt(35) != 0;
+            e.lensCorrectionParams = stmt.getText(36);
+            e.exposureTime       = stmt.getText(37);
+            e.exposureBias       = (float)stmt.getDouble(38);
+            e.orientation        = stmt.getInt(39);
+            e.whiteBalance       = stmt.getText(40);
+            e.focalLength35mm    = stmt.getInt(41);
+            e.offsetTime         = stmt.getText(42);
+            e.bodySerial         = stmt.getText(43);
+            e.lensSerial         = stmt.getText(44);
+            e.subjectDistance     = (float)stmt.getDouble(45);
+            e.subsecTimeOriginal = stmt.getText(46);
+            e.companionFiles     = stmt.getText(47);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -1036,5 +1125,17 @@ private:
         stmt.bind(34, e.developSettings);
         stmt.bind(35, e.isManaged ? 1 : 0);
         stmt.bind(36, e.faceScanned ? 1 : 0);
+        stmt.bind(37, e.lensCorrectionParams);
+        stmt.bind(38, e.exposureTime);
+        stmt.bind(39, (double)e.exposureBias);
+        stmt.bind(40, e.orientation);
+        stmt.bind(41, e.whiteBalance);
+        stmt.bind(42, e.focalLength35mm);
+        stmt.bind(43, e.offsetTime);
+        stmt.bind(44, e.bodySerial);
+        stmt.bind(45, e.lensSerial);
+        stmt.bind(46, (double)e.subjectDistance);
+        stmt.bind(47, e.subsecTimeOriginal);
+        stmt.bind(48, e.companionFiles);
     }
 };

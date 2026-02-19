@@ -1,4 +1,5 @@
 #include "tcApp.h"
+#include <mach/mach.h>
 
 void tcApp::setup() {
     // 0. Ensure OS bootstrap directory exists
@@ -483,7 +484,7 @@ void tcApp::setup() {
     }
 
     // 10. SingleView init (camera profiles, LUT shader, lens correction)
-    viewManager_->singleView()->init(getDataPath("profiles"), getDataPath("lensfun"));
+    viewManager_->singleView()->init(getDataPath("profiles"));
 
     // 11. Fonts
     loadJapaneseFont(font_, 14);
@@ -563,6 +564,16 @@ void tcApp::update() {
         int queued = provider_.queueAllMissingSP();
         if (queued > 0) {
             logNotice() << "[SmartPreview] Auto-queued " << queued << " photos";
+        }
+    }
+
+    // Process EXIF backfill results + auto-queue (one-shot)
+    provider_.processExifBackfillResults();
+    if (!exifBackfillQueued_) {
+        exifBackfillQueued_ = true;
+        int queued = provider_.queueAllMissingExifData();
+        if (queued > 0) {
+            logNotice() << "[ExifBackfill] Auto-queued " << queued << " photos";
         }
     }
 
@@ -726,9 +737,18 @@ void tcApp::draw() {
             provider_.getFaceDetectionCompletedCount(),
             provider_.getFaceDetectionTotalCount());
     }
-    fontSmall_.drawString(format("{}  Photos: {}{}{}{}{}{}  FPS: {:.0f}",
+    // Get process resident memory (macOS)
+    double ramGiB = 0;
+    mach_task_basic_info_data_t taskInfo;
+    mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+            (task_info_t)&taskInfo, &infoCount) == KERN_SUCCESS) {
+        ramGiB = taskInfo.resident_size / (1024.0 * 1024.0 * 1024.0);
+    }
+
+    fontSmall_.drawString(format("{}  Photos: {}{}{}{}{}{}  FPS: {:.0f}  RAM: {:.1f}GiB",
         serverLabel, provider_.getCount(), uploadStatus, consolidateStatus,
-        spStatus, embeddingStatus, faceStatus, getFrameRate()),
+        spStatus, embeddingStatus, faceStatus, getFrameRate(), ramGiB),
         textX, textY, Direction::Left, Direction::Center);
 }
 
@@ -1054,6 +1074,7 @@ void tcApp::filesDropped(const vector<string>& files) {
         provider_.queueAllMissingSP();
         provider_.queueAllMissingEmbeddings();
         provider_.queueAllMissingFaceDetections();
+        provider_.queueAllMissingExifData();
     }
 }
 

@@ -1550,6 +1550,51 @@ public:
     int getSPCompletedCount() const { return spCompletedCount_; }
     int getSPTotalCount() const { return spTotalCount_; }
 
+    // --- EXIF Backfill (v9 fields) ---
+
+    int queueAllMissingExifData() {
+        if (exifBackfillRunning_) return 0;
+        vector<string> ids;
+        for (const auto& [id, photo] : photos_) {
+            // Need backfill if v9 fields are empty and we have a local file
+            if (photo.lensCorrectionParams.empty() && photo.exposureTime.empty() &&
+                photo.orientation == 1 && photo.focalLength35mm == 0 &&
+                !photo.localPath.empty() && fs::exists(photo.localPath)) {
+                ids.push_back(id);
+            }
+        }
+        if (!ids.empty()) {
+            startExifBackfillThread(ids);
+        }
+        return (int)ids.size();
+    }
+
+    void processExifBackfillResults() {
+        lock_guard<mutex> lock(exifBackfillMutex_);
+        for (const auto& result : completedExifBackfills_) {
+            auto it = photos_.find(result.photoId);
+            if (it == photos_.end()) continue;
+            auto& photo = it->second;
+            const auto& r = result.updatedFields;
+            photo.lensCorrectionParams = r.lensCorrectionParams;
+            photo.exposureTime = r.exposureTime;
+            photo.exposureBias = r.exposureBias;
+            photo.orientation = r.orientation;
+            photo.whiteBalance = r.whiteBalance;
+            photo.focalLength35mm = r.focalLength35mm;
+            photo.offsetTime = r.offsetTime;
+            photo.bodySerial = r.bodySerial;
+            photo.lensSerial = r.lensSerial;
+            photo.subjectDistance = r.subjectDistance;
+            photo.subsecTimeOriginal = r.subsecTimeOriginal;
+            photo.companionFiles = r.companionFiles;
+            db_.updateExifData(photo);
+        }
+        completedExifBackfills_.clear();
+    }
+
+    bool isExifBackfillRunning() const { return exifBackfillRunning_; }
+
     // --- CLIP Embedding ---
 
     // Initialize CLIP embedder + text encoder in background
@@ -2041,6 +2086,16 @@ private:
     atomic<int> spTotalCount_{0};
     static constexpr int SP_WORKERS = 2;
     vector<thread> spThreads_;
+
+    // EXIF backfill
+    struct ExifBackfillResult {
+        string photoId;
+        PhotoEntry updatedFields;  // Only v9 fields populated
+    };
+    mutable mutex exifBackfillMutex_;
+    vector<ExifBackfillResult> completedExifBackfills_;
+    atomic<bool> exifBackfillRunning_{false};
+    static constexpr int EXIF_BACKFILL_WORKERS = 2;
 
     // CLIP embedding
     ClipEmbedder clipEmbedder_;
@@ -2759,8 +2814,257 @@ private:
                     photo.altitude = -photo.altitude;
                 }
             }
+
+            // --- Extended shooting info (v9) ---
+            {
+                // ExposureTime: "1/125 s" -> "1/125"
+                string et = getString("Exif.Photo.ExposureTime");
+                if (!et.empty()) {
+                    auto sp = et.find(' ');
+                    photo.exposureTime = (sp != string::npos) ? et.substr(0, sp) : et;
+                }
+                photo.exposureBias = getFloat("Exif.Photo.ExposureBiasValue");
+
+                auto oriIt = exif.findKey(Exiv2::ExifKey("Exif.Image.Orientation"));
+                if (oriIt != exif.end()) photo.orientation = (int)oriIt->toInt64();
+
+                photo.whiteBalance = getString("Exif.Photo.WhiteBalance");
+
+                auto fl35It = exif.findKey(Exiv2::ExifKey("Exif.Photo.FocalLengthIn35mmFilm"));
+                if (fl35It != exif.end()) photo.focalLength35mm = (int)fl35It->toInt64();
+
+                photo.offsetTime = getString("Exif.Photo.OffsetTime");
+                photo.bodySerial = getString("Exif.Photo.BodySerialNumber");
+                photo.lensSerial = getString("Exif.Photo.LensSerialNumber");
+                photo.subjectDistance = getFloat("Exif.Photo.SubjectDistance");
+                photo.subsecTimeOriginal = getString("Exif.Photo.SubSecTimeOriginal");
+            }
+
+            // --- Lens correction parameters (Sony EXIF / DNG OpcodeList) ---
+            extractLensCorrectionParams(exif, photo);
+
         } catch (...) {
             // exiv2 failed, leave metadata empty
+        }
+    }
+
+    // Extract Sony or DNG lens correction data from EXIF and store as JSON
+    static void extractLensCorrectionParams(const Exiv2::ExifData& exif, PhotoEntry& photo) {
+        // Try Sony SubImage1 correction params first
+        auto distIt = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DistortionCorrParams"));
+        if (distIt != exif.end()) {
+            extractSonyLensCorrection(exif, photo);
+            return;
+        }
+        // Try DNG OpcodeList
+        auto opIt = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.OpcodeList3"));
+        if (opIt != exif.end()) {
+            extractDngLensCorrection(exif, photo);
+            return;
+        }
+    }
+
+    // Decode Sony SubImage1 EXIF lens correction -> JSON
+    static void extractSonyLensCorrection(const Exiv2::ExifData& exif, PhotoEntry& photo) {
+        try {
+            auto readKnots = [&](const char* key) -> vector<int16_t> {
+                auto it = exif.findKey(Exiv2::ExifKey(key));
+                if (it == exif.end()) return {};
+                vector<int16_t> vals;
+                for (int i = 0; i < (int)it->count(); i++) {
+                    vals.push_back((int16_t)it->toInt64(i));
+                }
+                return vals;
+            };
+
+            auto distRaw = readKnots("Exif.SubImage1.DistortionCorrParams");
+            auto caRaw = readKnots("Exif.SubImage1.ChromaticAberrationCorrParams");
+            auto vigRaw = readKnots("Exif.SubImage1.VignettingCorrParams");
+
+            if (distRaw.empty() && caRaw.empty() && vigRaw.empty()) return;
+
+            nlohmann::json j;
+            j["type"] = "sony";
+
+            // Distortion: raw * 2^(-14) + 1
+            if (!distRaw.empty()) {
+                j["nc"] = (int)distRaw.size();
+                nlohmann::json dist = nlohmann::json::array();
+                for (auto v : distRaw) dist.push_back(v * (1.0 / 16384.0) + 1.0);
+                j["dist"] = dist;
+            }
+
+            // Chromatic aberration: raw * 2^(-21) + 1
+            // First half = R channel, second half = B channel
+            if (!caRaw.empty()) {
+                int half = (int)caRaw.size() / 2;
+                nlohmann::json caR = nlohmann::json::array();
+                nlohmann::json caB = nlohmann::json::array();
+                for (int i = 0; i < half; i++)
+                    caR.push_back(caRaw[i] * (1.0 / 2097152.0) + 1.0);
+                for (int i = half; i < (int)caRaw.size(); i++)
+                    caB.push_back(caRaw[i] * (1.0 / 2097152.0) + 1.0);
+                j["caR"] = caR;
+                j["caB"] = caB;
+            }
+
+            // Vignetting: gain = 2^(0.5 - (2^(raw * 2^(-13) - 1))^2)
+            if (!vigRaw.empty()) {
+                nlohmann::json vig = nlohmann::json::array();
+                for (auto v : vigRaw) {
+                    double x = v * (1.0 / 8192.0) - 1.0;
+                    double gain = pow(2.0, 0.5 - pow(pow(2.0, x), 2.0));
+                    vig.push_back(gain);
+                }
+                j["vig"] = vig;
+            }
+
+            photo.lensCorrectionParams = j.dump();
+        } catch (...) {}
+    }
+
+    // Decode DNG OpcodeList -> JSON
+    static void extractDngLensCorrection(const Exiv2::ExifData& exif, PhotoEntry& photo) {
+        try {
+            nlohmann::json j;
+            j["type"] = "dng";
+
+            // OpcodeList3: WarpRectilinear (distortion + TCA)
+            auto op3It = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.OpcodeList3"));
+            if (op3It != exif.end()) {
+                auto& val = op3It->value();
+                size_t sz = val.size();
+                vector<uint8_t> buf(sz);
+                val.copy((Exiv2::byte*)buf.data(), Exiv2::invalidByteOrder);
+                parseDngWarpRectilinear(buf, j);
+            }
+
+            // OpcodeList2: GainMap (vignetting)
+            auto op2It = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.OpcodeList2"));
+            if (op2It != exif.end()) {
+                auto& val = op2It->value();
+                size_t sz = val.size();
+                vector<uint8_t> buf(sz);
+                val.copy((Exiv2::byte*)buf.data(), Exiv2::invalidByteOrder);
+                parseDngGainMap(buf, j);
+            }
+
+            if (j.contains("warp") || j.contains("gain")) {
+                photo.lensCorrectionParams = j.dump();
+            }
+        } catch (...) {}
+    }
+
+    // Big-endian readers
+    static uint32_t readBE32(const uint8_t* p) {
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+               ((uint32_t)p[2] << 8) | p[3];
+    }
+    static double readBE64f(const uint8_t* p) {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+        double d;
+        memcpy(&d, &v, 8);
+        return d;
+    }
+    static float readBE32f(const uint8_t* p) {
+        uint32_t v = readBE32(p);
+        float f;
+        memcpy(&f, &v, 4);
+        return f;
+    }
+
+    // Parse WarpRectilinear opcode from OpcodeList3
+    static void parseDngWarpRectilinear(const vector<uint8_t>& buf, nlohmann::json& j) {
+        if (buf.size() < 4) return;
+        uint32_t numOps = readBE32(buf.data());
+        size_t pos = 4;
+
+        for (uint32_t op = 0; op < numOps && pos + 16 <= buf.size(); op++) {
+            uint32_t opcodeId = readBE32(buf.data() + pos);
+            // uint32_t dngVersion = readBE32(buf.data() + pos + 4);
+            // uint32_t flags = readBE32(buf.data() + pos + 8);
+            uint32_t paramBytes = readBE32(buf.data() + pos + 12);
+            pos += 16;
+
+            if (opcodeId == 1 && pos + paramBytes <= buf.size()) {
+                // WarpRectilinear: nPlanes(4) + [6 doubles per plane] + center(cx, cy)
+                const uint8_t* d = buf.data() + pos;
+                uint32_t nPlanes = readBE32(d);
+                if (nPlanes >= 1 && nPlanes <= 3) {
+                    nlohmann::json warp;
+                    warp["planes"] = nPlanes;
+                    nlohmann::json coeffs = nlohmann::json::array();
+                    size_t off = 4;
+                    for (uint32_t p = 0; p < nPlanes; p++) {
+                        nlohmann::json plane = nlohmann::json::array();
+                        for (int k = 0; k < 6; k++) {
+                            plane.push_back(readBE64f(d + off));
+                            off += 8;
+                        }
+                        coeffs.push_back(plane);
+                    }
+                    warp["cx"] = readBE64f(d + off); off += 8;
+                    warp["cy"] = readBE64f(d + off);
+                    j["warp"] = warp;
+                }
+            }
+            pos += paramBytes;
+        }
+    }
+
+    // Parse GainMap opcode from OpcodeList2
+    static void parseDngGainMap(const vector<uint8_t>& buf, nlohmann::json& j) {
+        if (buf.size() < 4) return;
+        uint32_t numOps = readBE32(buf.data());
+        size_t pos = 4;
+
+        for (uint32_t op = 0; op < numOps && pos + 16 <= buf.size(); op++) {
+            uint32_t opcodeId = readBE32(buf.data() + pos);
+            uint32_t paramBytes = readBE32(buf.data() + pos + 12);
+            pos += 16;
+
+            if (opcodeId == 9 && pos + paramBytes <= buf.size()) {
+                // GainMap: top(4) left(4) bottom(4) right(4) plane(4) planes(4)
+                //          rowPitch(4) colPitch(4) mapPointsV(4) mapPointsH(4)
+                //          mapSpacingV(8) mapSpacingH(8) mapOriginV(8) mapOriginH(8)
+                //          mapPlanes(4) + mapPoints float32[]
+                const uint8_t* d = buf.data() + pos;
+                if (paramBytes < 72) { pos += paramBytes; continue; }
+                // uint32_t top = readBE32(d);
+                // uint32_t left = readBE32(d + 4);
+                // uint32_t bottom = readBE32(d + 8);
+                // uint32_t right = readBE32(d + 12);
+                // uint32_t plane = readBE32(d + 16);
+                // uint32_t planes = readBE32(d + 20);
+                uint32_t rowPitch = readBE32(d + 24);
+                uint32_t colPitch = readBE32(d + 28);
+                uint32_t rows = readBE32(d + 32);
+                uint32_t cols = readBE32(d + 36);
+                // double spacingV = readBE64f(d + 40);
+                // double spacingH = readBE64f(d + 48);
+                // double originV = readBE64f(d + 56);
+                // double originH = readBE64f(d + 64);
+                uint32_t mapPlanes = readBE32(d + 72);
+
+                size_t headerSize = 76;
+                uint32_t totalPoints = rows * cols * mapPlanes;
+                if (headerSize + totalPoints * 4 <= paramBytes && totalPoints > 0 && totalPoints < 100000) {
+                    nlohmann::json gain;
+                    gain["rows"] = rows;
+                    gain["cols"] = cols;
+                    gain["mapPlanes"] = mapPlanes;
+                    gain["rowPitch"] = rowPitch;
+                    gain["colPitch"] = colPitch;
+                    nlohmann::json data = nlohmann::json::array();
+                    for (uint32_t i = 0; i < totalPoints; i++) {
+                        data.push_back(readBE32f(d + headerSize + i * 4));
+                    }
+                    gain["data"] = data;
+                    j["gain"] = gain;
+                }
+            }
+            pos += paramBytes;
         }
     }
 
@@ -3039,5 +3343,104 @@ private:
         if (photo.localPath.empty() || !fs::exists(photo.localPath)) return;
         if (!photo.isManaged) return;  // don't write XMP for external references
         writeXmpSidecar(photo.localPath, photo);
+    }
+
+    // EXIF backfill thread: re-read EXIF from local files for v9 fields
+    void startExifBackfillThread(const vector<string>& ids) {
+        if (exifBackfillRunning_) return;
+        exifBackfillRunning_ = true;
+
+        auto jobs = make_shared<vector<pair<string, string>>>();
+        jobs->reserve(ids.size());
+        for (const auto& id : ids) {
+            auto it = photos_.find(id);
+            if (it != photos_.end() && !it->second.localPath.empty()) {
+                jobs->push_back({id, it->second.localPath});
+            }
+        }
+
+        logNotice() << "[ExifBackfill] Starting " << jobs->size() << " jobs with "
+                     << EXIF_BACKFILL_WORKERS << " workers";
+
+        thread([this, jobs]() {
+            // Suppress exiv2 warnings/errors during bulk backfill
+            // (Sony2/Olympus MakerNote parse errors are harmless but noisy)
+            auto prevLevel = Exiv2::LogMsg::level();
+            Exiv2::LogMsg::setLevel(Exiv2::LogMsg::mute);
+
+            atomic<int> nextIdx{0};
+            int total = (int)jobs->size();
+
+            auto worker = [&]() {
+                while (true) {
+                    int idx = nextIdx.fetch_add(1);
+                    if (idx >= total) break;
+
+                    const auto& [id, path] = (*jobs)[idx];
+                    PhotoEntry temp;
+                    temp.id = id;
+
+                    // Re-read EXIF data using extractExifMetadata (which now populates v9 fields)
+                    try {
+                        auto image = Exiv2::ImageFactory::open(path);
+                        image->readMetadata();
+                        auto& exif = image->exifData();
+
+                        auto getString = [&](const char* key) -> string {
+                            auto it = exif.findKey(Exiv2::ExifKey(key));
+                            if (it != exif.end()) return it->print(&exif);
+                            return "";
+                        };
+                        auto getFloat = [&](const char* key) -> float {
+                            auto it = exif.findKey(Exiv2::ExifKey(key));
+                            if (it != exif.end()) return it->toFloat();
+                            return 0;
+                        };
+
+                        // Extended shooting info
+                        string et = getString("Exif.Photo.ExposureTime");
+                        if (!et.empty()) {
+                            auto sp = et.find(' ');
+                            temp.exposureTime = (sp != string::npos) ? et.substr(0, sp) : et;
+                        }
+                        temp.exposureBias = getFloat("Exif.Photo.ExposureBiasValue");
+                        auto oriIt = exif.findKey(Exiv2::ExifKey("Exif.Image.Orientation"));
+                        if (oriIt != exif.end()) temp.orientation = (int)oriIt->toInt64();
+                        temp.whiteBalance = getString("Exif.Photo.WhiteBalance");
+                        auto fl35It = exif.findKey(Exiv2::ExifKey("Exif.Photo.FocalLengthIn35mmFilm"));
+                        if (fl35It != exif.end()) temp.focalLength35mm = (int)fl35It->toInt64();
+                        temp.offsetTime = getString("Exif.Photo.OffsetTime");
+                        temp.bodySerial = getString("Exif.Photo.BodySerialNumber");
+                        temp.lensSerial = getString("Exif.Photo.LensSerialNumber");
+                        temp.subjectDistance = getFloat("Exif.Photo.SubjectDistance");
+                        temp.subsecTimeOriginal = getString("Exif.Photo.SubSecTimeOriginal");
+
+                        // Lens correction
+                        extractLensCorrectionParams(exif, temp);
+                    } catch (...) {}
+
+                    {
+                        lock_guard<mutex> lock(exifBackfillMutex_);
+                        completedExifBackfills_.push_back({id, std::move(temp)});
+                    }
+
+                    if ((idx + 1) % 100 == 0) {
+                        logNotice() << "[ExifBackfill] " << (idx + 1) << "/" << total;
+                    }
+                }
+            };
+
+            vector<thread> workers;
+            for (int i = 0; i < EXIF_BACKFILL_WORKERS; i++) {
+                workers.emplace_back(worker);
+            }
+            for (auto& w : workers) w.join();
+
+            // Restore exiv2 log level
+            Exiv2::LogMsg::setLevel(prevLevel);
+
+            logNotice() << "[ExifBackfill] Complete: " << total << " photos processed";
+            exifBackfillRunning_ = false;
+        }).detach();
     }
 };

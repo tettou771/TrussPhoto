@@ -38,11 +38,9 @@ public:
     bool wantsLeftSidebar() const override { return false; }
 
     // Initialize GPU resources (call once from tcApp::setup after addChild)
-    void init(const string& profileDir, const string& lensfunDir) {
+    void init(const string& profileDir) {
         profileManager_.setProfileDir(profileDir);
         lutShader_.load();
-        lensCorrector_.loadDatabase(lensfunDir);
-        lensCorrector_.loadAliases(lensfunDir + "/lens_aliases.json");
     }
 
     // Check if a profile exists for a given camera/style combo
@@ -117,12 +115,8 @@ public:
                             pendingRawPixels_ = std::move(loadedPixels);
                             int pw = pendingRawPixels_.getWidth();
                             int ph = pendingRawPixels_.getHeight();
-                            // EXIF embedded correction (Sony) > lensfun fallback
-                            if (!lensCorrector_.setupFromExif(path, pw, ph)) {
-                                if (focalLength > 0 && aperture > 0) {
-                                    lensCorrector_.setup(cameraMake, camera, lens, focalLength, aperture, pw, ph);
-                                }
-                            }
+                            // EXIF embedded correction (Sony ARW / DNG)
+                            lensCorrector_.setupFromExif(path, pw, ph);
                             rawLoadCompleted_ = true;
                         }
                         rawLoadInProgress_ = false;
@@ -143,9 +137,8 @@ public:
             Pixels spPixels;
             if (provider.loadSmartPreview(photoId, spPixels)) {
                 rawPixels_ = std::move(spPixels);
-                if (entry->focalLength > 0 && entry->aperture > 0) {
-                    lensCorrector_.setup(entry->cameraMake, entry->camera, entry->lens,
-                        entry->focalLength, entry->aperture,
+                if (!entry->lensCorrectionParams.empty()) {
+                    lensCorrector_.setupFromJson(entry->lensCorrectionParams,
                         rawPixels_.getWidth(), rawPixels_.getHeight());
                 }
                 reprocessImage();
@@ -178,7 +171,7 @@ public:
                     .lensEnabled = lensEnabled_,
                     .hasLensData = lensCorrector_.isReady(),
                     .isSmartPreview = isSmartPreview_,
-                    .isExifLens = lensCorrector_.isExifMode(),
+                    .lensSource = lensCorrector_.correctionSource(),
                 });
             }
         } else {
@@ -364,9 +357,8 @@ public:
                 Pixels spPixels;
                 if (spEntry && provider.loadSmartPreview(photoId, spPixels)) {
                     rawPixels_ = std::move(spPixels);
-                    if (spEntry->focalLength > 0 && spEntry->aperture > 0) {
-                        lensCorrector_.setup(spEntry->cameraMake, spEntry->camera, spEntry->lens,
-                            spEntry->focalLength, spEntry->aperture,
+                    if (!spEntry->lensCorrectionParams.empty()) {
+                        lensCorrector_.setupFromJson(spEntry->lensCorrectionParams,
                             rawPixels_.getWidth(), rawPixels_.getHeight());
                     }
                     reprocessImage();
@@ -382,7 +374,7 @@ public:
         if (key == 'L' || key == 'l') {
             lensEnabled_ = !lensEnabled_;
             logNotice() << "[LensCorrection] " << (lensEnabled_ ? "ON" : "OFF")
-                        << (lensCorrector_.isExifMode() ? " (EXIF)" : " (lensfun)");
+                        << " (" << lensCorrector_.correctionSource() << ")";
             if (selectedIndex_ >= 0 && isRawImage_ && rawPixels_.isAllocated()) {
                 reprocessImage();
             }
@@ -499,7 +491,7 @@ public:
                 .lensEnabled = lensEnabled_,
                 .hasLensData = lensCorrector_.isReady(),
                 .isSmartPreview = isSmartPreview_,
-                .isExifLens = lensCorrector_.isExifMode(),
+                .lensSource = lensCorrector_.correctionSource(),
             });
         }
     }
