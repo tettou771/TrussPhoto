@@ -191,6 +191,12 @@ public:
         panProgress_ = 0.0f;
     }
 
+    void centerOn(double lat, double lon, double z) {
+        centerLat_ = lat;
+        centerLon_ = lon;
+        zoom_ = z;
+    }
+
     void setTileCacheDir(const string& dir) {
         tileCacheDir_ = dir;
         if (!dir.empty()) fs::create_directories(dir);
@@ -394,8 +400,8 @@ public:
         fill();
         drawRect(0, 0, w, h);
 
-        // Fractional zoom: tiles are fetched at integer zoom, scaled for display
-        int tileZoom = clamp((int)floor(zoom_), 1, 19);
+        // Fractional zoom: round to nearest integer for sharper display
+        int tileZoom = clamp((int)round(zoom_), 1, 19);
         double tileScale = pow(2.0, zoom_ - tileZoom);
         double tileSize = 256.0 * tileScale;
 
@@ -710,7 +716,7 @@ private:
     // --- Pin clustering ---
 
     static constexpr float CLUSTER_CELL = 24.0f;
-    static constexpr double CLUSTER_ZOOM_STEP = 0.2;
+    static constexpr double CLUSTER_ZOOM_STEP = 0.5;
 
     static double quantizeZoom(double z) {
         return floor(z / CLUSTER_ZOOM_STEP) * CLUSTER_ZOOM_STEP;
@@ -1038,6 +1044,16 @@ public:
 
     void fitBounds() {
         canvas_->fitBounds();
+    }
+
+    // Center on a specific photo at zoom 14
+    void centerOnPhoto(const string& photoId) {
+        for (size_t i = 0; i < photos_.size(); i++) {
+            if (photoIds_[i] == photoId && photos_[i].hasGps()) {
+                canvas_->centerOn(photos_[i].latitude, photos_[i].longitude, 14.0);
+                return;
+            }
+        }
     }
 
     // --- Provisional pin API ---

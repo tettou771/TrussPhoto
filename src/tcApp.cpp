@@ -1018,7 +1018,13 @@ void tcApp::keyPressed(int key) {
             }
 
             viewManager_->switchTo(ViewMode::Map);
-            mapView->fitBounds();
+
+            // Center on selected photo at zoom 14, or fit all bounds
+            if (!selectedIds.empty()) {
+                mapView->centerOnPhoto(selectedIds[0]);
+            } else {
+                mapView->fitBounds();
+            }
 
             if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
             leftPaneWidth_ = 0;
