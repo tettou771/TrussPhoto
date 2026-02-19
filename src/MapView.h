@@ -8,7 +8,9 @@
 #include <tcxCurl.h>
 #include "PhotoEntry.h"
 #include "ViewContainer.h"
-#include "FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
+#include "PhotoStrip.h"
+#include "Constants.h"   // for SEL_R/G/B
+#include "FolderTree.h"  // for loadJapaneseFont
 #include <deque>
 #include <thread>
 #include <mutex>
@@ -22,28 +24,72 @@ using namespace tcx;
 
 namespace fs = std::filesystem;
 
-class MapView : public ViewContainer {
-public:
-    using Ptr = shared_ptr<MapView>;
+// =============================================================================
+// MapCanvas - map tile rendering, pins, and interaction (child RectNode)
+// =============================================================================
 
-    // Set photos to display as pins (filters to GPS-only)
+class MapCanvas : public RectNode {
+public:
+    using Ptr = shared_ptr<MapCanvas>;
+
+    // Callbacks
+    function<void(int index, const string& photoId)> onPinClick;
+    function<void(int index, const string& photoId)> onPinDoubleClick;
+    function<void()> onRedraw;
+
     void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids) {
         pins_.clear();
+        selectedPinIdx_ = -1;
         for (size_t i = 0; i < photos.size(); i++) {
             if (photos[i].hasGps()) {
                 pins_.push_back({photos[i].latitude, photos[i].longitude, (int)i, ids[i]});
             }
         }
-        clusterZoom_ = -999;  // invalidate cluster cache
+        clusterZoom_ = -999;
     }
 
-    // Set tile disk cache directory
+    // Select a pin by photoId. Returns true if the photo has GPS (pin found).
+    bool selectPin(const string& photoId) {
+        selectedPinIdx_ = -1;
+        for (size_t i = 0; i < pins_.size(); i++) {
+            if (pins_[i].photoId == photoId) {
+                selectedPinIdx_ = (int)i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Center map on pin if it's outside the viewport. Keep zoom level, animate.
+    void centerOnSelectedPin() {
+        if (selectedPinIdx_ < 0 || selectedPinIdx_ >= (int)pins_.size()) return;
+        auto& pin = pins_[selectedPinIdx_];
+
+        // Check if pin is within the visible viewport (with margin)
+        auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
+        auto centerPx = latLonToPixel(centerLat_, centerLon_, zoom_);
+        float halfW = getWidth() / 2.0f;
+        float halfH = getHeight() / 2.0f;
+        float margin = 40.0f;
+
+        float dx = pinPx.x - centerPx.x;
+        float dy = pinPx.y - centerPx.y;
+        if (abs(dx) < halfW - margin && abs(dy) < halfH - margin) return;
+
+        // Animate to pin location
+        panAnimating_ = true;
+        panFromLat_ = centerLat_;
+        panFromLon_ = centerLon_;
+        panToLat_ = pin.lat;
+        panToLon_ = pin.lon;
+        panProgress_ = 0.0f;
+    }
+
     void setTileCacheDir(const string& dir) {
         tileCacheDir_ = dir;
         if (!dir.empty()) fs::create_directories(dir);
     }
 
-    // Fit view to show all pins
     void fitBounds() {
         if (pins_.empty()) {
             centerLat_ = 35.68;
@@ -63,14 +109,13 @@ public:
         centerLat_ = (minLat + maxLat) / 2.0;
         centerLon_ = (minLon + maxLon) / 2.0;
 
-        // Find zoom level that fits all pins
         float w = getWidth();
         float h = getHeight();
         if (w < 1 || h < 1) { zoom_ = 10; return; }
 
         for (int z = 18; z >= 1; z--) {
-            auto pMin = latLonToPixel(maxLat, minLon, z);  // top-left
-            auto pMax = latLonToPixel(minLat, maxLon, z);  // bottom-right
+            auto pMin = latLonToPixel(maxLat, minLon, z);
+            auto pMax = latLonToPixel(minLat, maxLon, z);
             float spanX = pMax.x - pMin.x;
             float spanY = pMax.y - pMin.y;
             if (spanX < w * 0.8f && spanY < h * 0.8f) {
@@ -81,21 +126,15 @@ public:
         zoom_ = 1;
     }
 
-    // Callbacks
-    function<void(int index, const string& photoId)> onPinClick;        // single click on pin
-    function<void(int index, const string& photoId)> onPinDoubleClick;  // double click on pin
-    function<void()> onRedraw;
-
     void setup() override {
         enableEvents();
+        setClipping(true);
         loadJapaneseFont(font_, 12);
         loadJapaneseFont(fontSmall_, 10);
-
         tileClient_.addHeader("User-Agent", "TrussPhoto/1.0");
     }
 
     void update() override {
-        // Process completed tile downloads on main thread
         bool hadResults = false;
         {
             lock_guard<mutex> lock(tileMutex_);
@@ -117,7 +156,6 @@ public:
 
         if (hadResults && onRedraw) onRedraw();
 
-        // Restart tile thread if it stopped but queue still has items (race condition fix)
         if (!tileThreadRunning_ && !tileThreadStop_) {
             bool hasQueue;
             {
@@ -125,6 +163,20 @@ public:
                 hasQueue = !tileQueue_.empty();
             }
             if (hasQueue) startTileThread();
+        }
+
+        // Pan animation
+        if (panAnimating_) {
+            panProgress_ += 0.04f;  // ~15 frames at 60fps
+            if (panProgress_ >= 1.0f) {
+                panProgress_ = 1.0f;
+                panAnimating_ = false;
+            }
+            // Ease out cubic
+            float t = 1.0f - (1.0f - panProgress_) * (1.0f - panProgress_) * (1.0f - panProgress_);
+            centerLat_ = panFromLat_ + (panToLat_ - panFromLat_) * t;
+            centerLon_ = panFromLon_ + (panToLon_ - panFromLon_) * t;
+            if (onRedraw) onRedraw();
         }
     }
 
@@ -137,17 +189,13 @@ public:
         fill();
         drawRect(0, 0, w, h);
 
-        setClipping(true);
-
         // Fractional zoom: tiles are fetched at integer zoom, scaled for display
         int tileZoom = clamp((int)floor(zoom_), 1, 19);
         double tileScale = pow(2.0, zoom_ - tileZoom);
         double tileSize = 256.0 * tileScale;
 
-        // Center pixel coordinates (at fractional zoom level)
         auto centerPx = latLonToPixel(centerLat_, centerLon_, zoom_);
 
-        // Visible pixel range
         float halfW = w / 2.0f;
         float halfH = h / 2.0f;
         float left = centerPx.x - halfW;
@@ -164,7 +212,6 @@ public:
         // Draw tiles
         for (int ty = tileMinY; ty <= tileMaxY; ty++) {
             for (int tx = tileMinX; tx <= tileMaxX; tx++) {
-                // Compute tile rect from edge positions to avoid float gaps
                 float drawX = (float)(tx * tileSize) - left;
                 float drawY = (float)(ty * tileSize) - top;
                 float drawW = (float)((tx + 1) * tileSize) - left - drawX;
@@ -176,7 +223,6 @@ public:
                     setColor(1.0f, 1.0f, 1.0f);
                     it->second.draw(drawX, drawY, drawW, drawH);
                 } else {
-                    // Fallback: draw parent tile's sub-region (blurry but better than nothing)
                     bool fallbackDrawn = false;
                     if (tileZoom > 1) {
                         TileKey parentKey{tileZoom - 1, tx / 2, ty / 2};
@@ -196,14 +242,12 @@ public:
                         fill();
                         drawRect(drawX, drawY, drawW, drawH);
                     }
-
-                    // Request tile
                     requestTile(tileZoom, tx, ty);
                 }
             }
         }
 
-        // Prefetch adjacent zoom level tiles for smooth zooming
+        // Prefetch adjacent zoom levels
         for (int pz : {tileZoom + 1, tileZoom - 1}) {
             if (pz < 1 || pz > 19) continue;
             auto pCenter = latLonToPixel(centerLat_, centerLon_, (double)pz);
@@ -223,26 +267,26 @@ public:
             }
         }
 
-        // Draw pins (with grid-based clustering to avoid vertex buffer overflow)
+        // Draw pins
         drawPins(left, top, w, h);
 
-        setClipping(false);
-
-        // Zoom level indicator
-        setColor(0.0f, 0.0f, 0.0f, 0.5f);
+        // Zoom level indicator (bottom-left, flush to edges)
+        float overlayH = 20;
+        float overlayY = h - overlayH + 3;
+        setColor(0.0f, 0.0f, 0.0f, 0.3f);
         fill();
-        drawRect(8, h - 28, 80, 20);
-        setColor(0.8f, 0.8f, 0.85f);
-        fontSmall_.drawString(format("Zoom: {:.1f}", zoom_), 14, h - 18,
+        drawRect(0, overlayY, 88, overlayH);
+        setColor(1.0f, 1.0f, 1.0f);
+        fontSmall_.drawString(format("Zoom: {:.1f}", zoom_), 6, overlayY + overlayH / 2,
             Direction::Left, Direction::Center);
 
-        // OSM attribution
-        setColor(0.0f, 0.0f, 0.0f, 0.5f);
+        // OSM attribution (bottom-right, flush to edges)
+        float attrW = 184;
+        setColor(0.0f, 0.0f, 0.0f, 0.3f);
         fill();
-        float attrW = 180;
-        drawRect(w - attrW - 4, h - 28, attrW, 20);
-        setColor(0.6f, 0.6f, 0.65f);
-        fontSmall_.drawString("(C) OpenStreetMap contributors", w - attrW, h - 18,
+        drawRect(w - attrW, overlayY, attrW, overlayH);
+        setColor(1.0f, 1.0f, 1.0f);
+        fontSmall_.drawString("(C) OpenStreetMap contributors", w - attrW + 4, overlayY + overlayH / 2,
             Direction::Left, Direction::Center);
 
         // "No geotagged photos" message
@@ -251,12 +295,17 @@ public:
             font_.drawString("No geotagged photos", w / 2, h / 2,
                 Direction::Center, Direction::Center);
         }
+
+        // Separator line at bottom
+        setColor(0.25f, 0.25f, 0.28f);
+        fill();
+        drawRect(0, h - 1, w, 1);
     }
 
     bool onMousePress(Vec2 pos, int button) override {
         if (button != 0) return false;
 
-        // Hit test against cached clusters (world coords → screen coords)
+        // Hit test against cached clusters
         double qZoom = quantizeZoom(zoom_);
         double sf = pow(2.0, zoom_ - qZoom);
         auto centerPxQ = latLonToPixel(centerLat_, centerLon_, qZoom);
@@ -274,7 +323,6 @@ public:
             if (dx * dx + dy * dy > r * r) continue;
 
             if (cluster.count == 1) {
-                // Single pin: fire click/double-click
                 auto& pin = pins_[cluster.firstPinIdx];
                 auto now = chrono::steady_clock::now();
                 bool isDouble = (pin.photoIndex == lastPinClickIndex_ &&
@@ -288,7 +336,6 @@ public:
                     onPinClick(pin.photoIndex, pin.photoId);
                 }
             } else {
-                // Cluster: show first pin's metadata
                 auto& pin = pins_[cluster.firstPinIdx];
                 if (onPinClick) onPinClick(pin.photoIndex, pin.photoId);
             }
@@ -314,7 +361,6 @@ public:
         centerLat_ = clamp(newLat, -85.0, 85.0);
         centerLon_ = newLon;
 
-        // Wrap longitude
         while (centerLon_ > 180.0) centerLon_ -= 360.0;
         while (centerLon_ < -180.0) centerLon_ += 360.0;
 
@@ -334,7 +380,6 @@ public:
         zoom_ = clamp(zoom_, 1.0, 19.0);
 
         if (zoom_ != oldZoom) {
-            // Flush stale tile queue so visible tiles load first
             {
                 lock_guard<mutex> lock(tileMutex_);
                 for (const auto& req : tileQueue_) {
@@ -343,18 +388,15 @@ public:
                 tileQueue_.clear();
             }
 
-            // Keep the point under the mouse cursor fixed
             float w = getWidth();
             float h = getHeight();
             float dx = pos.x - w / 2.0f;
             float dy = pos.y - h / 2.0f;
 
-            // lat/lon of the point under cursor (at old zoom)
             auto oldCenterPx = latLonToPixel(centerLat_, centerLon_, oldZoom);
             auto [mouseLat, mouseLon] = pixelToLatLon(
                 oldCenterPx.x + dx, oldCenterPx.y + dy, oldZoom);
 
-            // Adjust center so that point stays under cursor at new zoom
             auto newMousePx = latLonToPixel(mouseLat, mouseLon, zoom_);
             auto [newLat, newLon] = pixelToLatLon(
                 newMousePx.x - dx, newMousePx.y - dy, zoom_);
@@ -370,13 +412,6 @@ public:
         return true;
     }
 
-    // ViewContainer lifecycle
-    void beginView(ViewContext& ctx) override { /* pins set via setPhotos() before activation */ }
-    void endView() override { /* keep tile cache, just deactivate */ }
-    bool wantsSearchBar() const override { return false; }
-    bool wantsLeftSidebar() const override { return false; }
-
-    // Stop background tile thread
     void shutdown() {
         tileThreadStop_ = true;
         if (tileThread_.joinable()) tileThread_.join();
@@ -387,11 +422,10 @@ private:
     inline static const Color PIN_COLOR = Color(0.9f, 0.2f, 0.2f);
 
     // Map state
-    double centerLat_ = 35.68;  // Tokyo default
+    double centerLat_ = 35.68;
     double centerLon_ = 139.77;
     double zoom_ = 10.0;
 
-    // Tile key for map storage
     struct TileKey {
         int z, x, y;
         bool operator<(const TileKey& o) const {
@@ -404,13 +438,11 @@ private:
         }
     };
 
-    // Tile cache
     std::map<TileKey, Texture> tileCache_;
     std::map<TileKey, bool> tileLoading_;
-    std::map<TileKey, int> tileFailed_;  // retry count for failed tiles
+    std::map<TileKey, int> tileFailed_;
     string tileCacheDir_;
 
-    // Photo pins
     struct Pin {
         double lat, lon;
         int photoIndex;
@@ -418,29 +450,33 @@ private:
     };
     vector<Pin> pins_;
 
-    // Pin cluster (for grid-based clustering in world coordinates)
     struct Cluster {
-        float wx, wy;      // average world pixel position (stable across pans)
+        float wx, wy;
         int count;
-        int firstPinIdx;   // index into pins_ for single-pin click
+        int firstPinIdx;
     };
     vector<Cluster> cachedClusters_;
-    double clusterZoom_ = -999;  // quantized zoom at which clusters were computed
+    double clusterZoom_ = -999;
 
-    // Drag state
     bool dragging_ = false;
     Vec2 dragStart_;
     double dragStartLat_ = 0, dragStartLon_ = 0;
 
-    // Double-click detection for pins
+    // Selected pin
+    int selectedPinIdx_ = -1;
+
+    // Pan animation
+    bool panAnimating_ = false;
+    double panFromLat_ = 0, panFromLon_ = 0;
+    double panToLat_ = 0, panToLon_ = 0;
+    float panProgress_ = 0;
+
     chrono::steady_clock::time_point lastPinClickTime_;
     int lastPinClickIndex_ = -1;
 
-    // Fonts
     Font font_;
     Font fontSmall_;
 
-    // Tile fetching
     HttpClient tileClient_;
     mutex tileMutex_;
 
@@ -454,12 +490,11 @@ private:
     atomic<bool> tileThreadRunning_{false};
     atomic<bool> tileThreadStop_{false};
 
-    // --- Pin clustering and drawing ---
+    // --- Pin clustering ---
 
-    static constexpr float CLUSTER_CELL = 24.0f;  // grid cell size in world pixels
-    static constexpr double CLUSTER_ZOOM_STEP = 0.2;  // quantization step
+    static constexpr float CLUSTER_CELL = 24.0f;
+    static constexpr double CLUSTER_ZOOM_STEP = 0.2;
 
-    // Quantize zoom to 0.2 steps
     static double quantizeZoom(double z) {
         return floor(z / CLUSTER_ZOOM_STEP) * CLUSTER_ZOOM_STEP;
     }
@@ -475,7 +510,6 @@ private:
             float wx = px.x;
             float wy = px.y;
 
-            // Grid in world pixel coords (anchored to map, not viewport)
             int gx = (int)floor(wx / CLUSTER_CELL);
             int gy = (int)floor(wy / CLUSTER_CELL);
             auto key = make_pair(gx, gy);
@@ -497,60 +531,88 @@ private:
     }
 
     void drawPins(float left, float top, float w, float h) {
-        // Rebuild clusters only when quantized zoom changes
         double qZoom = quantizeZoom(zoom_);
         if (qZoom != clusterZoom_) {
             rebuildClusters(qZoom);
         }
 
-        // Scale factor: cached clusters are at qZoom, display is at zoom_
         double scaleFactor = pow(2.0, zoom_ - qZoom);
 
-        // Viewport center in qZoom world coords
         auto centerPxQ = latLonToPixel(centerLat_, centerLon_, qZoom);
         float qLeft = centerPxQ.x * (float)scaleFactor - w / 2.0f;
         float qTop  = centerPxQ.y * (float)scaleFactor - h / 2.0f;
 
-        // Draw cached clusters, converting world→screen
+        // Draw all clusters (normal pins)
         for (const auto& cluster : cachedClusters_) {
-            float sx = cluster.wx * (float)scaleFactor - qLeft;
-            float sy = cluster.wy * (float)scaleFactor - qTop;
+            drawCluster(cluster, scaleFactor, qLeft, qTop, w, h);
+        }
 
-            // Skip off screen
-            if (sx < -30 || sx > w + 30 || sy < -30 || sy > h + 30) continue;
+        // Draw selected pin on top (independently from clusters)
+        if (selectedPinIdx_ >= 0 && selectedPinIdx_ < (int)pins_.size()) {
+            auto& pin = pins_[selectedPinIdx_];
+            auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
+            float sx = pinPx.x - left;
+            float sy = pinPx.y - top;
 
-            // Radius: small for <=99, step up per digit count
-            float r = PIN_RADIUS;
-            string label;
-            if (cluster.count >= 1000) {
-                r = PIN_RADIUS + 6;
-                label = format("{:.0f}k", cluster.count / 1000.0f);
-            } else if (cluster.count >= 100) {
-                r = PIN_RADIUS + 4;
-                label = to_string(cluster.count);
-            } else if (cluster.count > 1) {
-                label = to_string(cluster.count);
-            }
+            if (sx >= -30 && sx <= w + 30 && sy >= -30 && sy <= h + 30) {
+                float r = PIN_RADIUS + 2;
 
-            // Shadow
-            setColor(0.0f, 0.0f, 0.0f, 0.3f);
-            fill();
-            drawCircle(sx + 1, sy + 1, r);
+                // Shadow
+                setColor(0.0f, 0.0f, 0.0f, 0.4f);
+                fill();
+                drawCircle(sx + 1, sy + 1, r);
 
-            // Body
-            setColor(PIN_COLOR);
-            fill();
-            drawCircle(sx, sy, r);
+                // Orange selection pin
+                setColor(SEL_R, SEL_G, SEL_B);
+                fill();
+                drawCircle(sx, sy, r);
 
-            if (cluster.count == 1) {
+                // White inner dot
                 setColor(1.0f, 1.0f, 1.0f);
                 fill();
                 drawCircle(sx, sy, 3);
-            } else {
-                setColor(1.0f, 1.0f, 1.0f);
-                fontSmall_.drawString(label, sx, sy + 2,
-                    Direction::Center, Direction::Center);
             }
+        }
+    }
+
+    void drawCluster(const Cluster& cluster, double scaleFactor,
+                     float qLeft, float qTop, float w, float h) {
+        float sx = cluster.wx * (float)scaleFactor - qLeft;
+        float sy = cluster.wy * (float)scaleFactor - qTop;
+
+        if (sx < -30 || sx > w + 30 || sy < -30 || sy > h + 30) return;
+
+        float r = PIN_RADIUS;
+        string label;
+        if (cluster.count >= 1000) {
+            r = PIN_RADIUS + 6;
+            label = format("{:.0f}k", cluster.count / 1000.0f);
+        } else if (cluster.count >= 100) {
+            r = PIN_RADIUS + 4;
+            label = to_string(cluster.count);
+        } else if (cluster.count > 1) {
+            label = to_string(cluster.count);
+        }
+
+        // Shadow
+        setColor(0.0f, 0.0f, 0.0f, 0.3f);
+        fill();
+        drawCircle(sx + 1, sy + 1, r);
+
+        // Pin body
+        setColor(PIN_COLOR);
+        fill();
+        drawCircle(sx, sy, r);
+
+        // Inner dot or label
+        if (cluster.count == 1) {
+            setColor(1.0f, 1.0f, 1.0f);
+            fill();
+            drawCircle(sx, sy, 3);
+        } else {
+            setColor(1.0f, 1.0f, 1.0f);
+            fontSmall_.drawString(label, sx, sy + 2,
+                Direction::Center, Direction::Center);
         }
     }
 
@@ -576,12 +638,10 @@ private:
     void requestTile(int z, int x, int y, bool prefetch = false) {
         TileKey key{z, x, y};
 
-        // Already loaded, loading, or failed too many times?
         if (tileCache_.count(key) || tileLoading_.count(key)) return;
         auto fit = tileFailed_.find(key);
         if (fit != tileFailed_.end() && fit->second >= 3) return;
 
-        // Check disk cache first
         if (!tileCacheDir_.empty()) {
             string cachePath = format("{}/{}/{}/{}.png", tileCacheDir_, z, x, y);
             if (fs::exists(cachePath)) {
@@ -602,7 +662,7 @@ private:
             if (prefetch) {
                 tileQueue_.push_back({z, x, y});
             } else {
-                tileQueue_.push_front({z, x, y});  // visible tiles first
+                tileQueue_.push_front({z, x, y});
             }
         }
 
@@ -626,7 +686,6 @@ private:
                     tileQueue_.pop_front();
                 }
 
-                // Fetch from OSM
                 string url = format("https://tile.openstreetmap.org/{}/{}/{}.png",
                     req.z, req.x, req.y);
 
@@ -641,7 +700,6 @@ private:
                         (const unsigned char*)res.body.data(),
                         (int)res.body.size());
 
-                    // Save to disk cache
                     if (!tileCacheDir_.empty()) {
                         string dir = format("{}/{}/{}", tileCacheDir_, req.z, req.x);
                         fs::create_directories(dir);
@@ -658,7 +716,6 @@ private:
                     tileResults_.push_back({req.z, req.x, req.y, std::move(px)});
                 }
 
-                // Small delay to respect OSM rate limits
                 this_thread::sleep_for(chrono::milliseconds(100));
             }
             tileThreadRunning_ = false;
@@ -666,12 +723,10 @@ private:
         tileThread_.detach();
     }
 
-    // LRU eviction: remove tiles from cache when it gets too large
     void evictOldTiles() {
         const int MAX_TILES = 256;
         if ((int)tileCache_.size() <= MAX_TILES) return;
 
-        // Keep current and adjacent zoom levels for smooth transitions
         int currentZoom = (int)floor(zoom_);
         auto it = tileCache_.begin();
         while (it != tileCache_.end() && (int)tileCache_.size() > MAX_TILES) {
@@ -682,5 +737,110 @@ private:
                 ++it;
             }
         }
+    }
+};
+
+// =============================================================================
+// MapView - container for MapCanvas + PhotoStrip
+// =============================================================================
+
+class MapView : public ViewContainer {
+public:
+    using Ptr = shared_ptr<MapView>;
+
+    // Callbacks (forwarded to canvas)
+    function<void(int index, const string& photoId)> onPinClick;
+    function<void(int index, const string& photoId)> onPinDoubleClick;
+    function<void()> onRedraw;
+
+    MapView() {
+        // Create children in constructor (not setup!) so setPhotos() etc.
+        // can be called before setup() runs. addChild() is deferred to setup().
+        canvas_ = make_shared<MapCanvas>();
+        strip_ = make_shared<PhotoStrip>();
+    }
+
+    void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids,
+                   PhotoProvider& provider) {
+        canvas_->setPhotos(photos, ids);
+
+        vector<bool> hasGps(ids.size());
+        for (size_t i = 0; i < photos.size(); i++)
+            hasGps[i] = photos[i].hasGps();
+        strip_->setPhotos(ids, hasGps, provider);
+    }
+
+    void setStripSelection(const string& photoId) {
+        strip_->selectPhoto(photoId);
+        canvas_->selectPin(photoId);
+    }
+
+    void setTileCacheDir(const string& dir) {
+        canvas_->setTileCacheDir(dir);
+    }
+
+    void fitBounds() {
+        canvas_->fitBounds();
+    }
+
+    // Layout helpers
+    float stripHeight() const { return clamp(getHeight() * 0.15f, 80.0f, 160.0f); }
+    float mapHeight() const { return getHeight() - stripHeight(); }
+
+    void setSize(float w, float h) override {
+        RectNode::setSize(w, h);
+        layoutChildren();
+    }
+
+    void setup() override {
+        // addChild deferred to setup (needs shared_from_this)
+        addChild(canvas_);
+        addChild(strip_);
+
+        // Forward callbacks: map pin click → select strip + metadata
+        canvas_->onPinClick = [this](int idx, const string& id) {
+            canvas_->selectPin(id);
+            strip_->selectPhoto(id);
+            if (onPinClick) onPinClick(idx, id);
+            if (onRedraw) onRedraw();
+        };
+        canvas_->onPinDoubleClick = [this](int idx, const string& id) {
+            if (onPinDoubleClick) onPinDoubleClick(idx, id);
+        };
+        canvas_->onRedraw = [this]() {
+            if (onRedraw) onRedraw();
+        };
+
+        // Strip click → select pin + center map if GPS
+        strip_->onPhotoClick = [this](int idx, const string& id) {
+            bool hasGps = canvas_->selectPin(id);
+            if (hasGps) {
+                canvas_->centerOnSelectedPin();
+            }
+            if (onPinClick) onPinClick(idx, id);
+            if (onRedraw) onRedraw();
+        };
+
+        layoutChildren();
+    }
+
+    // ViewContainer lifecycle
+    void beginView(ViewContext& ctx) override {}
+    void endView() override {}
+    bool wantsSearchBar() const override { return false; }
+    bool wantsLeftSidebar() const override { return false; }
+
+    void shutdown() {
+        if (canvas_) canvas_->shutdown();
+        if (strip_) strip_->shutdown();
+    }
+
+private:
+    MapCanvas::Ptr canvas_;
+    PhotoStrip::Ptr strip_;
+
+    void layoutChildren() {
+        if (canvas_) canvas_->setRect(0, 0, getWidth(), mapHeight());
+        if (strip_) strip_->setRect(0, mapHeight(), getWidth(), stripHeight());
     }
 };

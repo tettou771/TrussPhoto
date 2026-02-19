@@ -8,6 +8,11 @@
 constexpr int THUMBNAIL_MAX_SIZE = 512;
 constexpr int THUMBNAIL_JPEG_QUALITY = 60;  // 0-100, lower = smaller file
 
+// Selection highlight color (bright orange) - use with setColor(SEL_R, SEL_G, SEL_B)
+constexpr float SEL_R = 0.95f;
+constexpr float SEL_G = 0.6f;
+constexpr float SEL_B = 0.15f;
+
 // Sync state of a photo
 enum class SyncState {
     LocalOnly  = 0,   // Only on local disk (not yet uploaded)

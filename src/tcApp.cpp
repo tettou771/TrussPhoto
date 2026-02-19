@@ -954,7 +954,13 @@ void tcApp::keyPressed(int key) {
                 if (e) photos.push_back(*e);
                 else photos.push_back(PhotoEntry{});
             }
-            mapView->setPhotos(photos, ids);
+            mapView->setPhotos(photos, ids, provider_);
+
+            // Pass grid selection to strip
+            auto selectedIds = g->getSelectedIds();
+            if (!selectedIds.empty()) {
+                mapView->setStripSelection(selectedIds[0]);
+            }
 
             viewManager_->switchTo(ViewMode::Map);
             mapView->fitBounds();
