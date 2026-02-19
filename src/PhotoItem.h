@@ -208,8 +208,23 @@ public:
     void setIsVideo(bool v) { isVideo_ = v; }
     bool isVideo() const { return isVideo_; }
 
+    void setStackSize(int n) { stackSize_ = n; }
+    int getStackSize() const { return stackSize_; }
+    bool isStacked() const { return stackSize_ > 1; }
+
+    // Check if a local point is over the stack badge area
+    bool isOverStackBadge(Vec2 local) const {
+        if (stackSize_ <= 1) return false;
+        // Badge region (top-right, generous hit area)
+        float bx = getWidth() - 28;
+        float by = 0;
+        float bw = 28;
+        float bh = 20;
+        return local.x >= bx && local.x <= bx + bw && local.y >= by && local.y <= by + bh;
+    }
+
     void rebindAndLoad(int dataIndex, const string& label, SyncState syncState,
-                       bool selected, bool isVideo, Font* font) {
+                       bool selected, bool isVideo, Font* font, int stackSize = 0) {
         // Cancel pending load for old data
         if (loadState_ == LoadState::Loading && onRequestUnload)
             onRequestUnload(entryIndex_);
@@ -220,6 +235,7 @@ public:
         setSyncState(syncState);
         setSelected(selected);
         setIsVideo(isVideo);
+        setStackSize(stackSize);
         label_->bgColor = isVideo ? Color(0.08f, 0.14f, 0.18f) : Color(0.12f, 0.12f, 0.14f);
         thumbnail_->clearImage();
 
@@ -286,6 +302,34 @@ public:
                 break;
         }
 
+        // Stack badge (top-right corner of thumbnail) - two overlapping rectangles
+        if (stackSize_ > 1) {
+            float bx = getWidth() - 22;
+            float by = 4;
+            float bw = 10, bh = 8;
+
+            // Back rectangle (offset)
+            setColor(0.6f, 0.6f, 0.65f, 0.7f);
+            noFill();
+            drawRect(bx + 3, by, bw, bh);
+
+            // Front rectangle
+            setColor(0.75f, 0.75f, 0.8f, 0.9f);
+            fill();
+            drawRect(bx, by + 3, bw, bh);
+            setColor(0.5f, 0.5f, 0.55f, 0.9f);
+            noFill();
+            drawRect(bx, by + 3, bw, bh);
+
+            // Count text
+            setColor(0.9f, 0.9f, 0.9f, 0.9f);
+            fill();
+            pushStyle();
+            setTextAlign(Direction::Left, Direction::Center);
+            drawBitmapString(to_string(stackSize_), bx + bw + 3, by + bh / 2 + 2);
+            popStyle();
+        }
+
         // CLIP similarity match border
         if (clipMatch_) {
             setColor(0.4f, 0.7f, 1.0f, 0.7f);  // light blue
@@ -341,6 +385,7 @@ private:
     bool isVideo_ = false;
     bool clipMatch_ = false;
     bool pastMouseOver = false;
+    int stackSize_ = 0;
     LoadState loadState_ = LoadState::Unloaded;
     SyncState syncState_ = SyncState::LocalOnly;
 };

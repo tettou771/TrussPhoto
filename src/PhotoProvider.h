@@ -125,6 +125,9 @@ public:
         }
         logNotice() << "[PhotoProvider] Library loaded from DB: " << photos_.size() << " photos";
 
+        // Rebuild stack index from persisted stack data
+        rebuildStackIndex();
+
         // Load face name cache
         loadFaceCache();
         loadFaceEmbeddingCache();
@@ -547,6 +550,34 @@ public:
             }
         }
 
+        // 2.5. If RAW/Video primary with JPG/HEIF companion, use companion for thumbnail
+        if (!photo.stackId.empty() && photo.stackPrimary && (photo.isRaw || photo.isVideo)) {
+            auto sit = stackIndex_.find(photo.stackId);
+            if (sit != stackIndex_.end()) {
+                for (auto& cid : sit->second) {
+                    if (cid == id) continue;
+                    auto cit = photos_.find(cid);
+                    if (cit == photos_.end()) continue;
+                    auto& companion = cit->second;
+                    if (companion.isRaw || companion.isVideo) continue;
+                    if (companion.localPath.empty() || !fs::exists(companion.localPath)) continue;
+                    // Found a JPG/HEIF companion - load it
+                    Pixels full;
+                    if (full.load(companion.localPath)) {
+                        int w = full.getWidth();
+                        int h = full.getHeight();
+                        if (w > THUMBNAIL_MAX_SIZE || h > THUMBNAIL_MAX_SIZE) {
+                            float scale = (float)THUMBNAIL_MAX_SIZE / max(w, h);
+                            resizePixels(full, (int)(w * scale), (int)(h * scale));
+                        }
+                        outPixels = std::move(full);
+                        saveThumbnailCache(id, photo, outPixels);
+                        return true;
+                    }
+                }
+            }
+        }
+
         // 3. Fallback: decode from local file
         if (!photo.localPath.empty() && fs::exists(photo.localPath)) {
             if (photo.isRaw) {
@@ -848,11 +879,138 @@ public:
         return deleted;
     }
 
+    // --- Stacking (RAW+JPG, Live Photo grouping) ---
+
+    // Resolve stacks: group entries by (dir, stem, dateTimeOriginal)
+    // and assign stack_id / stack_primary accordingly
+    int resolveStacks() {
+        // Group by (dir, lowercase_stem)
+        struct GroupKey {
+            string dir;
+            string stem;
+            bool operator==(const GroupKey& o) const { return dir == o.dir && stem == o.stem; }
+        };
+        struct GroupKeyHash {
+            size_t operator()(const GroupKey& k) const {
+                size_t h1 = hash<string>{}(k.dir);
+                size_t h2 = hash<string>{}(k.stem);
+                return h1 ^ (h2 << 1);
+            }
+        };
+
+        unordered_map<GroupKey, vector<string>, GroupKeyHash> groups;
+
+        for (auto& [id, photo] : photos_) {
+            if (photo.localPath.empty()) continue;
+            fs::path p(photo.localPath);
+            string dir = p.parent_path().string();
+            string stem = p.stem().string();
+            transform(stem.begin(), stem.end(), stem.begin(), ::tolower);
+            groups[{dir, stem}].push_back(id);
+        }
+
+        int stackCount = 0;
+        vector<pair<string, pair<string, bool>>> updates; // id -> (stackId, primary)
+
+        for (auto& [key, ids] : groups) {
+            if (ids.size() < 2) continue;
+
+            // Sub-group by dateTimeOriginal (must match exactly)
+            unordered_map<string, vector<string>> byDate;
+            for (auto& id : ids) {
+                auto& dt = photos_[id].dateTimeOriginal;
+                if (dt.empty()) continue; // skip entries without timestamp
+                byDate[dt].push_back(id);
+            }
+
+            for (auto& [dt, dateIds] : byDate) {
+                if (dateIds.size() < 2) continue;
+
+                // Category: RAW=2, Video=1, Image(JPG/HEIF/PNG)=0
+                // Same-category groups are NOT stacked
+                auto typeCategory = [this](const string& id) -> int {
+                    auto& p = photos_[id];
+                    if (p.isRaw) return 2;
+                    if (p.isVideo) return 1;
+                    return 0; // JPG, HEIF, PNG, etc. — all same category
+                };
+
+                // Check if all entries are the same category
+                int firstCat = typeCategory(dateIds[0]);
+                bool allSame = true;
+                for (size_t i = 1; i < dateIds.size(); i++) {
+                    if (typeCategory(dateIds[i]) != firstCat) {
+                        allSame = false;
+                        break;
+                    }
+                }
+                if (allSame) continue; // e.g. RAW+RAW or JPG+JPG — don't stack
+
+                // Sort by priority: RAW > Video > Image, then by fileSize
+                sort(dateIds.begin(), dateIds.end(), [&](const string& a, const string& b) {
+                    int ca = typeCategory(a), cb = typeCategory(b);
+                    if (ca != cb) return ca > cb;
+                    return photos_[a].fileSize > photos_[b].fileSize;
+                });
+
+                string primaryId = dateIds[0];
+                string stackId = primaryId; // use primary's ID as stack_id
+
+                for (size_t i = 0; i < dateIds.size(); i++) {
+                    bool isPrimary = (i == 0);
+                    updates.push_back({dateIds[i], {stackId, isPrimary}});
+                }
+                stackCount++;
+            }
+        }
+
+        // Apply updates to memory + DB
+        if (!updates.empty()) {
+            for (auto& [id, val] : updates) {
+                auto& photo = photos_[id];
+                photo.stackId = val.first;
+                photo.stackPrimary = val.second;
+                db_.updateStackId(id, val.first, val.second);
+            }
+            // Build stack index
+            rebuildStackIndex();
+            logNotice() << "[PhotoProvider] Resolved " << stackCount << " stacks ("
+                        << updates.size() << " entries)";
+        }
+        return stackCount;
+    }
+
+    // Get companion IDs for a stacked photo
+    vector<string> getStackCompanions(const string& id) const {
+        auto it = photos_.find(id);
+        if (it == photos_.end() || it->second.stackId.empty()) return {};
+
+        auto sit = stackIndex_.find(it->second.stackId);
+        if (sit == stackIndex_.end()) return {};
+
+        vector<string> result;
+        for (auto& cid : sit->second) {
+            if (cid != id) result.push_back(cid);
+        }
+        return result;
+    }
+
+    // Get stack size for a photo (0 = not stacked)
+    int getStackSize(const string& id) const {
+        auto it = photos_.find(id);
+        if (it == photos_.end() || it->second.stackId.empty()) return 0;
+        auto sit = stackIndex_.find(it->second.stackId);
+        return sit != stackIndex_.end() ? (int)sit->second.size() : 0;
+    }
+
     // Get sorted photo list (by dateTimeOriginal descending, newest first)
+    // Stacked non-primary entries are excluded from the result
     vector<string> getSortedIds() const {
         vector<string> ids;
         ids.reserve(photos_.size());
         for (const auto& [id, photo] : photos_) {
+            // Filter out non-primary stacked entries
+            if (!photo.stackId.empty() && !photo.stackPrimary) continue;
             ids.push_back(id);
         }
         sort(ids.begin(), ids.end(), [this](const string& a, const string& b) {
@@ -2080,6 +2238,15 @@ public:
     }
 
 private:
+    void rebuildStackIndex() {
+        stackIndex_.clear();
+        for (auto& [id, photo] : photos_) {
+            if (!photo.stackId.empty()) {
+                stackIndex_[photo.stackId].push_back(id);
+            }
+        }
+    }
+
     // Load person id->name mapping from DB
     unordered_map<int, string> loadPersonIdToName() {
         return db_.loadPersonIdToName();
@@ -2088,6 +2255,7 @@ private:
     HttpClient client_;
     PhotoDatabase db_;
     unordered_map<string, PhotoEntry> photos_;
+    unordered_map<string, vector<string>> stackIndex_; // stackId -> member ids
     string thumbnailCacheDir_;
     string databasePath_;
     string jsonMigrationPath_;

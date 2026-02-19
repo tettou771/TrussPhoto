@@ -72,6 +72,9 @@ void tcApp::setup() {
                     << " missing_files=" << result.stats.missingFile
                     << " faces=" << facesAdded
                     << " persons=" << result.stats.persons;
+
+        // Resolve stacks after lrcat import (RAW+JPG, Live Photo grouping)
+        provider_.resolveStacks();
     }
 
     // 7. Save bootstrap (remember catalog path for next launch)

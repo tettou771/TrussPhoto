@@ -21,6 +21,7 @@ public:
     // Callbacks
     function<void(int)> onItemClick;           // normal click -> full view
     function<void(vector<string>)> onDeleteRequest;  // delete selected photos
+    function<void(const string&)> onCompanionClick;  // companion photo id -> full view
 
     PhotoGrid() {
         itemWidth_ = 140;
@@ -259,7 +260,8 @@ protected:
         item->setClipMatch(clipMatch);
 
         bool video = photo ? photo->isVideo : false;
-        item->rebindAndLoad(dataIdx, stem, sync, selected, video, &labelFont_);
+        int stackSize = provider_->getStackSize(photoIds_[dataIdx]);
+        item->rebindAndLoad(dataIdx, stem, sync, selected, video, &labelFont_, stackSize);
     }
 
     void onUnbind(int dataIdx, ItemPtr& item) override {
@@ -275,6 +277,24 @@ protected:
     void onUpdate() override {
         scrollBar_->updateFromContainer();
         processLoadResults();
+        updateStackHover();
+    }
+
+    void endDraw() override {
+        drawCompanionPreview();
+    }
+
+    bool onMousePress(Vec2 local, int button) override {
+        // Check companion preview click
+        if (companionVisible_ && button == 0 && !companionId_.empty()) {
+            if (companionRect_.contains(local.x, local.y)) {
+                if (onCompanionClick) {
+                    onCompanionClick(companionId_);
+                }
+                return true;
+            }
+        }
+        return RecyclerGrid<PhotoItem>::onMousePress(local, button);
     }
 
     Vec2 getItemPosition(int dataIdx) override {
@@ -307,6 +327,153 @@ private:
     // --- Grid params ---
     float itemSize_ = 140;
 
+    // --- Stack hover preview ---
+    int hoverDataIdx_ = -1;          // data index currently hovered on badge
+    uint64_t hoverTimerId_ = 0;      // callAfter timer id
+    bool companionVisible_ = false;  // is companion preview showing
+    int companionDataIdx_ = -1;      // data index of the hovered primary
+    string companionId_;             // photo id of companion to show
+    Texture companionTexture_;       // loaded companion thumbnail
+    bool companionLoading_ = false;
+    Rect companionRect_;             // screen rect for click detection
+
+    // =========================================================================
+    // Stack hover management
+    // =========================================================================
+
+    void updateStackHover() {
+        if (!provider_) return;
+
+        // Find which pool item the mouse is over
+        int hoveredIdx = -1;
+        for (auto& [dataIdx, poolIdx] : poolMap_) {
+            auto& item = pool_[poolIdx];
+            if (!item->getActive()) continue;
+            if (!item->isStacked()) continue;
+            if (!item->isMouseOver()) continue;
+
+            // Check if mouse is over the badge area
+            Vec2 mouseLocal(item->getMouseX(), item->getMouseY());
+            if (item->isOverStackBadge(mouseLocal)) {
+                hoveredIdx = dataIdx;
+            }
+            break;
+        }
+
+        if (hoveredIdx != hoverDataIdx_) {
+            // Hover target changed
+            if (hoverTimerId_ != 0) {
+                cancelTimer(hoverTimerId_);
+                hoverTimerId_ = 0;
+            }
+            companionVisible_ = false;
+            companionTexture_.clear();
+            companionLoading_ = false;
+
+            hoverDataIdx_ = hoveredIdx;
+
+            if (hoveredIdx >= 0) {
+                // Start delay timer
+                int idx = hoveredIdx;
+                hoverTimerId_ = callAfter(0.5, [this, idx]() {
+                    hoverTimerId_ = 0;
+                    showCompanionPreview(idx);
+                });
+            }
+            redraw();
+        }
+    }
+
+    void showCompanionPreview(int dataIdx) {
+        if (!provider_ || dataIdx < 0 || dataIdx >= (int)photoIds_.size()) return;
+
+        auto companions = provider_->getStackCompanions(photoIds_[dataIdx]);
+        if (companions.empty()) return;
+
+        companionDataIdx_ = dataIdx;
+        companionId_ = companions[0]; // show first companion
+        companionVisible_ = true;
+
+        // Load companion thumbnail in background
+        companionLoading_ = true;
+        loader_.requestLoad(-1000 - dataIdx, companionId_);
+        redraw();
+    }
+
+    void drawCompanionPreview() {
+        if (!companionVisible_ || companionDataIdx_ < 0) {
+            companionRect_ = {0, 0, 0, 0};
+            return;
+        }
+
+        auto it = poolMap_.find(companionDataIdx_);
+        if (it == poolMap_.end()) return;
+
+        auto& item = pool_[it->second];
+        if (!item->getActive()) return;
+
+        // Position: offset from the primary item, bottom-right
+        Vec2 itemContentPos = getItemPosition(companionDataIdx_);
+        float scrollY = scrollContainer_->getScrollY();
+
+        float previewSize = itemSize_ * 0.7f;
+        float ox = itemContentPos.x + item->getWidth() * 0.5f;
+        float oy = itemContentPos.y + item->getHeight() * 0.5f - scrollY;
+
+        // Clamp to grid bounds
+        if (ox + previewSize > getWidth()) ox = getWidth() - previewSize - 4;
+        if (oy + previewSize > getHeight()) oy = getHeight() - previewSize - 4;
+
+        // Record rect for click detection
+        companionRect_ = {ox, oy, previewSize, previewSize};
+
+        // Shadow
+        setColor(0.0f, 0.0f, 0.0f, 0.4f);
+        fill();
+        drawRect(ox + 2, oy + 2, previewSize, previewSize);
+
+        // Background
+        setColor(0.15f, 0.15f, 0.18f);
+        fill();
+        drawRect(ox, oy, previewSize, previewSize);
+
+        // Draw companion thumbnail
+        if (companionTexture_.isAllocated()) {
+            setColor(1.0f, 1.0f, 1.0f);
+            float tw = companionTexture_.getWidth();
+            float th = companionTexture_.getHeight();
+            float scale = min(previewSize / tw, previewSize / th);
+            float dw = tw * scale, dh = th * scale;
+            float dx = ox + (previewSize - dw) / 2;
+            float dy = oy + (previewSize - dh) / 2;
+            companionTexture_.draw(dx, dy, dw, dh);
+        } else {
+            // Loading placeholder
+            setColor(0.3f, 0.3f, 0.35f);
+            fill();
+            drawRect(ox + 4, oy + 4, previewSize - 8, previewSize - 8);
+        }
+
+        // Border
+        setColor(0.5f, 0.5f, 0.55f);
+        noFill();
+        drawRect(ox, oy, previewSize, previewSize);
+
+        // Label
+        auto* photo = provider_->getPhoto(companionId_);
+        if (photo) {
+            string ext = fs::path(photo->filename).extension().string();
+            transform(ext.begin(), ext.end(), ext.begin(), ::toupper);
+            if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
+            setColor(0.8f, 0.8f, 0.85f);
+            fill();
+            pushStyle();
+            setTextAlign(Direction::Center, Direction::Top);
+            drawBitmapString(ext, ox + previewSize / 2, oy + previewSize + 2);
+            popStyle();
+        }
+    }
+
     // =========================================================================
     // Load management
     // =========================================================================
@@ -320,6 +487,16 @@ private:
         LoadResult result;
         while (loader_.tryGetResult(result)) {
             if (!result.success) continue;
+
+            // Companion preview load result (negative IDs)
+            if (result.id < -999) {
+                if (companionLoading_ && companionVisible_) {
+                    companionTexture_.allocate(result.pixels, TextureUsage::Immutable);
+                    companionLoading_ = false;
+                    redraw();
+                }
+                continue;
+            }
 
             auto it = poolMap_.find(result.id);
             if (it == poolMap_.end()) continue;
