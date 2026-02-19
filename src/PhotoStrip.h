@@ -9,6 +9,7 @@
 #include "PhotoProvider.h"
 #include "AsyncImageLoader.h"
 #include "FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
+#include "Constants.h"   // for SELECTION_COLOR
 using namespace std;
 using namespace tc;
 
@@ -52,16 +53,35 @@ public:
     void draw() override {
         // Selection border (bright orange, thick)
         if (selected_) {
-            setColor(0.95f, 0.6f, 0.15f);
+            setColor(SEL_R, SEL_G, SEL_B);
             fill();
             drawRect(0, 0, size_, size_);
         }
-        // GPS-missing border (gray)
-        else if (!hasGps_) {
-            setColor(0.4f, 0.4f, 0.42f);
+    }
+
+    void endDraw() override {
+        // No-GPS indicator: circle with diagonal line (top-left area)
+        if (!hasGps_) {
+            float iconSize = min(16.0f, size_ * 0.25f);
+            float cx = 2 + iconSize * 0.5f + 2;
+            float cy = 2 + iconSize * 0.5f + 2;
+            float r = iconSize * 0.5f;
+
+            // Dark backdrop
+            setColor(0.0f, 0.0f, 0.0f, 0.5f);
             fill();
-            drawRect(0, 0, size_, size_);
+            drawRect(cx - r - 2, cy - r - 2, iconSize + 4, iconSize + 4);
+
+            // Light gray circle + diagonal line
+            setColor(0.7f, 0.7f, 0.72f);
+            noFill();
+            setStrokeWeight(1.5f);
+            drawCircle(cx, cy, r);
+            drawLine(cx - r * 0.7f, cy - r * 0.7f,
+                     cx + r * 0.7f, cy + r * 0.7f);
+            fill();  // restore fill state
         }
+        RectNode::endDraw();
     }
 
 protected:
@@ -170,8 +190,15 @@ public:
     void setSize(float w, float h) override {
         RectNode::setSize(w, h);
         scrollContainer_->setRect(0, 0, w, h);
-        recalcLayout();
-        updateVisibleRange();
+
+        float newItemSize = calcItemSize();
+        if (!pool_.empty() && abs(newItemSize - itemSize_) > 0.5f) {
+            // Item size changed — rebuild pool with correct sizes
+            rebuildPool();
+        } else {
+            recalcLayout();
+            updateVisibleRange();
+        }
     }
 
     void shutdown() {

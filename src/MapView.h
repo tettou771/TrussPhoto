@@ -9,6 +9,7 @@
 #include "PhotoEntry.h"
 #include "ViewContainer.h"
 #include "PhotoStrip.h"
+#include "Constants.h"   // for SEL_R/G/B
 #include "FolderTree.h"  // for loadJapaneseFont
 #include <deque>
 #include <thread>
@@ -38,12 +39,50 @@ public:
 
     void setPhotos(const vector<PhotoEntry>& photos, const vector<string>& ids) {
         pins_.clear();
+        selectedPinIdx_ = -1;
         for (size_t i = 0; i < photos.size(); i++) {
             if (photos[i].hasGps()) {
                 pins_.push_back({photos[i].latitude, photos[i].longitude, (int)i, ids[i]});
             }
         }
         clusterZoom_ = -999;
+    }
+
+    // Select a pin by photoId. Returns true if the photo has GPS (pin found).
+    bool selectPin(const string& photoId) {
+        selectedPinIdx_ = -1;
+        for (size_t i = 0; i < pins_.size(); i++) {
+            if (pins_[i].photoId == photoId) {
+                selectedPinIdx_ = (int)i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Center map on pin if it's outside the viewport. Keep zoom level, animate.
+    void centerOnSelectedPin() {
+        if (selectedPinIdx_ < 0 || selectedPinIdx_ >= (int)pins_.size()) return;
+        auto& pin = pins_[selectedPinIdx_];
+
+        // Check if pin is within the visible viewport (with margin)
+        auto pinPx = latLonToPixel(pin.lat, pin.lon, zoom_);
+        auto centerPx = latLonToPixel(centerLat_, centerLon_, zoom_);
+        float halfW = getWidth() / 2.0f;
+        float halfH = getHeight() / 2.0f;
+        float margin = 40.0f;
+
+        float dx = pinPx.x - centerPx.x;
+        float dy = pinPx.y - centerPx.y;
+        if (abs(dx) < halfW - margin && abs(dy) < halfH - margin) return;
+
+        // Animate to pin location
+        panAnimating_ = true;
+        panFromLat_ = centerLat_;
+        panFromLon_ = centerLon_;
+        panToLat_ = pin.lat;
+        panToLon_ = pin.lon;
+        panProgress_ = 0.0f;
     }
 
     void setTileCacheDir(const string& dir) {
@@ -124,6 +163,20 @@ public:
                 hasQueue = !tileQueue_.empty();
             }
             if (hasQueue) startTileThread();
+        }
+
+        // Pan animation
+        if (panAnimating_) {
+            panProgress_ += 0.04f;  // ~15 frames at 60fps
+            if (panProgress_ >= 1.0f) {
+                panProgress_ = 1.0f;
+                panAnimating_ = false;
+            }
+            // Ease out cubic
+            float t = 1.0f - (1.0f - panProgress_) * (1.0f - panProgress_) * (1.0f - panProgress_);
+            centerLat_ = panFromLat_ + (panToLat_ - panFromLat_) * t;
+            centerLon_ = panFromLon_ + (panToLon_ - panFromLon_) * t;
+            if (onRedraw) onRedraw();
         }
     }
 
@@ -407,6 +460,15 @@ private:
     Vec2 dragStart_;
     double dragStartLat_ = 0, dragStartLon_ = 0;
 
+    // Selected pin
+    int selectedPinIdx_ = -1;
+
+    // Pan animation
+    bool panAnimating_ = false;
+    double panFromLat_ = 0, panFromLon_ = 0;
+    double panToLat_ = 0, panToLon_ = 0;
+    float panProgress_ = 0;
+
     chrono::steady_clock::time_point lastPinClickTime_;
     int lastPinClickIndex_ = -1;
 
@@ -478,41 +540,75 @@ private:
         float qLeft = centerPxQ.x * (float)scaleFactor - w / 2.0f;
         float qTop  = centerPxQ.y * (float)scaleFactor - h / 2.0f;
 
-        for (const auto& cluster : cachedClusters_) {
-            float sx = cluster.wx * (float)scaleFactor - qLeft;
-            float sy = cluster.wy * (float)scaleFactor - qTop;
-
-            if (sx < -30 || sx > w + 30 || sy < -30 || sy > h + 30) continue;
-
-            float r = PIN_RADIUS;
-            string label;
-            if (cluster.count >= 1000) {
-                r = PIN_RADIUS + 6;
-                label = format("{:.0f}k", cluster.count / 1000.0f);
-            } else if (cluster.count >= 100) {
-                r = PIN_RADIUS + 4;
-                label = to_string(cluster.count);
-            } else if (cluster.count > 1) {
-                label = to_string(cluster.count);
+        // Find which cluster contains the selected pin (to draw it last)
+        int selectedClusterIdx = -1;
+        if (selectedPinIdx_ >= 0) {
+            for (size_t ci = 0; ci < cachedClusters_.size(); ci++) {
+                auto& c = cachedClusters_[ci];
+                if (c.count == 1 && c.firstPinIdx == selectedPinIdx_) {
+                    selectedClusterIdx = (int)ci;
+                    break;
+                }
             }
+        }
 
-            setColor(0.0f, 0.0f, 0.0f, 0.3f);
-            fill();
-            drawCircle(sx + 1, sy + 1, r);
+        // Draw all non-selected pins first
+        for (size_t ci = 0; ci < cachedClusters_.size(); ci++) {
+            if ((int)ci == selectedClusterIdx) continue;
+            drawSingleCluster(cachedClusters_[ci], scaleFactor, qLeft, qTop, w, h, false);
+        }
 
+        // Draw selected pin last (on top)
+        if (selectedClusterIdx >= 0) {
+            drawSingleCluster(cachedClusters_[selectedClusterIdx], scaleFactor,
+                              qLeft, qTop, w, h, true);
+        }
+    }
+
+    void drawSingleCluster(const Cluster& cluster, double scaleFactor,
+                           float qLeft, float qTop, float w, float h,
+                           bool isSelected) {
+        float sx = cluster.wx * (float)scaleFactor - qLeft;
+        float sy = cluster.wy * (float)scaleFactor - qTop;
+
+        if (sx < -30 || sx > w + 30 || sy < -30 || sy > h + 30) return;
+
+        float r = PIN_RADIUS;
+        string label;
+        if (cluster.count >= 1000) {
+            r = PIN_RADIUS + 6;
+            label = format("{:.0f}k", cluster.count / 1000.0f);
+        } else if (cluster.count >= 100) {
+            r = PIN_RADIUS + 4;
+            label = to_string(cluster.count);
+        } else if (cluster.count > 1) {
+            label = to_string(cluster.count);
+        }
+
+        // Shadow
+        setColor(0.0f, 0.0f, 0.0f, 0.3f);
+        fill();
+        drawCircle(sx + 1, sy + 1, r);
+
+        // Pin body
+        if (isSelected) {
+            setColor(SEL_R, SEL_G, SEL_B);
+            r += 2;  // slightly larger for selected
+        } else {
             setColor(PIN_COLOR);
-            fill();
-            drawCircle(sx, sy, r);
+        }
+        fill();
+        drawCircle(sx, sy, r);
 
-            if (cluster.count == 1) {
-                setColor(1.0f, 1.0f, 1.0f);
-                fill();
-                drawCircle(sx, sy, 3);
-            } else {
-                setColor(1.0f, 1.0f, 1.0f);
-                fontSmall_.drawString(label, sx, sy + 2,
-                    Direction::Center, Direction::Center);
-            }
+        // Inner dot or label
+        if (cluster.count == 1) {
+            setColor(1.0f, 1.0f, 1.0f);
+            fill();
+            drawCircle(sx, sy, 3);
+        } else {
+            setColor(1.0f, 1.0f, 1.0f);
+            fontSmall_.drawString(label, sx, sy + 2,
+                Direction::Center, Direction::Center);
         }
     }
 
@@ -672,6 +768,7 @@ public:
 
     void setStripSelection(const string& photoId) {
         strip_->selectPhoto(photoId);
+        canvas_->selectPin(photoId);
     }
 
     void setTileCacheDir(const string& dir) {
@@ -696,9 +793,12 @@ public:
         addChild(canvas_);
         addChild(strip_);
 
-        // Forward callbacks
+        // Forward callbacks: map pin click → select strip + metadata
         canvas_->onPinClick = [this](int idx, const string& id) {
+            canvas_->selectPin(id);
+            strip_->selectPhoto(id);
             if (onPinClick) onPinClick(idx, id);
+            if (onRedraw) onRedraw();
         };
         canvas_->onPinDoubleClick = [this](int idx, const string& id) {
             if (onPinDoubleClick) onPinDoubleClick(idx, id);
@@ -706,8 +806,15 @@ public:
         canvas_->onRedraw = [this]() {
             if (onRedraw) onRedraw();
         };
+
+        // Strip click → select pin + center map if GPS
         strip_->onPhotoClick = [this](int idx, const string& id) {
+            bool hasGps = canvas_->selectPin(id);
+            if (hasGps) {
+                canvas_->centerOnSelectedPin();
+            }
             if (onPinClick) onPinClick(idx, id);
+            if (onRedraw) onRedraw();
         };
 
         layoutChildren();
