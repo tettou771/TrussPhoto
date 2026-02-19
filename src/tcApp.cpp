@@ -858,6 +858,18 @@ void tcApp::keyPressed(int key) {
             }
         } else if (key == 'A' || key == 'a') {
             mapView->runAutoGeotag();
+        } else if (key == SAPP_KEYCODE_BACKSPACE || key == SAPP_KEYCODE_DELETE) {
+            string photoId = mapView->selectedPhotoId();
+            if (!photoId.empty()) {
+                confirmDialogAsync("Remove Geotag",
+                    "Remove geotag from the selected photo?",
+                    [this, photoId](bool yes) {
+                        if (yes) {
+                            viewManager_->mapView()->removeGeotag(photoId, provider_);
+                            redraw();
+                        }
+                    });
+            }
         }
     } else if (viewMode() == ViewMode::Grid) {
         // Grid mode: if search bar is active, only handle ESC

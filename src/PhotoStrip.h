@@ -19,6 +19,7 @@ public:
     using Ptr = shared_ptr<StripItem>;
 
     function<void()> onClick;
+    function<void(float globalX, float globalY)> onDragMove;
     function<void(float globalX, float globalY)> onDragEnd;
 
     StripItem(float size) : size_(size) {
@@ -99,10 +100,11 @@ protected:
     bool onMousePress(Vec2 local, int button) override {
         if (button != 0) return RectNode::onMousePress(local, button);
         if (!hasGps_ && !hasProvisionalGeotag_) {
-            // GPS-less photo: start drag detection
+            // GPS-less photo: start drag detection, select immediately
             dragPending_ = true;
             isDragging_ = false;
             dragStartPos_ = local;
+            if (onClick) onClick();  // select on press
         }
         return true;
     }
@@ -114,6 +116,11 @@ protected:
         if (!isDragging_ && (dx * dx + dy * dy) > 25.0f) {  // > 5px
             isDragging_ = true;
         }
+        if (isDragging_ && onDragMove) {
+            float gx, gy;
+            localToGlobal(local.x, local.y, gx, gy);
+            onDragMove(gx, gy);
+        }
         return isDragging_;
     }
 
@@ -123,8 +130,10 @@ protected:
             float gx, gy;
             localToGlobal(local.x, local.y, gx, gy);
             onDragEnd(gx, gy);
+        } else if (!isDragging_ && dragPending_) {
+            // Already selected on press, no extra action needed
         } else if (!isDragging_ && onClick) {
-            onClick();
+            onClick();  // normal click (GPS photo)
         }
         dragPending_ = false;
         isDragging_ = false;
@@ -151,6 +160,7 @@ public:
     using Ptr = shared_ptr<PhotoStrip>;
 
     function<void(int stripIndex, const string& photoId)> onPhotoClick;
+    function<void(int stripIndex, const string& photoId, float globalX, float globalY)> onDragMove;
     function<void(int stripIndex, const string& photoId, float globalX, float globalY)> onDragEnd;
 
     PhotoStrip() {
@@ -196,6 +206,18 @@ public:
                 if (it != poolMap_.end()) {
                     pool_[it->second]->setHasProvisionalGeotag(has);
                 }
+                break;
+            }
+        }
+    }
+
+    // Mark a photo as now having GPS (update data + visible pool item)
+    void setHasGps(const string& photoId, bool v) {
+        for (size_t i = 0; i < photoIds_.size(); i++) {
+            if (photoIds_[i] == photoId) {
+                if (i < hasGps_.size()) hasGps_[i] = v;
+                auto it = poolMap_.find((int)i);
+                if (it != poolMap_.end()) pool_[it->second]->setHasGps(v);
                 break;
             }
         }
@@ -389,6 +411,12 @@ private:
 
                 if (onPhotoClick) onPhotoClick(dataIdx, photoIds_[dataIdx]);
                 redraw();
+            };
+
+            item->onDragMove = [this, poolIdx](float gx, float gy) {
+                int dataIdx = reverseMap_[poolIdx];
+                if (dataIdx < 0) return;
+                if (onDragMove) onDragMove(dataIdx, photoIds_[dataIdx], gx, gy);
             };
 
             item->onDragEnd = [this, poolIdx](float gx, float gy) {

@@ -116,6 +116,29 @@ public:
         return false;
     }
 
+    // Get selected pin's photoId (empty if none)
+    string selectedPhotoId() const {
+        if (selectedPinIdx_ >= 0 && selectedPinIdx_ < (int)pins_.size())
+            return pins_[selectedPinIdx_].photoId;
+        return "";
+    }
+
+    // Remove a pin by photoId and return true if found
+    bool removePin(const string& photoId) {
+        for (auto it = pins_.begin(); it != pins_.end(); ++it) {
+            if (it->photoId == photoId) {
+                bool wasSelected = (selectedPinIdx_ == (int)(it - pins_.begin()));
+                pins_.erase(it);
+                clusterZoom_ = -999;
+                if (wasSelected) selectedPinIdx_ = -1;
+                else if (selectedPinIdx_ >= (int)pins_.size()) selectedPinIdx_ = -1;
+                if (onRedraw) onRedraw();
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Center map on pin if it's outside the viewport. Keep zoom level, animate.
     void centerOnSelectedPin() {
         if (selectedPinIdx_ < 0 || selectedPinIdx_ >= (int)pins_.size()) return;
@@ -202,21 +225,32 @@ public:
     }
 
     void clearProvisionalPins() {
-        for (auto& pp : provisionalPins_) removeChild(pp);
+        for (auto& pp : provisionalPins_) pp->destroy();
         provisionalPins_.clear();
         if (onRedraw) onRedraw();
     }
 
-    // Mark pin for deferred removal via destroy() — safe from inside event handler
     void confirmPin(ProvisionalPin* pin) {
         if (!pin) return;
         if (onGeotagConfirm) onGeotagConfirm(pin->photoId, pin->lat, pin->lon);
         pins_.push_back({pin->lat, pin->lon, pin->photoIndex, pin->photoId});
         clusterZoom_ = -999;
-        pin->destroy();  // deferred removal by framework
+        selectPin(pin->photoId);
+        pin->destroy();
     }
 
-    // Sweep dead provisional pins (call from update)
+    void confirmAllPins() {
+        for (auto& pp : provisionalPins_) {
+            if (onGeotagConfirm) onGeotagConfirm(pp->photoId, pp->lat, pp->lon);
+            pins_.push_back({pp->lat, pp->lon, pp->photoIndex, pp->photoId});
+            pp->destroy();
+        }
+        provisionalPins_.clear();
+        clusterZoom_ = -999;
+        if (onRedraw) onRedraw();
+    }
+
+    // Sweep destroyed provisional pins from our tracking vector (framework handles scene graph)
     void sweepDeadPins() {
         auto it = std::remove_if(provisionalPins_.begin(), provisionalPins_.end(),
             [](const ProvisionalPin::Ptr& pp) { return pp->isDead(); });
@@ -224,17 +258,6 @@ public:
             provisionalPins_.erase(it, provisionalPins_.end());
             if (onRedraw) onRedraw();
         }
-    }
-
-    void confirmAllPins() {
-        for (auto& pp : provisionalPins_) {
-            if (onGeotagConfirm) onGeotagConfirm(pp->photoId, pp->lat, pp->lon);
-            pins_.push_back({pp->lat, pp->lon, pp->photoIndex, pp->photoId});
-            removeChild(pp);
-        }
-        provisionalPins_.clear();
-        clusterZoom_ = -999;
-        if (onRedraw) onRedraw();
     }
 
     bool hasProvisionalPins() const { return !provisionalPins_.empty(); }
@@ -983,6 +1006,17 @@ public:
 
     bool hasProvisionalPins() const { return canvas_->hasProvisionalPins(); }
 
+    // Get the selected pin's photoId (empty if none)
+    string selectedPhotoId() const { return canvas_->selectedPhotoId(); }
+
+    // Remove geotag from a photo: clear GPS in provider, remove pin from map, update strip
+    void removeGeotag(const string& photoId, PhotoProvider& provider) {
+        provider.setGps(photoId, 0, 0);
+        canvas_->removePin(photoId);
+        strip_->setHasGps(photoId, false);
+        logNotice() << "[MapView] Geotag removed: " << photoId;
+    }
+
     void clearProvisionalPins() {
         // Reset strip indicators
         for (auto& pp : canvas_->provisionalPins()) {
@@ -992,9 +1026,9 @@ public:
     }
 
     void confirmAllPins() {
-        // Mark strip items as having confirmed GPS (remove provisional indicator)
         for (auto& pp : canvas_->provisionalPins()) {
             strip_->setProvisionalGeotag(pp->photoId, false);
+            strip_->setHasGps(pp->photoId, true);
         }
         canvas_->confirmAllPins();
     }
@@ -1147,6 +1181,7 @@ public:
         };
         canvas_->onGeotagConfirm = [this](const string& id, double lat, double lon) {
             strip_->setProvisionalGeotag(id, false);
+            strip_->setHasGps(id, true);
             if (onGeotagConfirm) onGeotagConfirm(id, lat, lon);
         };
         canvas_->onRedraw = [this]() {
@@ -1163,19 +1198,27 @@ public:
             if (onRedraw) onRedraw();
         };
 
-        // Strip drag → create provisional pin on map
+        // Strip drag move → ghost indicator
+        strip_->onDragMove = [this](int idx, const string& id, float gx, float gy) {
+            dragActive_ = true;
+            dragGlobalX_ = gx;
+            dragGlobalY_ = gy;
+            if (onRedraw) onRedraw();
+        };
+
+        // Strip drag end → create provisional pin on map
         strip_->onDragEnd = [this](int idx, const string& id, float gx, float gy) {
-            // Convert global coords to canvas local
+            dragActive_ = false;
+
             float cx, cy;
             canvas_->globalToLocal(gx, gy, cx, cy);
 
-            // Check if drop landed on canvas area
             if (cx >= 0 && cx <= canvas_->getWidth() && cy >= 0 && cy <= canvas_->getHeight()) {
                 auto [lat, lon] = canvas_->screenToLatLon(cx, cy);
                 canvas_->addProvisionalPin(id, idx, lat, lon);
                 strip_->setProvisionalGeotag(id, true);
-                if (onRedraw) onRedraw();
             }
+            if (onRedraw) onRedraw();
         };
 
         layoutChildren();
@@ -1189,6 +1232,21 @@ public:
     bool wantsSearchBar() const override { return false; }
     bool wantsLeftSidebar() const override { return false; }
 
+    void endDraw() override {
+        // Ghost indicator during drag
+        if (dragActive_) {
+            float lx, ly;
+            globalToLocal(dragGlobalX_, dragGlobalY_, lx, ly);
+            setColor(0.3f, 0.65f, 1.0f, 0.5f);
+            fill();
+            drawCircle(lx, ly, 10);
+            setColor(1.0f, 1.0f, 1.0f, 0.7f);
+            fill();
+            drawCircle(lx, ly, 3);
+        }
+        RectNode::endDraw();
+    }
+
     void shutdown() {
         if (canvas_) canvas_->shutdown();
         if (strip_) strip_->shutdown();
@@ -1201,6 +1259,10 @@ private:
     // Keep a copy of photo data for auto-geotag
     vector<PhotoEntry> photos_;
     vector<string> photoIds_;
+
+    // Drag ghost state
+    bool dragActive_ = false;
+    float dragGlobalX_ = 0, dragGlobalY_ = 0;
 
     void layoutChildren() {
         if (canvas_) canvas_->setRect(0, 0, getWidth(), mapHeight());
