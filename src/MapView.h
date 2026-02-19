@@ -36,7 +36,7 @@ struct GpxTrackPoint {
 
 struct GpxTrack {
     vector<GpxTrackPoint> points;
-    Color color = Color(0.2f, 0.7f, 1.0f, 0.8f);
+    Color color = Color(0.55f, 0.0f, 1.0f, 0.8f);  // vivid purple
     float width = 3.0f;
 };
 
@@ -55,7 +55,8 @@ public:
     double lat = 0, lon = 0;
 
     static constexpr float SIZE = 20.0f;
-    inline static const Color COLOR = Color(0.3f, 0.65f, 1.0f);
+    static constexpr float ANIM_DURATION = 0.3f;
+    inline static const Color COLOR = Color(0.55f, 0.0f, 1.0f, 1.0f);  // vivid purple
 
     ProvisionalPin(const string& id, int idx, double lat_, double lon_,
                    MapCanvas* canvas)
@@ -66,32 +67,49 @@ public:
 
     void setSelected(bool v) { selected_ = v; }
     bool isSelected() const { return selected_; }
+    bool isAnimating() const { return (getElapsedTimef() - createdAt_) < ANIM_DURATION; }
 
     void draw() override {
         float cx = SIZE / 2;
         float cy = SIZE / 2;
 
-        // Orange selection ring
-        if (selected_) {
-            setColor(SEL_R, SEL_G, SEL_B);
-            fill();
-            drawCircle(cx, cy, 10);
-        } else {
-            // Shadow (only when not selected)
-            setColor(0.0f, 0.0f, 0.0f, 0.35f);
-            fill();
-            drawCircle(cx + 1, cy + 1, 7);
+        // Entry animation (scale bounce, 0.3s)
+        float age = getElapsedTimef() - createdAt_;
+        float scale = 1.0f;
+        if (age < ANIM_DURATION) {
+            float t = age / ANIM_DURATION;
+            // overshoot: 0→1.2→1.0 (easeOut back)
+            scale = 1.0f + 0.2f * sinf(t * TAU * 0.75f) * (1.0f - t);
         }
 
-        // Pin body (light blue)
-        setColor(COLOR);
-        fill();
-        drawCircle(cx, cy, 7);
+        // Red selection ring
+        if (selected_) {
+            setColor(0.9f, 0.2f, 0.2f);
+            fill();
+            drawCircle(cx, cy, 10 * scale);
+        }
 
-        // White inner dot
-        setColor(1.0f, 1.0f, 1.0f);
+        // Outer halo (ghost glow)
+        setColor(COLOR.r, COLOR.g, COLOR.b, 0.15f);
         fill();
-        drawCircle(cx, cy, 3);
+        drawCircle(cx, cy, 12.0f * scale);
+
+        // Shadow
+        if (!selected_) {
+            setColor(0.0f, 0.0f, 0.0f, 0.2f);
+            fill();
+            drawCircle(cx + 1, cy + 1, 7.0f * scale);
+        }
+
+        // Pin body (semi-transparent purple)
+        setColor(COLOR.r, COLOR.g, COLOR.b, 0.5f);
+        fill();
+        drawCircle(cx, cy, 7.0f * scale);
+
+        // Inner dot (white, ghostly)
+        setColor(1.0f, 1.0f, 1.0f, 0.6f);
+        fill();
+        drawCircle(cx, cy, 2.5f * scale);
     }
 
 protected:
@@ -101,6 +119,7 @@ protected:
 
 private:
     MapCanvas* canvas_;
+    float createdAt_ = getElapsedTimef();
     bool draggingPin_ = false;
     bool selected_ = false;
 };
@@ -229,6 +248,7 @@ public:
             }
         }
         clusterZoom_ = -999;
+        pinAppearTime_ = getElapsedTimef();
     }
 
     // Select a single pin by photoId. Returns true if the photo has GPS (pin found).
@@ -237,6 +257,7 @@ public:
         for (auto& pin : pins_) {
             if (pin.photoId == photoId) {
                 selectedPinIds_.insert(photoId);
+                selPinAppearTime_ = getElapsedTimef();
                 return true;
             }
         }
@@ -251,6 +272,7 @@ public:
         for (auto& id : photoIds) {
             if (pinIds.count(id)) selectedPinIds_.insert(id);
         }
+        if (!selectedPinIds_.empty()) selPinAppearTime_ = getElapsedTimef();
     }
 
     // Get first selected pin's photoId (empty if none)
@@ -395,6 +417,7 @@ public:
         if (onGeotagConfirm) onGeotagConfirm(pin->photoId, pin->lat, pin->lon);
         pins_.push_back({pin->lat, pin->lon, pin->photoIndex, pin->photoId});
         clusterZoom_ = -999;
+        pinAppearTime_ = getElapsedTimef();
         selectPin(pin->photoId);
         pin->destroy();
     }
@@ -407,6 +430,7 @@ public:
         }
         provisionalPins_.clear();
         clusterZoom_ = -999;
+        pinAppearTime_ = getElapsedTimef();
         if (onRedraw) onRedraw();
     }
 
@@ -449,6 +473,7 @@ public:
     void addPin(const string& photoId, int photoIndex, double lat, double lon) {
         pins_.push_back({lat, lon, photoIndex, photoId});
         clusterZoom_ = -999;
+        pinAppearTime_ = getElapsedTimef();
     }
 
     void fitGpxBounds() {
@@ -519,6 +544,7 @@ public:
         setClipping(true);
         loadJapaneseFont(font_, 12);
         loadJapaneseFont(fontSmall_, 10);
+        fontCluster_.load("/System/Library/Fonts/Supplemental/DIN Alternate Bold.ttf", 13);
         tileClient_.addHeader("User-Agent", "TrussPhoto/1.0");
 
         // Search bar
@@ -604,6 +630,21 @@ public:
                 if (onRedraw) onRedraw();
             }
         }
+
+        // Redraw while pin animations are running
+        bool animating = false;
+        for (auto& pp : provisionalPins_) {
+            if (pp->isAnimating()) { animating = true; break; }
+        }
+        if (!animating && pinAppearTime_ > 0) {
+            float pinAge = getElapsedTimef() - pinAppearTime_;
+            if (pinAge < PIN_ANIM_DURATION) animating = true;
+        }
+        if (!animating && selPinAppearTime_ > 0) {
+            float selAge = getElapsedTimef() - selPinAppearTime_;
+            if (selAge < PIN_ANIM_DURATION) animating = true;
+        }
+        if (animating && onRedraw) onRedraw();
     }
 
     void draw() override {
@@ -870,7 +911,11 @@ public:
 
 private:
     static constexpr float PIN_RADIUS = 7.0f;
-    inline static const Color PIN_COLOR = Color(0.9f, 0.2f, 0.2f);
+    inline static const Color PIN_COLOR = Color(1.0f, 0.5f, 0.0f);  // vivid orange
+    inline static const Color PIN_SEL_COLOR = Color(1.0f, 0.1f, 0.1f);  // vivid red (selected)
+    static constexpr float PIN_ANIM_DURATION = 0.35f;
+    float pinAppearTime_ = 0;
+    float selPinAppearTime_ = 0;
     static constexpr auto TILE_URL_BASE = "https://tile.openstreetmap.org";
     static constexpr auto NOMINATIM_URL = "https://nominatim.openstreetmap.org";
 
@@ -1004,6 +1049,7 @@ private:
 
     Font font_;
     Font fontSmall_;
+    Font fontCluster_;
 
     HttpClient tileClient_;
     mutex tileMutex_;
@@ -1116,6 +1162,9 @@ private:
     }
 
     void drawPins(float left, float top, float w, float h) {
+        pushStyle();
+        setCircleResolution(10);
+
         double qZoom = quantizeZoom(zoom_);
         if (qZoom != clusterZoom_) {
             rebuildClusters(qZoom);
@@ -1132,6 +1181,14 @@ private:
             drawCluster(cluster, scaleFactor, qLeft, qTop, w, h);
         }
 
+        // Pop animation for selected pins
+        float selAge = getElapsedTimef() - selPinAppearTime_;
+        float selScale = 1.0f;
+        if (selAge < PIN_ANIM_DURATION) {
+            float t = selAge / PIN_ANIM_DURATION;
+            selScale = 1.0f + 0.7f * sinf(t * TAU * 0.75f) * (1.0f - t);
+        }
+
         // Draw selected pins on top (independently from clusters)
         if (!selectedPinIds_.empty()) {
             for (auto& pin : pins_) {
@@ -1141,22 +1198,26 @@ private:
                 float sy = pinPx.y - top;
                 if (sx < -30 || sx > w + 30 || sy < -30 || sy > h + 30) continue;
 
+                float sr = 10 * selScale;
+
                 // Shadow
                 setColor(0.0f, 0.0f, 0.0f, 0.4f);
                 fill();
-                drawCircle(sx + 1, sy + 1, 10);
+                drawCircle(sx + 1, sy + 1, sr);
 
-                // Orange selection pin
-                setColor(SEL_R, SEL_G, SEL_B);
+                // Red selection pin
+                setColor(PIN_SEL_COLOR);
                 fill();
-                drawCircle(sx, sy, 10);
+                drawCircle(sx, sy, sr);
 
                 // White inner dot
                 setColor(1.0f, 1.0f, 1.0f);
                 fill();
-                drawCircle(sx, sy, 3);
+                drawCircle(sx, sy, 5 * selScale);
             }
         }
+
+        popStyle();
     }
 
     void drawCluster(const Cluster& cluster, double scaleFactor,
@@ -1166,13 +1227,21 @@ private:
 
         if (sx < -30 || sx > w + 30 || sy < -30 || sy > h + 30) return;
 
-        float r = PIN_RADIUS;
+        // Pop animation
+        float pinAge = getElapsedTimef() - pinAppearTime_;
+        float pinScale = 1.0f;
+        if (pinAge < PIN_ANIM_DURATION) {
+            float t = pinAge / PIN_ANIM_DURATION;
+            pinScale = 1.0f + 0.3f * sinf(t * TAU * 0.75f) * (1.0f - t);
+        }
+
+        float r = PIN_RADIUS * pinScale;
         string label;
         if (cluster.count >= 1000) {
-            r = PIN_RADIUS + 6;
+            r = (PIN_RADIUS + 6) * pinScale;
             label = format("{:.0f}k", cluster.count / 1000.0f);
         } else if (cluster.count >= 100) {
-            r = PIN_RADIUS + 4;
+            r = (PIN_RADIUS + 4) * pinScale;
             label = to_string(cluster.count);
         } else if (cluster.count > 1) {
             label = to_string(cluster.count);
@@ -1183,7 +1252,7 @@ private:
         fill();
         drawCircle(sx + 1, sy + 1, r);
 
-        // Pin body
+        // Pin body (orange)
         setColor(PIN_COLOR);
         fill();
         drawCircle(sx, sy, r);
@@ -1192,10 +1261,10 @@ private:
         if (cluster.count == 1) {
             setColor(1.0f, 1.0f, 1.0f);
             fill();
-            drawCircle(sx, sy, 3);
+            drawCircle(sx, sy, 3 * pinScale);
         } else {
             setColor(1.0f, 1.0f, 1.0f);
-            fontSmall_.drawString(label, sx, sy + 2,
+            fontCluster_.drawString(label, sx, sy,
                 Direction::Center, Direction::Center);
         }
     }
@@ -1709,10 +1778,11 @@ public:
         if (dragActive_) {
             float lx, ly;
             globalToLocal(dragGlobalX_, dragGlobalY_, lx, ly);
-            setColor(0.3f, 0.65f, 1.0f, 0.5f);
+            setColor(ProvisionalPin::COLOR.r, ProvisionalPin::COLOR.g,
+                     ProvisionalPin::COLOR.b, 0.4f);
             fill();
             drawCircle(lx, ly, 10);
-            setColor(1.0f, 1.0f, 1.0f, 0.7f);
+            setColor(1.0f, 1.0f, 1.0f, 0.5f);
             fill();
             drawCircle(lx, ly, 3);
         }
