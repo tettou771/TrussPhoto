@@ -870,13 +870,20 @@ public:
 
     // --- Reference import (lrcat etc.) ---
 
-    // Import pre-built entries as external references (no copy, no EXIF, no XMP)
+    // Import pre-built entries as external references, then enrich with EXIF + XMP
     int importReferences(vector<PhotoEntry>& entries) {
         int added = 0;
         vector<PhotoEntry> newEntries;
 
         for (auto& e : entries) {
             if (photos_.count(e.id)) continue;  // skip duplicates
+
+            // Extract full EXIF from file (lens correction, creative style, etc.)
+            if (!e.localPath.empty() && !e.isVideo && fs::exists(e.localPath)) {
+                extractExifMetadata(e.localPath, e);
+                extractXmpMetadata(e.localPath, e);
+            }
+
             photos_[e.id] = e;
             newEntries.push_back(e);
             added++;
