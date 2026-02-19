@@ -18,12 +18,56 @@ public:
     function<void(const string&)> onSearch;
     function<void()> onDeactivate;
 
+    // Parsed query: text part + location (@xxx) part
+    struct ParsedQuery {
+        string text;      // text part (@ tokens removed)
+        string location;  // location part (after @, empty if no @ token)
+    };
+
+    static ParsedQuery parseQuery(const string& raw) {
+        ParsedQuery result;
+        string text;
+        size_t i = 0;
+        while (i < raw.size()) {
+            // Skip leading spaces
+            if (raw[i] == ' ') {
+                if (!text.empty()) text += ' ';
+                i++;
+                continue;
+            }
+            if (raw[i] == '@') {
+                // Extract location token: @ to next space or EOL
+                i++; // skip @
+                string loc;
+                while (i < raw.size() && raw[i] != ' ') {
+                    loc += raw[i++];
+                }
+                if (!loc.empty()) result.location = loc;
+            } else {
+                // Regular text character
+                while (i < raw.size() && raw[i] != ' ') {
+                    text += raw[i++];
+                }
+            }
+        }
+        // Trim trailing spaces
+        while (!text.empty() && text.back() == ' ') text.pop_back();
+        result.text = text;
+        return result;
+    }
+
     void setup() override {
         enableEvents();
 
         // Load font for IME
         loadJapaneseFont(labelFont_, 14);
         ime_.setFont(&labelFont_);
+
+        // Enter key triggers search (not incremental)
+        ime_.onEnter = [this]() {
+            string q = getQuery();
+            if (onSearch) onSearch(q);
+        };
     }
 
     void activate() {
@@ -59,12 +103,12 @@ public:
     void update() override {
         if (!active_) return;
 
-        // Detect text changes (confirmed text)
+        // Detect text changes for idle timeout reset + redraw
         string current = getQuery();
         if (current != lastQuery_) {
             lastQuery_ = current;
             lastInputTime_ = getElapsedTimef();
-            if (onSearch) onSearch(current);
+            redraw();
         }
 
         // Detect composition changes (IME preedit) for redraw
@@ -122,7 +166,7 @@ public:
             string q = getQuery();
             if (q.empty()) {
                 setColor(0.35f, 0.35f, 0.4f);
-                labelFont_.drawString("Type to filter...", inputX, textY,
+                labelFont_.drawString("Enter to search / @place", inputX, textY,
                     Direction::Left, Direction::Center);
             } else {
                 setColor(0.8f, 0.8f, 0.85f);

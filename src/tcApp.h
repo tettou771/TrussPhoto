@@ -1,9 +1,11 @@
 #pragma once
 
 #include <TrussC.h>
+#include <tcxCurl.h>
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <mutex>
 #include "AppConfig.h"
 #include "AppPaths.h"
 #include "CatalogSettings.h"
@@ -112,4 +114,30 @@ private:
     void updateLayout();
     void rebuildFolderTree();
     void updateMetadataPanel();
+
+    // Geo search (Nominatim)
+    struct GeoSearchResult {
+        bool valid = false;
+        double south = 0, north = 0, west = 0, east = 0;
+        string textQuery;
+    };
+    GeoSearchResult geoResult_;
+    mutex geoMutex_;
+
+    void searchLocation(const string& location, const string& textQuery);
+    void runTextSearch(PhotoGrid::Ptr g, const string& query);
+
+    static string urlEncode(const string& s) {
+        string out;
+        for (unsigned char c : s) {
+            if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                out += (char)c;
+            } else {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%%%02X", c);
+                out += buf;
+            }
+        }
+        return out;
+    }
 };

@@ -78,6 +78,16 @@ public:
     void clearFilterPhotoIds() { filterPhotoIds_.clear(); }
     bool hasFilterPhotoIds() const { return !filterPhotoIds_.empty(); }
 
+    struct GeoBBox {
+        double south = 0, north = 0, west = 0, east = 0;
+        bool valid = false;
+    };
+
+    void setGeoBBox(double south, double north, double west, double east) {
+        geoBBox_ = {south, north, west, east, true};
+    }
+    void clearGeoBBox() { geoBBox_ = {}; }
+
     // --- Populate ---
 
     void populate(PhotoProvider& provider) {
@@ -103,6 +113,13 @@ public:
 
             // Filter by explicit photo ID set (e.g. from People view)
             if (!filterPhotoIds_.empty() && filterPhotoIds_.count(ids[i]) == 0) continue;
+
+            // Filter by GPS bounding box
+            if (geoBBox_.valid) {
+                if (!photo->hasGps()) continue;
+                if (photo->latitude < geoBBox_.south || photo->latitude > geoBBox_.north) continue;
+                if (photo->longitude < geoBBox_.west || photo->longitude > geoBBox_.east) continue;
+            }
 
             // Filter by folder path
             if (!filterPath_.empty()) {
@@ -294,6 +311,7 @@ private:
     vector<PhotoProvider::SearchResult> clipResults_;
     unordered_set<string> textMatchIds_;
     unordered_set<string> filterPhotoIds_;
+    GeoBBox geoBBox_;
 
     // --- Selection ---
     unordered_set<int> selectionSet_;

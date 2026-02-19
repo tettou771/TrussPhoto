@@ -118,41 +118,27 @@ void tcApp::setup() {
         auto g = grid();
         if (!g) return;
 
+        auto parsed = SearchBar::parseQuery(query);
+
+        // Clear previous geo filter
+        g->clearGeoBBox();
+
         if (query.empty()) {
+            // Empty query: clear all filters
             g->clearClipResults();
             g->clearTextMatchIds();
             g->setTextFilter("");
             g->populate(provider_);
-        } else if (provider_.isTextEncoderReady()) {
-            auto results = provider_.searchByText(query);
-
-            auto textMatches = provider_.searchByTextFields(query);
-            int textCount = 0;
-            if (!textMatches.empty()) {
-                unordered_set<string> clipIds;
-                for (const auto& r : results) clipIds.insert(r.photoId);
-                float boostScore = results.empty() ? 1.0f : results.front().score + 0.01f;
-                for (const auto& id : textMatches) {
-                    if (!clipIds.count(id)) {
-                        results.insert(results.begin(), {id, boostScore});
-                        textCount++;
-                    }
-                }
-            }
-
-            g->clearClipResults();
-            g->setTextFilter("");
-            g->setTextMatchIds(unordered_set<string>(textMatches.begin(), textMatches.end()));
-            g->setClipResults(results);
-            g->populate(provider_);
-            logNotice() << "[Search] query=\"" << query
-                        << "\" text=" << textCount
-                        << " clip=" << results.size() - textCount;
+        } else if (parsed.location.empty()) {
+            // Text-only search (no @location)
+            runTextSearch(g, parsed.text);
         } else {
-            g->clearClipResults();
-            g->clearTextMatchIds();
-            g->setTextFilter(query);
-            g->populate(provider_);
+            // Has @location → async Nominatim query
+            // Apply text filter immediately, geo will come later
+            if (!parsed.text.empty()) {
+                runTextSearch(g, parsed.text);
+            }
+            searchLocation(parsed.location, parsed.text);
         }
         redraw();
     };
@@ -658,6 +644,24 @@ void tcApp::update() {
             ? SyncState::Synced
             : SyncState::LocalOnly;
         provider_.setSyncState(uploadResult.photoId, newState);
+    }
+
+    // Process geo search results (Nominatim)
+    {
+        lock_guard<mutex> lock(geoMutex_);
+        if (geoResult_.valid) {
+            geoResult_.valid = false;
+            auto g2 = grid();
+            if (g2) {
+                g2->setGeoBBox(geoResult_.south, geoResult_.north,
+                               geoResult_.west, geoResult_.east);
+                runTextSearch(g2, geoResult_.textQuery);
+                logNotice() << "[GeoSearch] bbox=["
+                            << geoResult_.south << "," << geoResult_.north << ","
+                            << geoResult_.west << "," << geoResult_.east << "]";
+            }
+            redraw();
+        }
     }
 
     // Update sync state badges
@@ -1509,4 +1513,86 @@ void tcApp::updateMetadataPanel() {
         metadataPanel_->setPhoto(nullptr);
     }
     redraw();
+}
+
+void tcApp::runTextSearch(PhotoGrid::Ptr g, const string& query) {
+    if (!g) return;
+
+    if (query.empty()) {
+        g->clearClipResults();
+        g->clearTextMatchIds();
+        g->setTextFilter("");
+        g->populate(provider_);
+        return;
+    }
+
+    if (provider_.isTextEncoderReady()) {
+        auto results = provider_.searchByText(query);
+
+        auto textMatches = provider_.searchByTextFields(query);
+        int textCount = 0;
+        if (!textMatches.empty()) {
+            unordered_set<string> clipIds;
+            for (const auto& r : results) clipIds.insert(r.photoId);
+            float boostScore = results.empty() ? 1.0f : results.front().score + 0.01f;
+            for (const auto& id : textMatches) {
+                if (!clipIds.count(id)) {
+                    results.insert(results.begin(), {id, boostScore});
+                    textCount++;
+                }
+            }
+        }
+
+        g->clearClipResults();
+        g->setTextFilter("");
+        g->setTextMatchIds(unordered_set<string>(textMatches.begin(), textMatches.end()));
+        g->setClipResults(results);
+        g->populate(provider_);
+        logNotice() << "[Search] query=\"" << query
+                    << "\" text=" << textCount
+                    << " clip=" << results.size() - textCount;
+    } else {
+        g->clearClipResults();
+        g->clearTextMatchIds();
+        g->setTextFilter(query);
+        g->populate(provider_);
+    }
+}
+
+void tcApp::searchLocation(const string& location, const string& textQuery) {
+    thread([this, location, textQuery]() {
+        tcx::HttpClient client;
+        client.addHeader("User-Agent", "TrussPhoto/1.0");
+        client.setBaseUrl("");
+        string url = string("https://nominatim.openstreetmap.org")
+            + "/search?q=" + urlEncode(location)
+            + "&format=json&limit=1";
+        auto res = client.get(url);
+        if (res.ok()) {
+            auto j = nlohmann::json::parse(res.body, nullptr, false);
+            if (j.is_array() && !j.empty()) {
+                double south, north, west, east;
+
+                if (j[0].contains("boundingbox") && j[0]["boundingbox"].is_array()
+                    && j[0]["boundingbox"].size() == 4) {
+                    auto& bb = j[0]["boundingbox"];
+                    south = stod(bb[0].get<string>());
+                    north = stod(bb[1].get<string>());
+                    west  = stod(bb[2].get<string>());
+                    east  = stod(bb[3].get<string>());
+                } else {
+                    // No bbox → use point ±0.05 degrees (~5km)
+                    double lat = stod(j[0]["lat"].get<string>());
+                    double lon = stod(j[0]["lon"].get<string>());
+                    south = lat - 0.05;
+                    north = lat + 0.05;
+                    west  = lon - 0.05;
+                    east  = lon + 0.05;
+                }
+
+                lock_guard<mutex> lock(geoMutex_);
+                geoResult_ = {true, south, north, west, east, textQuery};
+            }
+        }
+    }).detach();
 }
