@@ -852,14 +852,22 @@ void tcApp::keyPressed(int key) {
         }
         if (key == SAPP_KEYCODE_ESCAPE) {
             if (mapView->hasProvisionalPins()) {
-                mapView->clearProvisionalPins();
+                int n = (int)mapView->provisionalPinCount();
+                string msg = format("{}件の仮タグを破棄しますか？", n);
+                if (confirmDialog("仮タグ破棄", msg)) {
+                    mapView->clearProvisionalPins();
+                }
             } else if (mapView->hasGpxTracks()) {
                 mapView->clearGpxTracks();
             }
             // else: do nothing (G key to go back to grid)
         } else if (key == SAPP_KEYCODE_ENTER || key == SAPP_KEYCODE_KP_ENTER) {
             if (mapView->hasProvisionalPins()) {
-                mapView->confirmAllPins();
+                int n = (int)mapView->provisionalPinCount();
+                string msg = format("{}件の仮タグを確定しますか？", n);
+                if (confirmDialog("仮タグ確定", msg)) {
+                    mapView->confirmAllPins();
+                }
             }
         } else if (key == 'A' || key == 'a') {
             mapView->runAutoGeotag();

@@ -421,6 +421,7 @@ public:
     }
 
     bool hasProvisionalPins() const { return !provisionalPins_.empty(); }
+    size_t provisionalPinCount() const { return provisionalPins_.size(); }
 
     // --- GPX track management ---
 
@@ -1424,6 +1425,7 @@ public:
     // --- Provisional pin API ---
 
     bool hasProvisionalPins() const { return canvas_->hasProvisionalPins(); }
+    size_t provisionalPinCount() const { return canvas_->provisionalPinCount(); }
 
     // --- GPX track forwarding ---
 
