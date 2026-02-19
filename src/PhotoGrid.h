@@ -21,7 +21,6 @@ public:
     // Callbacks
     function<void(int)> onItemClick;           // normal click -> full view
     function<void(vector<string>)> onDeleteRequest;  // delete selected photos
-    function<void(const string&)> onCompanionClick;  // companion photo id -> full view
 
     PhotoGrid() {
         itemWidth_ = 140;
@@ -239,6 +238,13 @@ protected:
             }
         };
 
+        item->onStackClick = [this, poolIdx]() {
+            int dataIdx = reverseMap_[poolIdx];
+            if (dataIdx >= 0) {
+                toggleCompanionPreview(dataIdx);
+            }
+        };
+
         item->onRequestLoad = [this](int idx) {
             requestLoad(idx);
         };
@@ -277,21 +283,19 @@ protected:
     void onUpdate() override {
         scrollBar_->updateFromContainer();
         processLoadResults();
-        updateStackHover();
-    }
-
-    void endDraw() override {
-        drawCompanionPreview();
     }
 
     bool onMousePress(Vec2 local, int button) override {
-        // Check companion preview click
-        if (companionVisible_ && button == 0 && !companionId_.empty()) {
-            if (companionRect_.contains(local.x, local.y)) {
-                if (onCompanionClick) {
-                    onCompanionClick(companionId_);
-                }
-                return true;
+        // Dismiss companion preview on click outside
+        if (companionPreview_ && companionPreview_->isShowing() && button == 0) {
+            // Check if click is inside the preview
+            float px = companionPreview_->getX();
+            float py = companionPreview_->getY();
+            float pw = companionPreview_->getWidth();
+            float ph = companionPreview_->getHeight();
+            if (local.x < px || local.x > px + pw || local.y < py || local.y > py + ph) {
+                companionPreview_->hide();
+                redraw();
             }
         }
         return RecyclerGrid<PhotoItem>::onMousePress(local, button);
@@ -327,151 +331,76 @@ private:
     // --- Grid params ---
     float itemSize_ = 140;
 
-    // --- Stack hover preview ---
-    int hoverDataIdx_ = -1;          // data index currently hovered on badge
-    uint64_t hoverTimerId_ = 0;      // callAfter timer id
-    bool companionVisible_ = false;  // is companion preview showing
-    int companionDataIdx_ = -1;      // data index of the hovered primary
-    string companionId_;             // photo id of companion to show
-    Texture companionTexture_;       // loaded companion thumbnail
+    // --- Stack companion preview ---
+    CompanionPreview::Ptr companionPreview_;
+    int companionDataIdx_ = -1;
+    string companionId_;
     bool companionLoading_ = false;
-    Rect companionRect_;             // screen rect for click detection
 
-    // =========================================================================
-    // Stack hover management
-    // =========================================================================
-
-    void updateStackHover() {
-        if (!provider_) return;
-
-        // Find which pool item the mouse is over
-        int hoveredIdx = -1;
-        for (auto& [dataIdx, poolIdx] : poolMap_) {
-            auto& item = pool_[poolIdx];
-            if (!item->getActive()) continue;
-            if (!item->isStacked()) continue;
-            if (!item->isMouseOver()) continue;
-
-            // Check if mouse is over the badge area
-            Vec2 mouseLocal(item->getMouseX(), item->getMouseY());
-            if (item->isOverStackBadge(mouseLocal)) {
-                hoveredIdx = dataIdx;
+    void ensureCompanionPreview() {
+        if (companionPreview_) return;
+        companionPreview_ = make_shared<CompanionPreview>();
+        companionPreview_->onClick = [this]() {
+            // Open the primary photo in SingleView (companion's parent)
+            if (companionDataIdx_ >= 0 && onItemClick) {
+                companionPreview_->hide();
+                onItemClick(companionDataIdx_);
             }
-            break;
-        }
-
-        if (hoveredIdx != hoverDataIdx_) {
-            // Hover target changed
-            if (hoverTimerId_ != 0) {
-                cancelTimer(hoverTimerId_);
-                hoverTimerId_ = 0;
-            }
-            companionVisible_ = false;
-            companionTexture_.clear();
-            companionLoading_ = false;
-
-            hoverDataIdx_ = hoveredIdx;
-
-            if (hoveredIdx >= 0) {
-                // Start delay timer
-                int idx = hoveredIdx;
-                hoverTimerId_ = callAfter(0.5, [this, idx]() {
-                    hoverTimerId_ = 0;
-                    showCompanionPreview(idx);
-                });
-            }
-            redraw();
-        }
+        };
+        addChild(companionPreview_);
     }
 
-    void showCompanionPreview(int dataIdx) {
+    // =========================================================================
+    // Stack companion preview (toggle on badge click)
+    // =========================================================================
+
+    void toggleCompanionPreview(int dataIdx) {
         if (!provider_ || dataIdx < 0 || dataIdx >= (int)photoIds_.size()) return;
+        ensureCompanionPreview();
+
+        // Toggle off if same item clicked again
+        if (companionPreview_->isShowing() && companionDataIdx_ == dataIdx) {
+            companionPreview_->hide();
+            redraw();
+            return;
+        }
 
         auto companions = provider_->getStackCompanions(photoIds_[dataIdx]);
         if (companions.empty()) return;
 
         companionDataIdx_ = dataIdx;
-        companionId_ = companions[0]; // show first companion
-        companionVisible_ = true;
+        companionId_ = companions[0];
 
-        // Load companion thumbnail in background
-        companionLoading_ = true;
-        loader_.requestLoad(-1000 - dataIdx, companionId_);
-        redraw();
-    }
-
-    void drawCompanionPreview() {
-        if (!companionVisible_ || companionDataIdx_ < 0) {
-            companionRect_ = {0, 0, 0, 0};
-            return;
-        }
-
-        auto it = poolMap_.find(companionDataIdx_);
+        // Calculate position
+        auto it = poolMap_.find(dataIdx);
         if (it == poolMap_.end()) return;
-
         auto& item = pool_[it->second];
-        if (!item->getActive()) return;
 
-        // Position: offset from the primary item, bottom-right
-        Vec2 itemContentPos = getItemPosition(companionDataIdx_);
+        Vec2 itemContentPos = getItemPosition(dataIdx);
         float scrollY = scrollContainer_->getScrollY();
-
         float previewSize = itemSize_ * 0.7f;
         float ox = itemContentPos.x + item->getWidth() * 0.5f;
         float oy = itemContentPos.y + item->getHeight() * 0.5f - scrollY;
 
         // Clamp to grid bounds
         if (ox + previewSize > getWidth()) ox = getWidth() - previewSize - 4;
-        if (oy + previewSize > getHeight()) oy = getHeight() - previewSize - 4;
+        if (oy + previewSize + 14 > getHeight()) oy = getHeight() - previewSize - 18;
 
-        // Record rect for click detection
-        companionRect_ = {ox, oy, previewSize, previewSize};
-
-        // Shadow
-        setColor(0.0f, 0.0f, 0.0f, 0.4f);
-        fill();
-        drawRect(ox + 2, oy + 2, previewSize, previewSize);
-
-        // Background
-        setColor(0.15f, 0.15f, 0.18f);
-        fill();
-        drawRect(ox, oy, previewSize, previewSize);
-
-        // Draw companion thumbnail
-        if (companionTexture_.isAllocated()) {
-            setColor(1.0f, 1.0f, 1.0f);
-            float tw = companionTexture_.getWidth();
-            float th = companionTexture_.getHeight();
-            float scale = min(previewSize / tw, previewSize / th);
-            float dw = tw * scale, dh = th * scale;
-            float dx = ox + (previewSize - dw) / 2;
-            float dy = oy + (previewSize - dh) / 2;
-            companionTexture_.draw(dx, dy, dw, dh);
-        } else {
-            // Loading placeholder
-            setColor(0.3f, 0.3f, 0.35f);
-            fill();
-            drawRect(ox + 4, oy + 4, previewSize - 8, previewSize - 8);
-        }
-
-        // Border
-        setColor(0.5f, 0.5f, 0.55f);
-        noFill();
-        drawRect(ox, oy, previewSize, previewSize);
-
-        // Label
+        // Get extension label
+        string ext;
         auto* photo = provider_->getPhoto(companionId_);
         if (photo) {
-            string ext = fs::path(photo->filename).extension().string();
+            ext = fs::path(photo->filename).extension().string();
             transform(ext.begin(), ext.end(), ext.begin(), ::toupper);
             if (!ext.empty() && ext[0] == '.') ext = ext.substr(1);
-            setColor(0.8f, 0.8f, 0.85f);
-            fill();
-            pushStyle();
-            setTextAlign(Direction::Center, Direction::Top);
-            drawBitmapString(ext, ox + previewSize / 2, oy + previewSize + 2);
-            popStyle();
         }
+
+        companionPreview_->show(ox, oy, previewSize, ext);
+
+        // Load companion thumbnail in background
+        companionLoading_ = true;
+        loader_.requestLoad(-1000 - dataIdx, companionId_);
+        redraw();
     }
 
     // =========================================================================
@@ -490,10 +419,9 @@ private:
 
             // Companion preview load result (negative IDs)
             if (result.id < -999) {
-                if (companionLoading_ && companionVisible_) {
-                    companionTexture_.allocate(result.pixels, TextureUsage::Immutable);
+                if (companionLoading_ && companionPreview_ && companionPreview_->isShowing()) {
+                    companionPreview_->setPixels(std::move(result.pixels));
                     companionLoading_ = false;
-                    redraw();
                 }
                 continue;
             }
