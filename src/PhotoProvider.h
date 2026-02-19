@@ -618,6 +618,15 @@ public:
             chrono::system_clock::now().time_since_epoch()).count();
     }
 
+    bool setGps(const string& id, double lat, double lon) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        it->second.latitude = lat;
+        it->second.longitude = lon;
+        db_.updateGps(id, lat, lon);
+        return true;
+    }
+
     bool setRating(const string& id, int rating) {
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;

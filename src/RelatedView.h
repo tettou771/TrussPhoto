@@ -795,20 +795,9 @@ private:
     // Timeline construction
     // =========================================================================
 
+    // Delegate to PhotoEntry::parseDateTimeOriginal
     static int64_t parseDateTimeOriginal(const string& dt) {
-        if (dt.size() < 19) return 0;
-        try {
-            tm t = {};
-            t.tm_year = stoi(dt.substr(0, 4)) - 1900;
-            t.tm_mon = stoi(dt.substr(5, 2)) - 1;
-            t.tm_mday = stoi(dt.substr(8, 2));
-            t.tm_hour = stoi(dt.substr(11, 2));
-            t.tm_min = stoi(dt.substr(14, 2));
-            t.tm_sec = stoi(dt.substr(17, 2));
-            return (int64_t)mktime(&t);
-        } catch (...) {
-            return 0;
-        }
+        return PhotoEntry::parseDateTimeOriginal(dt);
     }
 
     void buildTimeline(PhotoProvider& provider) {

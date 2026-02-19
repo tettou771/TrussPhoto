@@ -194,6 +194,11 @@ void tcApp::setup() {
         updateLayout();
     };
     mapView->onRedraw = [this]() { redraw(); };
+    mapView->onGeotagConfirm = [this](const string& photoId, double lat, double lon) {
+        provider_.setGps(photoId, lat, lon);
+        logNotice() << "[MapView] Geotag confirmed: " << photoId
+                     << " lat=" << lat << " lon=" << lon;
+    };
 
     // 5c2. Configure related view callbacks
     auto relatedView = viewManager_->relatedView();
@@ -830,6 +835,29 @@ void tcApp::keyPressed(int key) {
                 }
                 updateLayout();
             }
+        }
+    } else if (viewMode() == ViewMode::Map) {
+        auto mapView = viewManager_->mapView();
+        if (key == SAPP_KEYCODE_ESCAPE) {
+            if (mapView->hasProvisionalPins()) {
+                mapView->clearProvisionalPins();
+            } else {
+                viewManager_->switchTo(ViewMode::Grid);
+                leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
+                leftTween_.finish();
+                if (metadataPanel_) {
+                    metadataPanel_->clearViewInfo();
+                    metadataPanel_->clearThumbnail();
+                    updateMetadataPanel();
+                }
+                updateLayout();
+            }
+        } else if (key == SAPP_KEYCODE_ENTER || key == SAPP_KEYCODE_KP_ENTER) {
+            if (mapView->hasProvisionalPins()) {
+                mapView->confirmAllPins();
+            }
+        } else if (key == 'A' || key == 'a') {
+            mapView->runAutoGeotag();
         }
     } else if (viewMode() == ViewMode::Grid) {
         // Grid mode: if search bar is active, only handle ESC

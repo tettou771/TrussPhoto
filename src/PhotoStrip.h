@@ -19,6 +19,7 @@ public:
     using Ptr = shared_ptr<StripItem>;
 
     function<void()> onClick;
+    function<void(float globalX, float globalY)> onDragEnd;
 
     StripItem(float size) : size_(size) {
         enableEvents();
@@ -35,6 +36,9 @@ public:
 
     void setHasGps(bool v) { hasGps_ = v; }
     bool hasGps() const { return hasGps_; }
+
+    void setHasProvisionalGeotag(bool v) { hasProvisionalGeotag_ = v; }
+    bool hasProvisionalGeotag() const { return hasProvisionalGeotag_; }
 
     ThumbnailNode* getThumbnail() { return thumb_.get(); }
 
@@ -60,35 +64,71 @@ public:
     }
 
     void endDraw() override {
-        // No-GPS indicator: circle with diagonal line (top-left area)
         if (!hasGps_) {
             float iconSize = min(16.0f, size_ * 0.25f);
             float cx = 2 + iconSize * 0.5f + 2;
             float cy = 2 + iconSize * 0.5f + 2;
             float r = iconSize * 0.5f;
 
-            // Dark backdrop
-            setColor(0.0f, 0.0f, 0.0f, 0.5f);
-            fill();
-            drawRect(cx - r - 2, cy - r - 2, iconSize + 4, iconSize + 4);
-
-            // Light gray circle + diagonal line
-            setColor(0.7f, 0.7f, 0.72f);
-            noFill();
-            setStrokeWeight(1.5f);
-            drawCircle(cx, cy, r);
-            drawLine(cx - r * 0.7f, cy - r * 0.7f,
-                     cx + r * 0.7f, cy + r * 0.7f);
-            fill();  // restore fill state
+            if (hasProvisionalGeotag_) {
+                // Provisional geotag: light blue dot
+                setColor(0.0f, 0.0f, 0.0f, 0.5f);
+                fill();
+                drawRect(cx - r - 2, cy - r - 2, iconSize + 4, iconSize + 4);
+                setColor(0.3f, 0.65f, 1.0f);
+                fill();
+                drawCircle(cx, cy, r * 0.7f);
+            } else {
+                // No-GPS indicator: circle with diagonal line
+                setColor(0.0f, 0.0f, 0.0f, 0.5f);
+                fill();
+                drawRect(cx - r - 2, cy - r - 2, iconSize + 4, iconSize + 4);
+                setColor(0.7f, 0.7f, 0.72f);
+                noFill();
+                setStrokeWeight(1.5f);
+                drawCircle(cx, cy, r);
+                drawLine(cx - r * 0.7f, cy - r * 0.7f,
+                         cx + r * 0.7f, cy + r * 0.7f);
+                fill();
+            }
         }
         RectNode::endDraw();
     }
 
 protected:
     bool onMousePress(Vec2 local, int button) override {
-        (void)local;
-        if (button == 0 && onClick) onClick();
-        return RectNode::onMousePress(local, button);
+        if (button != 0) return RectNode::onMousePress(local, button);
+        if (!hasGps_ && !hasProvisionalGeotag_) {
+            // GPS-less photo: start drag detection
+            dragPending_ = true;
+            isDragging_ = false;
+            dragStartPos_ = local;
+        }
+        return true;
+    }
+
+    bool onMouseDrag(Vec2 local, int button) override {
+        if (button != 0 || !dragPending_) return false;
+        float dx = local.x - dragStartPos_.x;
+        float dy = local.y - dragStartPos_.y;
+        if (!isDragging_ && (dx * dx + dy * dy) > 25.0f) {  // > 5px
+            isDragging_ = true;
+        }
+        return isDragging_;
+    }
+
+    bool onMouseRelease(Vec2 local, int button) override {
+        if (button != 0) return false;
+        if (isDragging_ && onDragEnd) {
+            float gx, gy;
+            localToGlobal(local.x, local.y, gx, gy);
+            onDragEnd(gx, gy);
+        } else if (!isDragging_ && onClick) {
+            onClick();
+        }
+        dragPending_ = false;
+        isDragging_ = false;
+        return true;
     }
 
 private:
@@ -96,7 +136,13 @@ private:
     float size_;
     bool selected_ = false;
     bool hasGps_ = true;
+    bool hasProvisionalGeotag_ = false;
     bool loaded_ = false;
+
+    // Drag state
+    bool dragPending_ = false;
+    bool isDragging_ = false;
+    Vec2 dragStartPos_;
 };
 
 // PhotoStrip - horizontal scrolling strip with pool-based recycling
@@ -105,6 +151,7 @@ public:
     using Ptr = shared_ptr<PhotoStrip>;
 
     function<void(int stripIndex, const string& photoId)> onPhotoClick;
+    function<void(int stripIndex, const string& photoId, float globalX, float globalY)> onDragEnd;
 
     PhotoStrip() {
         loadJapaneseFont(font_, 10);
@@ -139,6 +186,25 @@ public:
 
         selectedIdx_ = -1;
         rebuildPool();
+    }
+
+    // Update provisional geotag indicators
+    void setProvisionalGeotag(const string& photoId, bool has) {
+        for (size_t i = 0; i < photoIds_.size(); i++) {
+            if (photoIds_[i] == photoId) {
+                auto it = poolMap_.find((int)i);
+                if (it != poolMap_.end()) {
+                    pool_[it->second]->setHasProvisionalGeotag(has);
+                }
+                break;
+            }
+        }
+    }
+
+    void clearAllProvisionalGeotags() {
+        for (auto& [dataIdx, poolIdx] : poolMap_) {
+            pool_[poolIdx]->setHasProvisionalGeotag(false);
+        }
     }
 
     // Select a photo and scroll to center it
@@ -323,6 +389,12 @@ private:
 
                 if (onPhotoClick) onPhotoClick(dataIdx, photoIds_[dataIdx]);
                 redraw();
+            };
+
+            item->onDragEnd = [this, poolIdx](float gx, float gy) {
+                int dataIdx = reverseMap_[poolIdx];
+                if (dataIdx < 0) return;
+                if (onDragEnd) onDragEnd(dataIdx, photoIds_[dataIdx], gx, gy);
             };
 
             pool_.push_back(item);
