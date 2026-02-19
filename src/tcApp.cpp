@@ -194,6 +194,8 @@ void tcApp::setup() {
         updateLayout();
     };
     mapView->onRedraw = [this]() { redraw(); };
+    mapView->cmdDownRef = &cmdDown_;
+    mapView->shiftDownRef = &shiftDown_;
     mapView->onGeotagConfirm = [this](const string& photoId, double lat, double lon) {
         provider_.setGps(photoId, lat, lon);
         logNotice() << "[MapView] Geotag confirmed: " << photoId
@@ -313,12 +315,13 @@ void tcApp::setup() {
         lastClickIndex_ = index;
 
         auto g = grid();
-        if (cmdDown_ && shiftDown_) {
+        if (shiftDown_) {
             int anchor = g->getSelectionAnchor();
             if (anchor >= 0) {
-                bool select = !g->isSelected(index);
-                g->selectRange(anchor, index, select);
+                if (!cmdDown_) g->clearSelection();
+                g->selectRange(anchor, index, true);
             } else {
+                if (!cmdDown_) g->clearSelection();
                 g->toggleSelection(index);
             }
             updateMetadataPanel();

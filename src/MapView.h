@@ -972,6 +972,10 @@ public:
     function<void(const string& photoId, double lat, double lon)> onGeotagConfirm;
     function<void()> onRedraw;
 
+    // Modifier key refs (set by tcApp)
+    bool* cmdDownRef = nullptr;
+    bool* shiftDownRef = nullptr;
+
     MapView() {
         canvas_ = make_shared<MapCanvas>();
         strip_ = make_shared<PhotoStrip>();
@@ -1033,25 +1037,35 @@ public:
         canvas_->confirmAllPins();
     }
 
-    // Auto-geotag: interpolate GPS from timestamps
+    // Auto-geotag: interpolate GPS from timestamps for selected photos
     void runAutoGeotag() {
         constexpr double MAX_GAP_SEC = 2.0 * 3600;
         constexpr double EXTRAP_MAX_SEC = MAX_GAP_SEC * 0.25;
+        constexpr int MAX_PINS = 1000;
 
-        // Build sorted timeline with GPS info
+        // Only operate on selected photos
+        auto selectedIds = strip_->selectedPhotoIds();
+        if (selectedIds.empty()) return;
+
+        unordered_set<string> targetIds(selectedIds.begin(), selectedIds.end());
+
+        // Build sorted timeline (all photos for interpolation, but only selected as targets)
         struct TimeEntry {
             int idx;
             string id;
             int64_t time;
             bool hasGps;
+            bool isTarget;
             double lat, lon;
         };
         vector<TimeEntry> sorted;
         for (size_t i = 0; i < photos_.size(); i++) {
             int64_t t = PhotoEntry::parseDateTimeOriginal(photos_[i].dateTimeOriginal);
             if (t == 0) continue;
+            bool target = !photos_[i].hasGps() && targetIds.count(photoIds_[i]);
             sorted.push_back({(int)i, photoIds_[i], t,
-                              photos_[i].hasGps(), photos_[i].latitude, photos_[i].longitude});
+                              photos_[i].hasGps(), target,
+                              photos_[i].latitude, photos_[i].longitude});
         }
         sort(sorted.begin(), sorted.end(),
              [](const TimeEntry& a, const TimeEntry& b) { return a.time < b.time; });
@@ -1059,7 +1073,12 @@ public:
         int count = 0;
         for (size_t ci = 0; ci < sorted.size(); ci++) {
             auto& c = sorted[ci];
-            if (c.hasGps) continue;
+            if (c.hasGps || !c.isTarget) continue;
+
+            if (count >= MAX_PINS) {
+                logWarning() << "[MapView] Auto-geotag capped at " << MAX_PINS << " pins";
+                break;
+            }
 
             // Already has provisional pin?
             bool alreadyProvisional = false;
@@ -1225,7 +1244,12 @@ public:
     }
 
     // ViewContainer lifecycle
-    void beginView(ViewContext& ctx) override {}
+    void beginView(ViewContext& ctx) override {
+        // Pass modifier key refs to strip (must be deferred from setup()
+        // because tcApp sets cmdDownRef/shiftDownRef after addChild triggers setup)
+        strip_->cmdDownRef = cmdDownRef;
+        strip_->shiftDownRef = shiftDownRef;
+    }
     void endView() override {
         clearProvisionalPins();
     }

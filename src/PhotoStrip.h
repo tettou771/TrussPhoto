@@ -10,6 +10,7 @@
 #include "AsyncImageLoader.h"
 #include "FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
 #include "Constants.h"   // for SELECTION_COLOR
+#include <set>
 using namespace std;
 using namespace tc;
 
@@ -160,8 +161,13 @@ public:
     using Ptr = shared_ptr<PhotoStrip>;
 
     function<void(int stripIndex, const string& photoId)> onPhotoClick;
+    function<void(const set<int>& selectedIndices)> onSelectionChanged;
     function<void(int stripIndex, const string& photoId, float globalX, float globalY)> onDragMove;
     function<void(int stripIndex, const string& photoId, float globalX, float globalY)> onDragEnd;
+
+    // Modifier key refs (set by MapView from tcApp)
+    bool* cmdDownRef = nullptr;
+    bool* shiftDownRef = nullptr;
 
     PhotoStrip() {
         loadJapaneseFont(font_, 10);
@@ -194,7 +200,8 @@ public:
             return provider.getThumbnail(photoId, outPixels);
         });
 
-        selectedIdx_ = -1;
+        selectedIndices_.clear();
+        lastClickIdx_ = -1;
         rebuildPool();
     }
 
@@ -229,37 +236,72 @@ public:
         }
     }
 
-    // Select a photo and scroll to center it
+    // Select a single photo and scroll to it (used for external selection, e.g. pin click)
     void selectPhoto(const string& photoId) {
         int idx = -1;
         for (size_t i = 0; i < photoIds_.size(); i++) {
             if (photoIds_[i] == photoId) { idx = (int)i; break; }
         }
         if (idx < 0) return;
-
-        // Update selection
-        int oldIdx = selectedIdx_;
-        selectedIdx_ = idx;
-
-        // Update visual state for pool items
-        if (oldIdx >= 0) {
-            auto it = poolMap_.find(oldIdx);
-            if (it != poolMap_.end()) pool_[it->second]->setSelected(false);
-        }
-        auto it = poolMap_.find(idx);
-        if (it != poolMap_.end()) pool_[it->second]->setSelected(true);
-
-        // Scroll to center
+        clearSelectionVisuals();
+        selectedIndices_.clear();
+        selectedIndices_.insert(idx);
+        lastClickIdx_ = idx;
+        applySelectionVisuals();
         scrollToIndex(idx);
         redraw();
     }
 
-    int selectedIndex() const { return selectedIdx_; }
+    // Multi-selection by click with modifiers
+    void handleSelection(int idx, bool cmd, bool shift) {
+        if (shift && lastClickIdx_ >= 0) {
+            // Range select
+            int lo = min(lastClickIdx_, idx);
+            int hi = max(lastClickIdx_, idx);
+            if (!cmd) {
+                clearSelectionVisuals();
+                selectedIndices_.clear();
+            }
+            for (int i = lo; i <= hi; i++) selectedIndices_.insert(i);
+        } else if (cmd) {
+            // Toggle
+            if (selectedIndices_.count(idx)) selectedIndices_.erase(idx);
+            else selectedIndices_.insert(idx);
+            lastClickIdx_ = idx;
+        } else {
+            // Single
+            clearSelectionVisuals();
+            selectedIndices_.clear();
+            selectedIndices_.insert(idx);
+            lastClickIdx_ = idx;
+        }
+        applySelectionVisuals();
+        if (onSelectionChanged) onSelectionChanged(selectedIndices_);
+        redraw();
+    }
+
+    const set<int>& selectedIndices() const { return selectedIndices_; }
+
+    int selectedIndex() const {
+        if (selectedIndices_.empty()) return -1;
+        return *selectedIndices_.begin();
+    }
 
     string selectedPhotoId() const {
-        if (selectedIdx_ >= 0 && selectedIdx_ < (int)photoIds_.size())
-            return photoIds_[selectedIdx_];
+        int idx = selectedIndex();
+        if (idx >= 0 && idx < (int)photoIds_.size())
+            return photoIds_[idx];
         return "";
+    }
+
+    // Get all selected photo IDs
+    vector<string> selectedPhotoIds() const {
+        vector<string> result;
+        for (int idx : selectedIndices_) {
+            if (idx >= 0 && idx < (int)photoIds_.size())
+                result.push_back(photoIds_[idx]);
+        }
+        return result;
     }
 
     void update() override {
@@ -301,7 +343,8 @@ private:
     vector<string> photoIds_;
     vector<bool> hasGps_;
     PhotoProvider* provider_ = nullptr;
-    int selectedIdx_ = -1;
+    set<int> selectedIndices_;
+    int lastClickIdx_ = -1;  // anchor for shift-range selection
 
     // Scroll
     PlainScrollContainer::Ptr scrollContainer_;
@@ -399,18 +442,11 @@ private:
                 int dataIdx = reverseMap_[poolIdx];
                 if (dataIdx < 0) return;
 
-                // Update selection
-                int oldIdx = selectedIdx_;
-                selectedIdx_ = dataIdx;
-
-                if (oldIdx >= 0) {
-                    auto oit = poolMap_.find(oldIdx);
-                    if (oit != poolMap_.end()) pool_[oit->second]->setSelected(false);
-                }
-                pool_[poolIdx]->setSelected(true);
+                bool cmd = cmdDownRef && *cmdDownRef;
+                bool shift = shiftDownRef && *shiftDownRef;
+                handleSelection(dataIdx, cmd, shift);
 
                 if (onPhotoClick) onPhotoClick(dataIdx, photoIds_[dataIdx]);
-                redraw();
             };
 
             item->onDragMove = [this, poolIdx](float gx, float gy) {
@@ -473,7 +509,7 @@ private:
 
         // Set GPS and selection state
         item->setHasGps(dataIdx < (int)hasGps_.size() && hasGps_[dataIdx]);
-        item->setSelected(dataIdx == selectedIdx_);
+        item->setSelected(selectedIndices_.count(dataIdx) > 0);
 
         // Request thumbnail load
         item->clearImage();
@@ -520,5 +556,19 @@ private:
         targetX = clamp(targetX, 0.0f, maxScroll);
         scrollContainer_->setScrollX(targetX);
         lastScrollX_ = -99999;
+    }
+
+    // Clear selected visual state for all visible pool items
+    void clearSelectionVisuals() {
+        for (auto& [dataIdx, poolIdx] : poolMap_) {
+            pool_[poolIdx]->setSelected(false);
+        }
+    }
+
+    // Apply selected visual state based on selectedIndices_
+    void applySelectionVisuals() {
+        for (auto& [dataIdx, poolIdx] : poolMap_) {
+            pool_[poolIdx]->setSelected(selectedIndices_.count(dataIdx) > 0);
+        }
     }
 };
