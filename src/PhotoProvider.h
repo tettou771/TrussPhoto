@@ -2937,12 +2937,13 @@ private:
                 j["caB"] = caB;
             }
 
-            // Vignetting: gain = 2^(0.5 - (2^(raw * 2^(-13) - 1))^2)
+            // Vignetting: gain = 2^(0.5 - 2^(raw * 2^(-13) - 1))
+            // darktable v2 formula (no squaring of inner or outer term)
             if (!vigRaw.empty()) {
                 nlohmann::json vig = nlohmann::json::array();
                 for (auto v : vigRaw) {
                     double x = v * (1.0 / 8192.0) - 1.0;
-                    double gain = pow(2.0, 0.5 - pow(pow(2.0, x), 2.0));
+                    double gain = pow(2.0, 0.5 - pow(2.0, x));
                     vig.push_back(gain);
                 }
                 j["vig"] = vig;

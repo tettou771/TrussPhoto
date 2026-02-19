@@ -114,7 +114,7 @@ public:
                             pendingRawPixels_ = std::move(loadedPixels);
                             int pw = pendingRawPixels_.getWidth();
                             int ph = pendingRawPixels_.getHeight();
-                            // EXIF embedded correction + DefaultCrop info
+                            // EXIF embedded correction (Sony ARW + DNG OpcodeList)
                             lensCorrector_.setupFromExif(path, pw, ph);
                             rawLoadCompleted_ = true;
                         }
@@ -212,14 +212,22 @@ public:
                 // Write intermediate dimensions + rotation-adjusted crop coords to DB.
                 // setupFromExif has transformed crop for portrait orientation;
                 // writing back ensures setupFromJson gets correct coords for SP display.
-                if (lensCorrector_.intermediateWidth() > 0) {
-                    auto* entry = ctx_->provider->getPhoto(spId);
-                    if (entry && !entry->lensCorrectionParams.empty()) {
+                if (lensCorrector_.isReady()) {
+                    auto* entry2 = ctx_->provider->getPhoto(spId);
+                    if (entry2 && !entry2->lensCorrectionParams.empty()) {
                         try {
-                            auto j = nlohmann::json::parse(entry->lensCorrectionParams);
+                            auto j = nlohmann::json::parse(entry2->lensCorrectionParams);
                             if (!j.contains("intW")) {
-                                j["intW"] = lensCorrector_.intermediateWidth();
-                                j["intH"] = lensCorrector_.intermediateHeight();
+                                // Use lensCorrector's intW if set (Sony path),
+                                // otherwise use raw pixel dimensions (DNG path)
+                                int intW = lensCorrector_.intermediateWidth();
+                                int intH = lensCorrector_.intermediateHeight();
+                                if (intW == 0) {
+                                    intW = rawPixels_.getWidth();
+                                    intH = rawPixels_.getHeight();
+                                }
+                                j["intW"] = intW;
+                                j["intH"] = intH;
                                 if (lensCorrector_.hasDefaultCrop()) {
                                     j["cropX"] = lensCorrector_.cropX();
                                     j["cropY"] = lensCorrector_.cropY();

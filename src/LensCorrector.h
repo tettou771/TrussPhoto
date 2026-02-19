@@ -124,113 +124,69 @@ public:
             image->readMetadata();
             auto& exif = image->exifData();
 
-            // Distortion correction (required)
+            bool correctionFound = false;
+
+            // --- Try Sony SubImage1 correction params ---
             auto distTag = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DistortionCorrParams"));
-            if (distTag == exif.end()) return false;
-
-            int nc = (int)distTag->toInt64(0);
-            if (nc < 2 || nc > 16) return false;
-
-            for (int i = 0; i < nc; i++) {
-                exifKnots_[i] = (float)(i + 0.5f) / (float)(nc - 1);
-                exifDistortion_[i] = (float)distTag->toInt64(i + 1) * powf(2.0f, -14.0f) + 1.0f;
-            }
-            exifKnotCount_ = nc;
-
-            logNotice() << "[LensCorrector] EXIF distortion: nc=" << nc
-                        << " first=" << exifDistortion_[0]
-                        << " last=" << exifDistortion_[nc - 1];
-
-            // Chromatic Aberration (R/B channels, optional)
-            auto caTag = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.ChromaticAberrationCorrParams"));
-            if (caTag != exif.end()) {
-                int caNc = (int)caTag->toInt64(0);
-                if (caNc == nc * 2) {
+            if (distTag != exif.end()) {
+                int nc = (int)distTag->toInt64(0);
+                if (nc >= 2 && nc <= 16) {
                     for (int i = 0; i < nc; i++) {
-                        exifCaR_[i] = (float)caTag->toInt64(i + 1) * powf(2.0f, -21.0f) + 1.0f;
-                        exifCaB_[i] = (float)caTag->toInt64(nc + i + 1) * powf(2.0f, -21.0f) + 1.0f;
+                        exifKnots_[i] = (float)(i + 0.5f) / (float)(nc - 1);
+                        exifDistortion_[i] = (float)distTag->toInt64(i + 1) * powf(2.0f, -14.0f) + 1.0f;
                     }
-                    hasExifTca_ = true;
-                    logNotice() << "[LensCorrector] EXIF TCA: R[0]=" << exifCaR_[0]
-                                << " B[0]=" << exifCaB_[0];
+                    exifKnotCount_ = nc;
+                    correctionFound = true;
+
+                    logNotice() << "[LensCorrector] EXIF distortion: nc=" << nc
+                                << " first=" << exifDistortion_[0]
+                                << " last=" << exifDistortion_[nc - 1];
+
+                    // Chromatic Aberration (R/B channels, optional)
+                    auto caTag = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.ChromaticAberrationCorrParams"));
+                    if (caTag != exif.end()) {
+                        int caNc = (int)caTag->toInt64(0);
+                        if (caNc == nc * 2) {
+                            for (int i = 0; i < nc; i++) {
+                                exifCaR_[i] = (float)caTag->toInt64(i + 1) * powf(2.0f, -21.0f) + 1.0f;
+                                exifCaB_[i] = (float)caTag->toInt64(nc + i + 1) * powf(2.0f, -21.0f) + 1.0f;
+                            }
+                            hasExifTca_ = true;
+                        }
+                    }
+
+                    // Vignetting (optional)
+                    auto vigTag = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.VignettingCorrParams"));
+                    if (vigTag != exif.end()) {
+                        int vigNc = (int)vigTag->toInt64(0);
+                        if (vigNc == nc) {
+                            for (int i = 0; i < nc; i++) {
+                                float raw = (float)vigTag->toInt64(i + 1);
+                                float v = powf(2.0f, 0.5f - powf(2.0f, raw * powf(2.0f, -13.0f) - 1.0f));
+                                exifVignetting_[i] = v;
+                            }
+                            hasExifVig_ = true;
+                        }
+                    }
+                    logNotice() << "[LensCorrector] Using Sony EXIF correction";
                 }
             }
 
-            // Vignetting (optional)
-            auto vigTag = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.VignettingCorrParams"));
-            if (vigTag != exif.end()) {
-                int vigNc = (int)vigTag->toInt64(0);
-                if (vigNc == nc) {
-                    for (int i = 0; i < nc; i++) {
-                        float raw = (float)vigTag->toInt64(i + 1);
-                        float v = powf(2.0f, 0.5f - powf(2.0f, raw * powf(2.0f, -13.0f) - 1.0f));
-                        exifVignetting_[i] = v * v;
-                    }
-                    hasExifVig_ = true;
-                    logNotice() << "[LensCorrector] EXIF vignetting: first=" << exifVignetting_[0]
-                                << " last=" << exifVignetting_[nc - 1];
-                }
+            // --- Try DNG OpcodeList (Sigma etc.) ---
+            if (!correctionFound) {
+                correctionFound = setupDngFromExif(exif);
             }
 
-            // Read DefaultCropOrigin/Size for post-correction crop.
-            // EXIF stores these in the sensor's native (landscape) orientation.
-            // LibRaw rotates output according to EXIF Orientation, so for portrait
-            // photos we must transform crop coordinates to match the rotated image.
-            auto cropOrig = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropOrigin"));
-            auto cropSize = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropSize"));
-            if (cropOrig != exif.end() && cropSize != exif.end() &&
-                cropOrig->count() >= 2 && cropSize->count() >= 2) {
-                int cx = (int)cropOrig->toInt64(0);
-                int cy = (int)cropOrig->toInt64(1);
-                int cw = (int)cropSize->toInt64(0);
-                int ch = (int)cropSize->toInt64(1);
+            if (!correctionFound) return false;
 
-                // Detect rotation: if crop is landscape but image is portrait,
-                // the image was rotated by LibRaw.
-                bool cropIsLandscape = (cw > ch);
-                bool imageIsPortrait = (width < height);
-
-                if (cropIsLandscape && imageIsPortrait) {
-                    // Read EXIF Orientation to determine rotation direction
-                    int orient = 1;
-                    auto orientTag = exif.findKey(Exiv2::ExifKey("Exif.Image.Orientation"));
-                    if (orientTag != exif.end()) orient = (int)orientTag->toInt64();
-
-                    if (orient == 6) {
-                        // 90° CW: landscape (x,y,w,h) → portrait
-                        // In landscape space, the "height" axis = width in portrait
-                        cropX_ = width - cy - ch;
-                        cropY_ = cx;
-                        cropW_ = ch;
-                        cropH_ = cw;
-                    } else if (orient == 8) {
-                        // 90° CCW: landscape (x,y,w,h) → portrait
-                        cropX_ = cy;
-                        cropY_ = height - cx - cw;
-                        cropW_ = ch;
-                        cropH_ = cw;
-                    } else {
-                        // Unknown rotation, use as-is
-                        cropX_ = cx; cropY_ = cy; cropW_ = cw; cropH_ = ch;
-                    }
-
-                    logNotice() << "[LensCorrector] DefaultCrop (rotated orient=" << orient
-                                << "): origin=(" << cropX_ << "," << cropY_
-                                << ") size=" << cropW_ << "x" << cropH_;
-                } else {
-                    cropX_ = cx; cropY_ = cy; cropW_ = cw; cropH_ = ch;
-                    logNotice() << "[LensCorrector] DefaultCrop: origin=(" << cropX_ << "," << cropY_
-                                << ") size=" << cropW_ << "x" << cropH_;
-                }
-                hasDefaultCrop_ = true;
-            }
+            // --- DefaultCropOrigin/Size (common to Sony and DNG) ---
+            readDefaultCropFromExif(exif, width, height);
 
             intW_ = width;
             intH_ = height;
             width_ = width;
             height_ = height;
             ready_ = true;
-            logNotice() << "[LensCorrector] Using EXIF embedded correction (" << width << "x" << height << ")";
             return true;
         } catch (const Exiv2::Error& e) {
             logWarning() << "[LensCorrector] EXIF read error: " << e.what();
@@ -877,5 +833,166 @@ private:
              + v10 * dx * (1 - dy)
              + v01 * (1 - dx) * dy
              + v11 * dx * dy;
+    }
+
+    // =========================================================================
+    // DNG OpcodeList binary parsing (direct from EXIF, no JSON intermediate)
+    // =========================================================================
+
+    static uint32_t readBE32(const uint8_t* p) {
+        return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+               ((uint32_t)p[2] << 8) | p[3];
+    }
+    static double readBE64f(const uint8_t* p) {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
+        double d;
+        memcpy(&d, &v, 8);
+        return d;
+    }
+    static float readBE32f(const uint8_t* p) {
+        uint32_t v = readBE32(p);
+        float f;
+        memcpy(&f, &v, 4);
+        return f;
+    }
+
+    // Parse DNG OpcodeList3/2 directly from EXIF data into member variables
+    bool setupDngFromExif(const Exiv2::ExifData& exif) {
+        bool hasWarp = false, hasGain = false;
+
+        // OpcodeList3: WarpRectilinear (distortion + TCA)
+        auto op3It = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.OpcodeList3"));
+        if (op3It != exif.end()) {
+            auto& val = op3It->value();
+            size_t sz = val.size();
+            vector<uint8_t> buf(sz);
+            val.copy((Exiv2::byte*)buf.data(), Exiv2::invalidByteOrder);
+
+            if (sz >= 4) {
+                uint32_t numOps = readBE32(buf.data());
+                size_t pos = 4;
+                for (uint32_t op = 0; op < numOps && pos + 16 <= sz; op++) {
+                    uint32_t opcodeId = readBE32(buf.data() + pos);
+                    uint32_t paramBytes = readBE32(buf.data() + pos + 12);
+                    pos += 16;
+                    if (opcodeId == 1 && pos + paramBytes <= sz) {
+                        const uint8_t* d = buf.data() + pos;
+                        uint32_t nPlanes = readBE32(d);
+                        if (nPlanes >= 1 && nPlanes <= 3) {
+                            dngWarpPlanes_ = nPlanes;
+                            size_t off = 4;
+                            for (uint32_t p = 0; p < nPlanes; p++) {
+                                for (int k = 0; k < 4; k++) {
+                                    dngWarp_[p].kr[k] = readBE64f(d + off);
+                                    off += 8;
+                                }
+                                for (int k = 0; k < 2; k++) {
+                                    dngWarp_[p].kt[k] = readBE64f(d + off);
+                                    off += 8;
+                                }
+                            }
+                            dngCx_ = readBE64f(d + off); off += 8;
+                            dngCy_ = readBE64f(d + off);
+                            hasWarp = true;
+                        }
+                    }
+                    pos += paramBytes;
+                }
+            }
+        }
+
+        // OpcodeList2: GainMap (vignetting)
+        auto op2It = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.OpcodeList2"));
+        if (op2It != exif.end()) {
+            auto& val = op2It->value();
+            size_t sz = val.size();
+            vector<uint8_t> buf(sz);
+            val.copy((Exiv2::byte*)buf.data(), Exiv2::invalidByteOrder);
+
+            if (sz >= 4) {
+                uint32_t numOps = readBE32(buf.data());
+                size_t pos = 4;
+                for (uint32_t op = 0; op < numOps && pos + 16 <= sz; op++) {
+                    uint32_t opcodeId = readBE32(buf.data() + pos);
+                    uint32_t paramBytes = readBE32(buf.data() + pos + 12);
+                    pos += 16;
+                    if (opcodeId == 9 && pos + paramBytes <= sz && paramBytes >= 76) {
+                        const uint8_t* d = buf.data() + pos;
+                        uint32_t rows = readBE32(d + 32);
+                        uint32_t cols = readBE32(d + 36);
+                        uint32_t mapPlanes = readBE32(d + 72);
+                        uint32_t totalPts = rows * cols * mapPlanes;
+                        if (76 + totalPts * 4 <= paramBytes && totalPts > 0 && totalPts < 100000) {
+                            dngGainRows_ = rows;
+                            dngGainCols_ = cols;
+                            dngGainMapPlanes_ = mapPlanes;
+                            dngGainMap_.resize(totalPts);
+                            for (uint32_t i = 0; i < totalPts; i++) {
+                                dngGainMap_[i] = readBE32f(d + 76 + i * 4);
+                            }
+                            hasGain = true;
+                        }
+                    }
+                    pos += paramBytes;
+                }
+            }
+        }
+
+        if (!hasWarp && !hasGain) return false;
+
+        useDng_ = true;
+        logNotice() << "[LensCorrector] DNG OpcodeList from EXIF: warp="
+                    << dngWarpPlanes_ << "planes gain="
+                    << dngGainRows_ << "x" << dngGainCols_;
+        return true;
+    }
+
+    // Read DefaultCropOrigin/Size from EXIF and set crop members.
+    // Handles portrait rotation (EXIF stores in landscape orientation).
+    void readDefaultCropFromExif(const Exiv2::ExifData& exif, int width, int height) {
+        auto cropOrig = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropOrigin"));
+        auto cropSize = exif.findKey(Exiv2::ExifKey("Exif.SubImage1.DefaultCropSize"));
+        if (cropOrig == exif.end() || cropSize == exif.end() ||
+            cropOrig->count() < 2 || cropSize->count() < 2) return;
+
+        int cx = (int)cropOrig->toInt64(0);
+        int cy = (int)cropOrig->toInt64(1);
+        int cw = (int)cropSize->toInt64(0);
+        int ch = (int)cropSize->toInt64(1);
+
+        // Detect rotation: if crop is landscape but image is portrait,
+        // the image was rotated by LibRaw.
+        bool cropIsLandscape = (cw > ch);
+        bool imageIsPortrait = (width < height);
+
+        if (cropIsLandscape && imageIsPortrait) {
+            int orient = 1;
+            auto orientTag = exif.findKey(Exiv2::ExifKey("Exif.Image.Orientation"));
+            if (orientTag != exif.end()) orient = (int)orientTag->toInt64();
+
+            if (orient == 6) {
+                cropX_ = width - cy - ch;
+                cropY_ = cx;
+                cropW_ = ch;
+                cropH_ = cw;
+            } else if (orient == 8) {
+                cropX_ = cy;
+                cropY_ = height - cx - cw;
+                cropW_ = ch;
+                cropH_ = cw;
+            } else {
+                cropX_ = cx; cropY_ = cy; cropW_ = cw; cropH_ = ch;
+            }
+
+            logNotice() << "[LensCorrector] DefaultCrop (rotated orient=" << orient
+                        << "): origin=(" << cropX_ << "," << cropY_
+                        << ") size=" << cropW_ << "x" << cropH_;
+        } else {
+            cropX_ = cx; cropY_ = cy; cropW_ = cw; cropH_ = ch;
+            logNotice() << "[LensCorrector] DefaultCrop: origin=(" << cropX_ << "," << cropY_
+                        << ") size=" << cropW_ << "x" << cropH_;
+        }
+        hasDefaultCrop_ = true;
     }
 };
