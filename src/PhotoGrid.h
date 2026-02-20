@@ -273,6 +273,12 @@ protected:
     void onUnbind(int dataIdx, ItemPtr& item) override {
         loader_.cancelRequest(dataIdx);
         item->unloadImage();
+
+        // Clean up companion preview if its parent card is being recycled
+        if (companionDataIdx_ == dataIdx && companionPreview_) {
+            companionPreview_->hide();
+            companionDataIdx_ = -1;
+        }
     }
 
     void onSetup() override {
@@ -286,17 +292,10 @@ protected:
     }
 
     bool onMousePress(Vec2 local, int button) override {
-        // Dismiss companion preview on click outside
+        // Dismiss companion preview on click outside (click on grid background or another card)
         if (companionPreview_ && companionPreview_->isShowing() && button == 0) {
-            // Check if click is inside the preview
-            float px = companionPreview_->getX();
-            float py = companionPreview_->getY();
-            float pw = companionPreview_->getWidth();
-            float ph = companionPreview_->getHeight();
-            if (local.x < px || local.x > px + pw || local.y < py || local.y > py + ph) {
-                companionPreview_->hide();
-                redraw();
-            }
+            companionPreview_->hide();
+            redraw();
         }
         return RecyclerGrid<PhotoItem>::onMousePress(local, button);
     }
@@ -347,7 +346,6 @@ private:
                 onItemClick(companionDataIdx_);
             }
         };
-        addChild(companionPreview_);
     }
 
     // =========================================================================
@@ -371,20 +369,17 @@ private:
         companionDataIdx_ = dataIdx;
         companionId_ = companions[0];
 
-        // Calculate position
         auto it = poolMap_.find(dataIdx);
         if (it == poolMap_.end()) return;
         auto& item = pool_[it->second];
 
-        Vec2 itemContentPos = getItemPosition(dataIdx);
-        float scrollY = scrollContainer_->getScrollY();
-        float previewSize = itemSize_ * 0.7f;
-        float ox = itemContentPos.x + item->getWidth() * 0.5f;
-        float oy = itemContentPos.y + item->getHeight() * 0.5f - scrollY;
+        // Attach preview as child of the card — follows scroll automatically
+        item->addChild(companionPreview_);
 
-        // Clamp to grid bounds
-        if (ox + previewSize > getWidth()) ox = getWidth() - previewSize - 4;
-        if (oy + previewSize + 14 > getHeight()) oy = getHeight() - previewSize - 18;
+        float previewSize = itemSize_ * 0.7f;
+        // Position relative to card: offset to bottom-right, overlapping
+        float ox = item->getWidth() * 0.5f;
+        float oy = item->getHeight() * 0.5f;
 
         // Get extension label
         string ext;
