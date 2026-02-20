@@ -18,6 +18,7 @@
 #include <deque>
 #include <condition_variable>
 #include <sys/stat.h>
+#include <vecLib/vDSP.h>
 
 using namespace std;
 using namespace tc;
@@ -1944,6 +1945,7 @@ public:
 
         // Compare with all cached image embeddings
         vector<SearchResult> all;
+        all.reserve(embeddingCache_.size());
         for (const auto& [id, imgEmb] : embeddingCache_) {
             float score = cosineSimilarity(textEmb, imgEmb);
             all.push_back({id, score});
@@ -2372,7 +2374,11 @@ private:
     static float cosineSimilarity(const vector<float>& a, const vector<float>& b) {
         if (a.size() != b.size() || a.empty()) return 0;
         float dot = 0;
+#ifdef __APPLE__
+        vDSP_dotpr(a.data(), 1, b.data(), 1, &dot, (vDSP_Length)a.size());
+#else
         for (size_t i = 0; i < a.size(); i++) dot += a[i] * b[i];
+#endif
         // Both vectors are already L2-normalized, so dot product = cosine similarity
         return dot;
     }

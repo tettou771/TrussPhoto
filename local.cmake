@@ -5,7 +5,7 @@
 # =============================================================================
 
 if(APPLE)
-    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework MetalPerformanceShaders")
+    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework MetalPerformanceShaders" "-framework Accelerate")
 endif()
 
 if(NOT EMSCRIPTEN)
