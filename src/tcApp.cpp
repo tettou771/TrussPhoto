@@ -1095,6 +1095,12 @@ void tcApp::keyPressed(int key) {
     if (key == 'M' || key == 'm') {
         if (viewMode() == ViewMode::Single || viewMode() == ViewMode::Grid ||
             viewMode() == ViewMode::Related || viewMode() == ViewMode::People) {
+            // Capture current photo before switching away from SingleView
+            string focusPhotoId;
+            if (viewMode() == ViewMode::Single) {
+                focusPhotoId = singleView->currentPhotoId();
+            }
+
             // Switch to map from any view
             viewManager_->switchTo(ViewMode::Grid);  // clean up current view first
 
@@ -1111,17 +1117,21 @@ void tcApp::keyPressed(int key) {
             }
             mapView->setPhotos(photos, ids, provider_);
 
-            // Pass grid selection to strip
-            auto selectedIds = g->getSelectedIds();
-            if (!selectedIds.empty()) {
-                mapView->setStripSelection(selectedIds[0]);
+            // Determine which photo to center on
+            if (focusPhotoId.empty()) {
+                auto selectedIds = g->getSelectedIds();
+                if (!selectedIds.empty()) focusPhotoId = selectedIds[0];
+            }
+
+            if (!focusPhotoId.empty()) {
+                mapView->setStripSelection(focusPhotoId);
             }
 
             viewManager_->switchTo(ViewMode::Map);
 
-            // Center on selected photo at zoom 14, or fit all bounds
-            if (!selectedIds.empty()) {
-                mapView->centerOnPhoto(selectedIds[0]);
+            // Center on focus photo at zoom 14, or fit all bounds
+            if (!focusPhotoId.empty()) {
+                mapView->centerOnPhoto(focusPhotoId);
             } else {
                 mapView->fitBounds();
             }
