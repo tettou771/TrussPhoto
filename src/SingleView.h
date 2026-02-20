@@ -18,6 +18,7 @@
 #include "LensCorrector.h"
 #include "DevelopShader.h"
 #include "GuidedFilter.h"
+#include "ContextMenu.h"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -44,6 +45,9 @@ public:
     // Callback when photo changes (for DevelopPanel slider sync)
     function<void(float exposure, float wbTemp, float wbTint,
                   float chroma, float luma)> onDevelopRestored;
+
+    // Right-click context menu
+    function<void(ContextMenu::Ptr)> onContextMenu;
 
     void setup() override {
         enableEvents();
@@ -476,6 +480,10 @@ public:
 protected:
     // Node event handlers (dispatched by the Node tree, not tcApp)
     bool onMousePress(Vec2 pos, int button) override {
+        if (button == 1 && onContextMenu && ctx_) {
+            buildContextMenu();
+            return true;
+        }
         if (button == 0) {
             if (isVideo_) {
                 float barY = getHeight() - seekBarHeight_;
@@ -892,6 +900,43 @@ private:
         char buf[16];
         snprintf(buf, sizeof(buf), "%d:%02d", m, s);
         return buf;
+    }
+
+    void buildContextMenu() {
+        if (!ctx_ || selectedIndex_ < 0) return;
+        if (selectedIndex_ >= (int)ctx_->grid->getPhotoIdCount()) return;
+
+        const string& photoId = ctx_->grid->getPhotoId(selectedIndex_);
+        auto* entry = ctx_->provider->getPhoto(photoId);
+        if (!entry) return;
+
+        auto menu = make_shared<ContextMenu>();
+
+        // Reset develop settings
+        menu->addChild(make_shared<MenuItem>("Reset Develop",
+            [this, photoId]() {
+                exposure_ = 0; wbTemp_ = 0; wbTint_ = 0;
+                chromaDenoise_ = 0.5f; lumaDenoise_ = 0;
+                developShader_.setExposure(0);
+                developShader_.setWbTemp(0);
+                developShader_.setWbTint(0);
+                needsFboRender_ = true;
+                if (ctx_) ctx_->provider->setDevelop(photoId, 0, 0, 0, 0.5f, 0);
+                if (onDevelopRestored) onDevelopRestored(0, 0, 0, 0.5f, 0);
+                if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+            }));
+
+        menu->addChild(make_shared<MenuSeparator>());
+
+        // Show in Finder
+        if (!entry->localPath.empty()) {
+            menu->addChild(make_shared<MenuItem>("Show in Finder",
+                [path = entry->localPath]() {
+                    revealInFinder(path);
+                }));
+        }
+
+        onContextMenu(menu);
     }
 
     void loadProfileForEntry(const PhotoEntry& entry) {

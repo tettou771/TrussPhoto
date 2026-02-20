@@ -350,6 +350,26 @@ void tcApp::setup() {
         }
     };
 
+    // Context menu callbacks
+    grid()->onContextMenu = [this](ContextMenu::Ptr menu) {
+        showContextMenu(menu);
+    };
+    grid()->onDeleteRequest = [this](vector<string> ids) {
+        int count = (int)ids.size();
+        string msg = format("Delete {} photo{}?\nThis will permanently remove the file{} from disk.",
+            count, count > 1 ? "s" : "", count > 1 ? "s" : "");
+        if (confirmDialog("Delete Photos", msg)) {
+            int deleted = provider_.deletePhotos(ids);
+            logNotice() << "[Delete] Removed " << deleted << " photos";
+            grid()->populate(provider_);
+            rebuildFolderTree();
+            redraw();
+        }
+    };
+    viewManager_->singleView()->onContextMenu = [this](ContextMenu::Ptr menu) {
+        showContextMenu(menu);
+    };
+
     // Display previous library immediately
     if (hasLibrary && provider_.getCount() > 0) {
         grid()->populate(provider_);
@@ -793,6 +813,12 @@ void tcApp::draw() {
 void tcApp::keyPressed(int key) {
     redraw(3);
 
+    // ESC closes context menu first (if open)
+    if (key == SAPP_KEYCODE_ESCAPE && contextMenu_) {
+        closeContextMenu();
+        return;
+    }
+
     auto singleView = viewManager_->singleView();
     auto peopleView = viewManager_->peopleView();
     auto g = grid();
@@ -1141,8 +1167,43 @@ void tcApp::keyReleased(int key) {
 }
 
 void tcApp::mousePressed(Vec2 pos, int button) {
+    // Record right-click position for context menu placement
+    if (button == 1) {
+        lastRightClickPos_ = pos;
+    }
+
     if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related ||
         viewMode() == ViewMode::People || viewMode() == ViewMode::Single) return;
+}
+
+void tcApp::showContextMenu(ContextMenu::Ptr menu) {
+    closeContextMenu();
+
+    // Full-screen overlay to catch outside clicks
+    menuOverlay_ = make_shared<MenuOverlay>();
+    menuOverlay_->setSize(getWindowWidth(), getWindowHeight());
+    menuOverlay_->onClick = [this]() { closeContextMenu(); };
+    addChild(menuOverlay_);
+
+    // Position and add menu (last child = z-order frontmost)
+    menu->setPos(lastRightClickPos_.x, lastRightClickPos_.y);
+    addChild(menu);
+    menu->finalizeLayout();
+    menu->onClose = [this]() { closeContextMenu(); };
+    contextMenu_ = menu;
+    redraw();
+}
+
+void tcApp::closeContextMenu() {
+    if (contextMenu_) {
+        contextMenu_->destroy();  // deferred removal (safe during event/draw)
+        contextMenu_ = nullptr;
+    }
+    if (menuOverlay_) {
+        menuOverlay_->destroy();
+        menuOverlay_ = nullptr;
+    }
+    redraw();
 }
 
 void tcApp::mouseReleased(Vec2 pos, int button) {

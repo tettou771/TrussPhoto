@@ -297,6 +297,7 @@ public:
 
     // Callbacks (set by parent)
     function<void()> onClick;
+    function<void()> onRightClick;
     function<void()> onStackClick;
     function<void(int)> onRequestLoad;
     function<void(int)> onRequestUnload;
@@ -475,6 +476,10 @@ protected:
         (void)local;
         if (button == 0 && onClick) {
             onClick();
+        }
+        if (button == 1 && onRightClick) {
+            onRightClick();
+            return true;
         }
         return RectNode::onMousePress(local, button);
     }

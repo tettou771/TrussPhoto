@@ -9,6 +9,7 @@
 #include "PhotoItem.h"
 #include "AsyncImageLoader.h"
 #include "RecyclerGrid.h"
+#include "ContextMenu.h"
 #include "FolderTree.h"  // for loadJapaneseFont
 using namespace std;
 using namespace tc;
@@ -21,6 +22,7 @@ public:
     // Callbacks
     function<void(int)> onItemClick;           // normal click -> full view
     function<void(vector<string>)> onDeleteRequest;  // delete selected photos
+    function<void(ContextMenu::Ptr)> onContextMenu;  // right-click -> context menu
 
     PhotoGrid() {
         itemWidth_ = 140;
@@ -253,6 +255,31 @@ protected:
             if (dataIdx >= 0 && onItemClick) {
                 onItemClick(dataIdx);
             }
+        };
+
+        item->onRightClick = [this, poolIdx]() {
+            int dataIdx = reverseMap_[poolIdx];
+            if (dataIdx < 0 || !onContextMenu || !provider_) return;
+
+            string photoId = photoIds_[dataIdx];
+            auto* photo = provider_->getPhoto(photoId);
+            if (!photo) return;
+
+            auto menu = make_shared<ContextMenu>();
+
+            menu->addChild(make_shared<MenuItem>("Show in Finder",
+                [path = photo->localPath]() {
+                    revealInFinder(path);
+                }));
+
+            menu->addChild(make_shared<MenuSeparator>());
+
+            menu->addChild(make_shared<MenuItem>("Delete",
+                [this, photoId]() {
+                    if (onDeleteRequest) onDeleteRequest({photoId});
+                }));
+
+            onContextMenu(menu);
         };
 
         item->onStackClick = [this, poolIdx]() {

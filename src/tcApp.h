@@ -15,6 +15,7 @@
 #include "DevelopPanel.h"
 #include "PaneToggle.h"
 #include "SearchBar.h"
+#include "ContextMenu.h"
 #include "ViewManager.h"
 #include "UploadQueue.h"
 #include "ServerConfig.h"
@@ -87,6 +88,14 @@ private:
     bool spQueued_ = false;
     bool embeddingsQueued_ = false;
     bool visionModelUnloaded_ = false;
+
+    // Context menu
+    ContextMenu::Ptr contextMenu_;
+    MenuOverlay::Ptr menuOverlay_;
+    Vec2 lastRightClickPos_;
+
+    void showContextMenu(ContextMenu::Ptr menu);
+    void closeContextMenu();
 
     // Modifier key tracking
     bool cmdDown_ = false;
