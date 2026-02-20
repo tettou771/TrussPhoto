@@ -2,7 +2,7 @@
 
 // =============================================================================
 // DevelopShader.h - Unified develop shader (lens + crop + LUT in one pass)
-// Renders to an offscreen RGB10A2 FBO for 10-bit color output.
+// Renders to an offscreen RGBA32F FBO for full-precision color output.
 // Result texture can be drawn by the Node tree like any other texture.
 // =============================================================================
 
@@ -30,12 +30,12 @@ public:
             return false;
         }
 
-        // Offscreen pipeline (RGB10A2, no blend, no depth)
+        // Offscreen pipeline (RGBA32F, no blend, no depth)
         sg_pipeline_desc pip_desc = {};
         pip_desc.shader = shader_;
         pip_desc.layout.attrs[ATTR_develop_develop_position].format = SG_VERTEXFORMAT_FLOAT2;
         pip_desc.layout.attrs[ATTR_develop_develop_texcoord0].format = SG_VERTEXFORMAT_FLOAT2;
-        pip_desc.colors[0].pixel_format = SG_PIXELFORMAT_RGB10A2;
+        pip_desc.colors[0].pixel_format = SG_PIXELFORMAT_RGBA32F;
         pip_desc.colors[0].blend.enabled = false;
         pip_desc.depth.pixel_format = SG_PIXELFORMAT_NONE;
         pip_desc.sample_count = 1;
@@ -299,6 +299,7 @@ public:
     sg_sampler getFboSampler() const { return linearSmp_; }
     int getFboWidth() const { return fboW_; }
     int getFboHeight() const { return fboH_; }
+    sg_image getFboImage() const { return fboImg_; }
 
     void invalidateFbo() { fboReady_ = false; }
 
@@ -348,7 +349,7 @@ private:
     sg_image dummyLut3DImg_ = {};
     sg_view dummyLut3DView_ = {};
 
-    // Offscreen FBO (RGB10A2)
+    // Offscreen FBO (RGBA32F)
     sg_image fboImg_ = {};
     sg_view fboAttView_ = {};   // attachment view (render target)
     sg_view fboTexView_ = {};   // texture view (for sampling)
@@ -365,12 +366,12 @@ private:
             sg_destroy_image(fboImg_);
         }
 
-        // Create RGB10A2 render target
+        // Create RGBA32F render target
         sg_image_desc desc = {};
         desc.usage.color_attachment = true;
         desc.width = w;
         desc.height = h;
-        desc.pixel_format = SG_PIXELFORMAT_RGB10A2;
+        desc.pixel_format = SG_PIXELFORMAT_RGBA32F;
         desc.sample_count = 1;
         desc.label = "develop_fbo_img";
         fboImg_ = sg_make_image(&desc);

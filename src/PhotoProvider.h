@@ -43,6 +43,7 @@ public:
 
     // Set all paths from a single catalog directory
     void setCatalogDir(const string& catalogPath) {
+        catalogDir_        = catalogPath;
         thumbnailCacheDir_ = catalogPath + "/thumbnail_cache";
         smartPreviewDir_   = catalogPath + "/smart_preview";
         databasePath_      = catalogPath + "/library.db";
@@ -51,6 +52,8 @@ public:
         fs::create_directories(smartPreviewDir_);
         fs::create_directories(pendingDir_);
     }
+
+    const string& getCatalogDir() const { return catalogDir_; }
 
     void setRawStoragePath(const string& path) {
         rawStoragePath_ = path;
@@ -2270,6 +2273,7 @@ private:
     PhotoDatabase db_;
     unordered_map<string, PhotoEntry> photos_;
     unordered_map<string, vector<string>> stackIndex_; // stackId -> member ids
+    string catalogDir_;
     string thumbnailCacheDir_;
     string databasePath_;
     string jsonMigrationPath_;

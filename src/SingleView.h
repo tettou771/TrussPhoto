@@ -19,6 +19,7 @@
 #include "DevelopShader.h"
 #include "GuidedFilter.h"
 #include "ContextMenu.h"
+#include "PhotoExporter.h"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -610,6 +611,27 @@ public:
         return !id.empty() && ctx_->provider->getCachedEmbedding(id);
     }
 
+    void doExport() {
+        if (!developShader_.isFboReady() || !ctx_) return;
+        string pid = currentPhotoId();
+        auto* entry = ctx_->provider->getPhoto(pid);
+        if (!entry) return;
+
+        string outPath = PhotoExporter::makeExportPath(
+            ctx_->provider->getCatalogDir(), entry->filename);
+
+        ExportSettings settings;
+        settings.maxEdge = 0;  // full resolution
+        settings.quality = 92;
+
+        if (PhotoExporter::exportJpeg(developShader_, outPath, settings)) {
+            logNotice() << "[Export] " << outPath;
+            revealInFinder(outPath);
+        } else {
+            logError() << "[Export] Failed";
+        }
+    }
+
     void joinRawLoadThread() {
         if (rawLoadThread_.joinable()) rawLoadThread_.join();
     }
@@ -927,6 +949,12 @@ private:
             }));
 
         menu->addChild(make_shared<MenuSeparator>());
+
+        // Export JPEG
+        if (developShader_.isFboReady()) {
+            menu->addChild(make_shared<MenuItem>("Export JPEG",
+                [this]() { doExport(); }));
+        }
 
         // Show in Finder
         if (!entry->localPath.empty()) {

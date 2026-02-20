@@ -909,6 +909,10 @@ void tcApp::keyPressed(int key) {
             updateLayout();
         }
 
+        if (key == 'E' || key == 'e') {
+            singleView->doExport();
+        }
+
         // Update metadata panel with current state
         singleView->updateMetadata();
     } else if (viewMode() == ViewMode::People) {
