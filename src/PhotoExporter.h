@@ -24,31 +24,60 @@ namespace PhotoExporter {
 // Implemented in PhotoExporter.mm (Metal API)
 bool readFboPixels(sg_image fboImg, int w, int h, Pixels& outPixels);
 
-// Bilinear downscale (U8 RGBA)
+// Area-averaging downscale (U8 RGBA)
+// Each output pixel averages ALL source pixels in the corresponding region.
+// Equivalent to OpenCV INTER_AREA — no pixel skipping, no aliasing.
 inline void resizeU8(const Pixels& src, Pixels& dst, int newW, int newH) {
     int srcW = src.getWidth(), srcH = src.getHeight();
     int ch = src.getChannels();
     dst.allocate(newW, newH, ch);
     auto* srcData = src.getData();
     auto* dstData = dst.getData();
+
+    float scaleX = (float)srcW / newW;
+    float scaleY = (float)srcH / newH;
+
     for (int y = 0; y < newH; y++) {
-        float srcYf = (y + 0.5f) * srcH / newH - 0.5f;
-        int y0 = max(0, (int)floor(srcYf));
-        int y1 = min(srcH - 1, y0 + 1);
-        float fy = srcYf - y0;
+        float srcY0 = y * scaleY;
+        float srcY1 = (y + 1) * scaleY;
+        int iy0 = (int)srcY0;
+        int iy1 = min((int)srcY1, srcH - 1);
+
         for (int x = 0; x < newW; x++) {
-            float srcXf = (x + 0.5f) * srcW / newW - 0.5f;
-            int x0 = max(0, (int)floor(srcXf));
-            int x1 = min(srcW - 1, x0 + 1);
-            float fx = srcXf - x0;
+            float srcX0 = x * scaleX;
+            float srcX1 = (x + 1) * scaleX;
+            int ix0 = (int)srcX0;
+            int ix1 = min((int)srcX1, srcW - 1);
+
+            float sum[4] = {0, 0, 0, 0};
+            float totalWeight = 0;
+
+            for (int sy = iy0; sy <= iy1; sy++) {
+                // Vertical coverage of this source row
+                float wy = 1.0f;
+                if (sy == iy0) wy = 1.0f - (srcY0 - iy0);
+                if (sy == iy1 && iy1 != iy0) wy = srcY1 - iy1;
+                if (sy == iy0 && sy == iy1) wy = srcY1 - srcY0;
+
+                for (int sx = ix0; sx <= ix1; sx++) {
+                    float wx = 1.0f;
+                    if (sx == ix0) wx = 1.0f - (srcX0 - ix0);
+                    if (sx == ix1 && ix1 != ix0) wx = srcX1 - ix1;
+                    if (sx == ix0 && sx == ix1) wx = srcX1 - srcX0;
+
+                    float w = wx * wy;
+                    int idx = (sy * srcW + sx) * ch;
+                    for (int c = 0; c < ch; c++) {
+                        sum[c] += srcData[idx + c] * w;
+                    }
+                    totalWeight += w;
+                }
+            }
+
+            int outIdx = (y * newW + x) * ch;
+            float invW = 1.0f / totalWeight;
             for (int c = 0; c < ch; c++) {
-                float v00 = srcData[(y0 * srcW + x0) * ch + c];
-                float v10 = srcData[(y0 * srcW + x1) * ch + c];
-                float v01 = srcData[(y1 * srcW + x0) * ch + c];
-                float v11 = srcData[(y1 * srcW + x1) * ch + c];
-                float v = v00*(1-fx)*(1-fy) + v10*fx*(1-fy)
-                        + v01*(1-fx)*fy + v11*fx*fy;
-                dstData[(y * newW + x) * ch + c] = (unsigned char)clamp(v, 0.f, 255.f);
+                dstData[outIdx + c] = (unsigned char)clamp(sum[c] * invW, 0.f, 255.f);
             }
         }
     }

@@ -20,6 +20,7 @@
 #include "GuidedFilter.h"
 #include "ContextMenu.h"
 #include "PhotoExporter.h"
+#include "ExportDialog.h"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -613,23 +614,25 @@ public:
 
     void doExport() {
         if (!developShader_.isFboReady() || !ctx_) return;
-        string pid = currentPhotoId();
-        auto* entry = ctx_->provider->getPhoto(pid);
-        if (!entry) return;
 
-        string outPath = PhotoExporter::makeExportPath(
-            ctx_->provider->getCatalogDir(), entry->filename);
-
-        ExportSettings settings;
-        settings.maxEdge = 0;  // full resolution
-        settings.quality = 92;
-
-        if (PhotoExporter::exportJpeg(developShader_, outPath, settings)) {
-            logNotice() << "[Export] " << outPath;
-            revealInFinder(outPath);
-        } else {
-            logError() << "[Export] Failed";
+        if (!exportDialog_) {
+            exportDialog_ = make_shared<ExportDialog>();
+            exportDialog_->onExport = [this](const ExportSettings& s) {
+                executeExport(s);
+            };
+            exportDialog_->onCancel = [this]() {
+                exportDialog_->hide();
+                if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+            };
+            addChild(exportDialog_);
+            exportDialog_->setActive(false);
         }
+
+        int srcW = developShader_.getFboWidth();
+        int srcH = developShader_.getFboHeight();
+        exportDialog_->setSize(getWidth(), getHeight());
+        exportDialog_->show(lastExportSettings_, srcW, srcH);
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
     void joinRawLoadThread() {
@@ -637,6 +640,26 @@ public:
     }
 
 private:
+    void executeExport(const ExportSettings& settings) {
+        if (exportDialog_) exportDialog_->hide();
+        lastExportSettings_ = settings;
+
+        string pid = currentPhotoId();
+        auto* entry = ctx_->provider->getPhoto(pid);
+        if (!entry) return;
+
+        string outPath = PhotoExporter::makeExportPath(
+            ctx_->provider->getCatalogDir(), entry->filename);
+
+        if (PhotoExporter::exportJpeg(developShader_, outPath, settings)) {
+            logNotice() << "[Export] " << outPath;
+            revealInFinder(outPath);
+        } else {
+            logError() << "[Export] Failed";
+        }
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+    }
+
     ViewContext* ctx_ = nullptr;
 
     // Image state
@@ -696,6 +719,10 @@ private:
     bool isVideo_ = false;
     bool seekDragging_ = false;
     float seekBarHeight_ = 40.0f;
+
+    // Export dialog
+    ExportDialog::Ptr exportDialog_;
+    ExportSettings lastExportSettings_ = {0, 92}; // Full res, quality 92
 
     // Draw a texture by view+sampler via sgl (for FBO result)
     void drawTextureView(sg_view view, sg_sampler sampler,
