@@ -233,9 +233,20 @@ public:
                 int orient = j.value("orient", 1);
                 int cx = cropX_, cy = cropY_, cw = cropW_, ch = cropH_;
                 // Need intermediate dims for transformation.
-                // Use intW/intH if available, otherwise approximate from pixel dims.
-                int iw = (intW_ > 0) ? intW_ : width;
-                int ih = (intH_ > 0) ? intH_ : height;
+                // intW_/intH_ in DB are post-rotation (portrait): intW=short, intH=long.
+                // Crop coords are pre-rotation (landscape): cx/cw along long edge.
+                // When estimating, crop-based values are landscape, so swap for portrait.
+                int iw, ih;
+                if (intW_ > 0 && intH_ > 0) {
+                    iw = intW_;  ih = intH_;
+                } else {
+                    // Estimate landscape dims from crop + symmetric margin assumption
+                    int estLandW = cx + cw + cx;
+                    int estLandH = cy + ch + cy;
+                    // Swap to match post-rotation convention (portrait: W=short, H=long)
+                    iw = estLandH;
+                    ih = estLandW;
+                }
                 if (orient == 6) {
                     cropX_ = iw - cy - ch;
                     cropY_ = cx;
@@ -371,11 +382,8 @@ public:
             out[0] = 0; out[1] = 0; out[2] = 1; out[3] = 1;
             return;
         }
-        float scaleX = 1.0f, scaleY = 1.0f;
-        if (intW_ > 0 && intH_ > 0 && srcW != intW_) {
-            scaleX = (float)srcW / intW_;
-            scaleY = (float)srcH / intH_;
-        }
+        float scaleX, scaleY;
+        getCropScale(srcW, srcH, scaleX, scaleY);
         float cx = cropX_ * scaleX;
         float cy = cropY_ * scaleY;
         float cw = cropW_ * scaleX;
@@ -427,15 +435,31 @@ private:
     // Needed to scale crop coordinates for smart preview display.
     int intW_ = 0, intH_ = 0;
 
+    // Compute scale factors from intermediate → source dimensions.
+    // Handles missing intW/intH by estimating from crop margins.
+    void getCropScale(int srcW, int srcH, float& scaleX, float& scaleY) const {
+        scaleX = 1.0f;
+        scaleY = 1.0f;
+        if (intW_ > 0 && intH_ > 0 && srcW != intW_) {
+            scaleX = (float)srcW / intW_;
+            scaleY = (float)srcH / intH_;
+        } else if (intW_ == 0 && hasDefaultCrop_ &&
+                   (cropX_ + cropW_ > srcW || cropY_ + cropH_ > srcH)) {
+            // intW/intH not in DB yet (photo never opened full-size).
+            // Estimate intermediate size assuming symmetric sensor margins.
+            float estIntW = cropX_ + cropW_ + cropX_;
+            float estIntH = cropY_ + cropH_ + cropY_;
+            scaleX = (float)srcW / estIntW;
+            scaleY = (float)srcH / estIntH;
+        }
+    }
+
     // Helper: compute output dimensions and crop center from current state
     void getCropCenter(int srcW, int srcH, int& outW, int& outH,
                        float& cropCx, float& cropCy) const {
         if (hasDefaultCrop_) {
-            float scaleX = 1.0f, scaleY = 1.0f;
-            if (intW_ > 0 && intH_ > 0 && srcW != intW_) {
-                scaleX = (float)srcW / intW_;
-                scaleY = (float)srcH / intH_;
-            }
+            float scaleX, scaleY;
+            getCropScale(srcW, srcH, scaleX, scaleY);
             outW = max(1, (int)round(cropW_ * scaleX));
             outH = max(1, (int)round(cropH_ * scaleY));
             cropCx = cropX_ * scaleX + (outW - 1) * 0.5f;
