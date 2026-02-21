@@ -21,6 +21,7 @@
 #include "ContextMenu.h"
 #include "PhotoExporter.h"
 #include "ExportDialog.h"
+#include "VideoSeekBar.h"
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -113,6 +114,24 @@ public:
                     isVideo_ = true;
                     videoPlayer_.play();
                     loaded = true;
+
+                    // Create seek bar (lazily, once)
+                    if (!videoSeekBar_) {
+                        videoSeekBar_ = make_shared<VideoSeekBar>();
+                        seekBarPlayPauseListener_ = videoSeekBar_->playPauseToggled.listen([this]() {
+                            videoPlayer_.togglePause();
+                            if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+                        });
+                        seekBarSeekListener_ = videoSeekBar_->seeked.listen([this](float& pct) {
+                            videoPlayer_.setPosition(pct);
+                            if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+                        });
+                        addChild(videoSeekBar_);
+                        videoSeekBar_->setActive(false);
+                    }
+                    videoSeekBar_->setRect(0, getHeight() - 40, getWidth(), 40);
+                    videoSeekBar_->setActive(true);
+
                     if (ctx_->redraw) ctx_->redraw(1);
                 }
             }
@@ -217,6 +236,13 @@ public:
         videoPlayer_.update();
         if (videoPlayer_.isFrameNew()) {
             if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+        }
+        // Sync video state to seek bar
+        if (videoSeekBar_ && videoSeekBar_->getActive()) {
+            videoSeekBar_->setPosition(videoPlayer_.getPosition());
+            videoSeekBar_->setDuration(videoPlayer_.getDuration());
+            videoSeekBar_->setPlaying(videoPlayer_.isPlaying());
+            videoSeekBar_->setRect(0, getHeight() - 40, getWidth(), 40);
         }
     }
 
@@ -573,16 +599,7 @@ protected:
             return true;
         }
         if (button == 0) {
-            if (isVideo_) {
-                float barY = getHeight() - seekBarHeight_;
-                if (pos.y >= barY) {
-                    seekDragging_ = true;
-                    float pct = clamp(pos.x / getWidth(), 0.0f, 1.0f);
-                    videoPlayer_.setPosition(pct);
-                    return true;
-                }
-                return false;
-            }
+            if (isVideo_) return false;
             isDragging_ = true;
             dragStart_ = pos;
             return true;
@@ -593,7 +610,6 @@ protected:
     bool onMouseRelease(Vec2 pos, int button) override {
         (void)pos;
         if (button == 0) {
-            if (seekDragging_) { seekDragging_ = false; return true; }
             isDragging_ = false;
             return true;
         }
@@ -602,12 +618,6 @@ protected:
 
     bool onMouseDrag(Vec2 pos, int button) override {
         if (button == 0) {
-            if (seekDragging_ && isVideo_) {
-                float pct = clamp(pos.x / getWidth(), 0.0f, 1.0f);
-                videoPlayer_.setPosition(pct);
-                if (ctx_ && ctx_->redraw) ctx_->redraw(1);
-                return true;
-            }
             if (isDragging_ && !isVideo_) {
                 Vec2 delta = pos - dragStart_;
                 panOffset_ = panOffset_ + delta;
@@ -818,8 +828,9 @@ private:
     // Video playback
     VideoPlayer videoPlayer_;
     bool isVideo_ = false;
-    bool seekDragging_ = false;
-    float seekBarHeight_ = 40.0f;
+    VideoSeekBar::Ptr videoSeekBar_;
+    EventListener seekBarPlayPauseListener_;
+    EventListener seekBarSeekListener_;
 
     // Export dialog
     ExportDialog::Ptr exportDialog_;
@@ -874,7 +885,7 @@ private:
         if (isVideo_) {
             videoPlayer_.close();
             isVideo_ = false;
-            seekDragging_ = false;
+            if (videoSeekBar_) videoSeekBar_->setActive(false);
         }
 
         if (rawLoadThread_.joinable()) rawLoadThread_.join();
@@ -991,7 +1002,7 @@ private:
         float imgW = videoPlayer_.getWidth();
         float imgH = videoPlayer_.getHeight();
         float winW = getWidth();
-        float winH = getHeight() - seekBarHeight_;
+        float winH = getHeight() - 40; // reserve space for seek bar
 
         float fitScale = min(winW / imgW, winH / imgH);
         float drawW = imgW * fitScale;
@@ -1001,58 +1012,6 @@ private:
 
         setColor(1.0f, 1.0f, 1.0f);
         tex.draw(x, y, drawW, drawH);
-
-        // Seek bar
-        float barY = getHeight() - seekBarHeight_;
-        float pos = videoPlayer_.getPosition();
-        float dur = videoPlayer_.getDuration();
-        float cur = pos * dur;
-
-        setColor(0, 0, 0, 0.6f);
-        fill();
-        drawRect(0, barY, getWidth(), seekBarHeight_);
-
-        float iconX = 20;
-        float iconY = barY + seekBarHeight_ / 2;
-        setColor(1, 1, 1, 0.9f);
-        if (videoPlayer_.isPlaying()) {
-            fill();
-            drawRect(iconX - 4, iconY - 8, 4, 16);
-            drawRect(iconX + 4, iconY - 8, 4, 16);
-        } else {
-            fill();
-            drawTriangle(iconX - 4, iconY - 8,
-                         iconX - 4, iconY + 8,
-                         iconX + 8, iconY);
-        }
-
-        float barX = 44;
-        float barW = getWidth() - barX - 100;
-        float barMidY = barY + seekBarHeight_ / 2;
-
-        setColor(0.3f, 0.3f, 0.35f);
-        fill();
-        drawRect(barX, barMidY - 2, barW, 4);
-
-        setColor(0.5f, 0.7f, 1.0f);
-        drawRect(barX, barMidY - 2, barW * pos, 4);
-        drawCircle(barX + barW * pos, barMidY, 6);
-
-        setColor(0.8f, 0.8f, 0.85f);
-        string timeStr = formatTime(cur) + " / " + formatTime(dur);
-        pushStyle();
-        setTextAlign(Direction::Right, Direction::Center);
-        drawBitmapString(timeStr, getWidth() - 10, barMidY);
-        popStyle();
-    }
-
-    static string formatTime(float seconds) {
-        int s = (int)seconds;
-        int m = s / 60;
-        s = s % 60;
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d:%02d", m, s);
-        return buf;
     }
 
     void buildContextMenu() {
