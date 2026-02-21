@@ -4,21 +4,20 @@
 // CropView.h - Interactive crop editing view
 // =============================================================================
 // Displays the developed FBO image with a draggable crop rectangle overlay.
-// Left area: image + crop overlay. Right 260px: CropPanel.
+// Left area: image + crop overlay. Right 220px: CropPanel.
 // =============================================================================
 
 #include <TrussC.h>
 #include "ViewContainer.h"
 #include "SingleView.h"
 #include "CropPanel.h"
+#include "CropTypes.h"
 
 using namespace std;
 using namespace tc;
 
-// Hysteresis multiplier for auto-flipping aspect orientation during corner drag.
-// The diagonal angle must exceed TAU/8 * this value (~49.5°) to trigger a flip.
-// CropView.h:19
-static constexpr float kAspectFlipThreshold = 1.1f;
+// Flip threshold: TAU/8 * this value (~47°). Slightly above 45° for hysteresis.
+static constexpr float kFlipThreshold = 1.05f;
 
 class CropView : public ViewContainer {
 public:
@@ -52,7 +51,7 @@ public:
         // Create panel in constructor so it's available before setup()
         panel_ = make_shared<CropPanel>();
 
-        panel_->onAspectChanged = [this](CropPanel::Aspect a) {
+        panel_->onAspectChanged = [this](CropAspect a) {
             applyAspect(a);
             if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         };
@@ -332,7 +331,7 @@ protected:
         float dy = (pos.y - dragStart_.y) / imgRect_.h;
 
         auto& s = dragStartCrop_;
-        bool locked = panel_->aspect() != CropPanel::Free;
+        bool locked = panel_->aspect() != CropAspect::Free;
 
         if (dragMode_ == DragMode::Move) {
             cropX_ = clamp(s.x + dx, 0.0f, 1.0f - cropW_);
@@ -364,7 +363,7 @@ protected:
                     float targetAR = getTargetAspectNorm();
                     if (targetAR > 0) {
                         if (isHoriz) {
-                            // Width changed → adjust height symmetrically
+                            // Width changed -> adjust height symmetrically
                             float cy = s.y + s.h / 2;
                             nh = nw / targetAR;
                             float maxH = min(cy, 1.0f - cy) * 2;
@@ -372,7 +371,7 @@ protected:
                             ny = cy - nh / 2;
                             if (dragMode_ == DragMode::L) nx = s.x + s.w - nw;
                         } else {
-                            // Height changed → adjust width symmetrically
+                            // Height changed -> adjust width symmetrically
                             float cx = s.x + s.w / 2;
                             nw = nh * targetAR;
                             float maxW = min(cx, 1.0f - cx) * 2;
@@ -410,7 +409,7 @@ protected:
                 if (nh < minSize) { if (moveTop) ny = s.y + s.h - minSize; nh = minSize; }
 
                 // Auto-flip orientation during corner drag (only when AR locked, not 1:1)
-                if (locked && panel_->aspect() != CropPanel::A1_1) {
+                if (locked && panel_->aspect() != CropAspect::A1_1) {
                     // Anchor corner in screen coords
                     float anchorNX = moveLeft ? (s.x + s.w) : s.x;
                     float anchorNY = moveTop  ? (s.y + s.h) : s.y;
@@ -421,13 +420,9 @@ protected:
                     float sdy = abs(pos.y - anchorSY);
                     float angle = atan2(sdy, sdx); // angle from horizontal
 
-                    float flipAngle = TAU / 8 * kAspectFlipThreshold;
-                    bool shouldFlip = false;
-                    if (isLandscape_ && angle >= flipAngle) {
-                        shouldFlip = true;
-                    } else if (!isLandscape_ && angle <= TAU / 4 - flipAngle) {
-                        shouldFlip = true;
-                    }
+                    // Angle from current orientation's axis
+                    float a = isLandscape_ ? atan2(sdy, sdx) : atan2(sdx, sdy);
+                    bool shouldFlip = (a > TAU / 8 * kFlipThreshold);
 
                     if (shouldFlip) {
                         isLandscape_ = !isLandscape_;
@@ -489,7 +484,7 @@ protected:
         factor = clamp(factor, 0.8f, 1.2f);
 
         constexpr float minSize = 0.02f;
-        bool locked = panel_->aspect() != CropPanel::Free;
+        bool locked = panel_->aspect() != CropAspect::Free;
 
         float centerX = cropX_ + cropW_ / 2;
         float centerY = cropY_ + cropH_ / 2;
@@ -579,13 +574,13 @@ private:
     float getTargetAspectNorm() {
         float ar = 0;
         switch (panel_->aspect()) {
-            case CropPanel::Original: ar = originalAspect_; break;
-            case CropPanel::A16_9:    ar = 16.0f / 9.0f; break;
-            case CropPanel::A4_3:     ar = 4.0f / 3.0f; break;
-            case CropPanel::A3_2:     ar = 3.0f / 2.0f; break;
-            case CropPanel::A1_1:     ar = 1.0f; break;
-            case CropPanel::A5_4:     ar = 5.0f / 4.0f; break;
-            case CropPanel::Free:     return 0;
+            case CropAspect::Original: ar = originalAspect_; break;
+            case CropAspect::A16_9:    ar = 16.0f / 9.0f; break;
+            case CropAspect::A4_3:     ar = 4.0f / 3.0f; break;
+            case CropAspect::A3_2:     ar = 3.0f / 2.0f; break;
+            case CropAspect::A1_1:     ar = 1.0f; break;
+            case CropAspect::A5_4:     ar = 5.0f / 4.0f; break;
+            case CropAspect::Free:     return 0;
         }
         // Flip for portrait orientation
         if (!isLandscape_) ar = 1.0f / ar;
@@ -593,31 +588,33 @@ private:
         return ar / originalAspect_;
     }
 
-    void applyAspect(CropPanel::Aspect a) {
-        if (a == CropPanel::Free) return;
+    void applyAspect(CropAspect a) {
+        if (a == CropAspect::Free) return;
 
         pushUndo();
         float normAR = getTargetAspectNorm();
         if (normAR <= 0) return;
 
-        // Fit the largest rectangle with this aspect ratio centered in crop
         float centerX = cropX_ + cropW_ / 2;
         float centerY = cropY_ + cropH_ / 2;
 
-        float newW, newH;
-        if (cropW_ / cropH_ > normAR) {
-            // Current is wider → constrain by height
-            newH = cropH_;
-            newW = newH * normAR;
+        // Compute maximum possible crop at this AR within image bounds
+        float maxW, maxH;
+        if (normAR >= 1.0f) {
+            maxW = 1.0f; maxH = 1.0f / normAR;
         } else {
-            // Current is taller → constrain by width
-            newW = cropW_;
-            newH = newW / normAR;
+            maxH = 1.0f; maxW = normAR;
         }
 
-        // Clamp to image bounds
-        newW = min(newW, 1.0f);
-        newH = min(newH, 1.0f);
+        // Scale down to preserve current crop's larger dimension
+        float currentMax = max(cropW_, cropH_);
+        float newMax = max(maxW, maxH);
+        float newW = maxW, newH = maxH;
+        if (newMax > currentMax) {
+            float s = currentMax / newMax;
+            newW *= s;
+            newH *= s;
+        }
 
         cropX_ = clamp(centerX - newW / 2, 0.0f, 1.0f - newW);
         cropY_ = clamp(centerY - newH / 2, 0.0f, 1.0f - newH);

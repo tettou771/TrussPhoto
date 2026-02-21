@@ -13,7 +13,7 @@
 #include "MapView.h"
 #include "RelatedView.h"
 #include "PeopleView.h"
-#include "CropView.h"
+#include "crop/CropView.h"
 
 using namespace std;
 using namespace tc;

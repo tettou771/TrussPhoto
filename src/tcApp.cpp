@@ -1087,12 +1087,11 @@ void tcApp::keyPressed(int key) {
                     updateLayout();
                 }
             }
-        } else if (key == 'R' || key == 'r') {
-            // R key: enter crop mode for single selected photo
+        } else if (key == 'D' || key == 'd') {
+            // D key: open selected photo in single (develop) view
             if (g->getSelectionCount() == 1) {
                 auto ids = g->getSelectedIds();
                 if (!ids.empty()) {
-                    // Find index in grid
                     for (int i = 0; i < (int)g->getPhotoIdCount(); i++) {
                         if (g->getPhotoId(i) == ids[0]) {
                             g->clearSelection();
@@ -1101,31 +1100,6 @@ void tcApp::keyPressed(int key) {
                             leftPaneWidth_ = 0;
                             leftTween_.finish();
                             updateLayout();
-
-                            // Now enter crop mode (same as R key in SingleView)
-                            auto singleView = viewManager_->singleView();
-                            if (singleView->hasFbo() && !singleView->isVideo()) {
-                                auto cv = viewManager_->cropView();
-                                cv->onDone_ = [this]() {
-                                    viewManager_->switchTo(ViewMode::Single);
-                                    if (showDevelop_) {
-                                        if (developPanel_) developPanel_->setActive(true);
-                                        if (metadataPanel_) metadataPanel_->setActive(false);
-                                    } else {
-                                        if (metadataPanel_) metadataPanel_->setActive(true);
-                                    }
-                                    updateLayout();
-                                };
-                                viewManager_->switchTo(ViewMode::Crop);
-                                cv->enterCrop();
-                                if (metadataPanel_) metadataPanel_->setActive(false);
-                                if (developPanel_) developPanel_->setActive(false);
-                                rightPaneWidth_ = 0;
-                                rightTween_.finish();
-                                leftPaneWidth_ = 0;
-                                leftTween_.finish();
-                                updateLayout();
-                            }
                             break;
                         }
                     }
