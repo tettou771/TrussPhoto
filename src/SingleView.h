@@ -329,74 +329,90 @@ public:
             }
         }
 
-        float imgW, imgH;
+        // Source dimensions (what we're reading from)
+        float srcW, srcH;
         if (hasFbo) {
-            imgW = (float)displayW_ * ucW;
-            imgH = (float)displayH_ * ucH;
+            srcW = (float)displayW_;
+            srcH = (float)displayH_;
         } else if (hasPreviewRaw) {
-            imgW = previewTexture_.getWidth() * ucW;
-            imgH = previewTexture_.getHeight() * ucH;
+            srcW = previewTexture_.getWidth();
+            srcH = previewTexture_.getHeight();
         } else {
-            imgW = fullImage_.getWidth() * ucW;
-            imgH = fullImage_.getHeight() * ucH;
+            srcW = fullImage_.getWidth();
+            srcH = fullImage_.getHeight();
         }
 
         float totalRot = ucRot90 * TAU / 4 + ucAngle;
+        bool hasRotation = (totalRot != 0);
 
-        // For 90° rotations (odd multiples), swap display dimensions
-        bool swapDims = (ucRot90 % 2 != 0);
-        float fitW = swapDims ? imgH : imgW;
-        float fitH = swapDims ? imgW : imgH;
-
-        // Account for fine rotation in bounding box
-        if (ucAngle != 0) {
-            float absA = abs(ucAngle);
-            float cA = cos(absA), sA = sin(absA);
-            float bw = fitW * cA + fitH * sA;
-            float bh = fitW * sA + fitH * cA;
-            fitW = bw;
-            fitH = bh;
+        // Compute bounding box of rotated source image
+        float bbW = srcW, bbH = srcH;
+        if (hasRotation) {
+            float absRot = abs(totalRot);
+            float cosA = cos(absRot), sinA = sin(absRot);
+            bbW = srcW * cosA + srcH * sinA;
+            bbH = srcW * sinA + srcH * cosA;
         }
 
-        auto [x, y, drawW, drawH] = calcDrawRect(fitW, fitH);
+        // Crop area in BB pixels (the output dimensions)
+        float cropPxW = ucW * bbW;
+        float cropPxH = ucH * bbH;
 
-        // Actual image draw size (before rotation bounding box expansion)
-        float actualDrawW, actualDrawH;
-        {
-            float winW = getWidth(), winH = getHeight();
-            float fitScale = min(winW / fitW, winH / fitH) * zoomLevel_;
-            actualDrawW = imgW * fitScale;
-            actualDrawH = imgH * fitScale;
-        }
+        auto [x, y, drawW, drawH] = calcDrawRect(cropPxW, cropPxH);
 
-        // Draw center
-        float cx = x + drawW / 2;
-        float cy = y + drawH / 2;
+        if (hasRotation && hasFbo) {
+            // Per-vertex UV mapping for rotated + cropped display
+            float drawCX = x + drawW / 2;
+            float drawCY = y + drawH / 2;
 
-        if (totalRot != 0) {
-            pushMatrix();
-            translate(cx, cy);
-            rotate(totalRot);
-            translate(-cx, -cy);
-        }
+            // Crop center offset from BB center (in BB pixels)
+            float cropCenterBBX = (ucX + ucW / 2 - 0.5f) * bbW;
+            float cropCenterBBY = (ucY + ucH / 2 - 0.5f) * bbH;
 
-        // Center the actual image within the draw rect
-        float ix = cx - actualDrawW / 2;
-        float iy = cy - actualDrawH / 2;
+            // Screen pixels per BB pixel
+            float scale = drawW / cropPxW;
 
-        setColor(1.0f, 1.0f, 1.0f);
-        if (hasFbo) {
-            drawTextureView(developShader_.getFboView(), developShader_.getFboSampler(),
-                            ix, iy, actualDrawW, actualDrawH,
-                            ucX, ucY, ucX + ucW, ucY + ucH);
-        } else if (hasPreviewRaw) {
-            previewTexture_.draw(ix, iy, actualDrawW, actualDrawH);
+            // Screen point -> texture UV via inverse rotation
+            auto screenToUV = [&](float sx, float sy) -> pair<float,float> {
+                float bbx = (sx - drawCX) / scale + cropCenterBBX;
+                float bby = (sy - drawCY) / scale + cropCenterBBY;
+                float cosR = cos(-totalRot), sinR = sin(-totalRot);
+                float ix = bbx * cosR - bby * sinR;
+                float iy = bbx * sinR + bby * cosR;
+                float u = ix / srcW + 0.5f;
+                float v = iy / srcH + 0.5f;
+                return {u, v};
+            };
+
+            auto [u0, v0] = screenToUV(x, y);
+            auto [u1, v1] = screenToUV(x + drawW, y);
+            auto [u2, v2] = screenToUV(x + drawW, y + drawH);
+            auto [u3, v3] = screenToUV(x, y + drawH);
+
+            setColor(1.0f, 1.0f, 1.0f);
+            sgl_enable_texture();
+            sgl_texture(developShader_.getFboView(), developShader_.getFboSampler());
+            Color col = getDefaultContext().getColor();
+            sgl_begin_quads();
+            sgl_c4f(col.r, col.g, col.b, col.a);
+            sgl_v2f_t2f(x, y, u0, v0);
+            sgl_v2f_t2f(x + drawW, y, u1, v1);
+            sgl_v2f_t2f(x + drawW, y + drawH, u2, v2);
+            sgl_v2f_t2f(x, y + drawH, u3, v3);
+            sgl_end();
+            sgl_disable_texture();
         } else {
-            fullImage_.draw(ix, iy, actualDrawW, actualDrawH);
-        }
-
-        if (totalRot != 0) {
-            popMatrix();
+            // No rotation: simple axis-aligned draw
+            setColor(1.0f, 1.0f, 1.0f);
+            if (hasFbo) {
+                drawTextureView(developShader_.getFboView(), developShader_.getFboSampler(),
+                                x, y, drawW, drawH,
+                                ucX, ucY, ucX + ucW, ucY + ucH);
+            } else if (hasPreviewRaw) {
+                previewTexture_.draw(x, y, drawW, drawH);
+            } else {
+                fullImage_.draw(x, y, drawW, drawH);
+            }
         }
     }
 

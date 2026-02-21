@@ -140,10 +140,13 @@ public:
         angleSlider_->setAngle(radians);
     }
 
+    // Per-vertex UV pairs: TL, TR, BR, BL (supports rotated crop)
     void setPreviewInfo(sg_view view, sg_sampler sampler,
                         float u0, float v0, float u1, float v1,
+                        float u2, float v2, float u3, float v3,
                         int outputW, int outputH) {
-        preview_->setPreviewInfo(view, sampler, u0, v0, u1, v1, outputW, outputH);
+        preview_->setPreviewInfo(view, sampler, u0, v0, u1, v1, u2, v2, u3, v3,
+                                 outputW, outputH);
         outputSize_->text = to_string(outputW) + " x " + to_string(outputH);
     }
 

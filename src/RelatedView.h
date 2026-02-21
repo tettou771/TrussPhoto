@@ -567,7 +567,7 @@ private:
     void startFadeOut(const unordered_set<string>& newIds,
                       const unordered_map<string, AnimSnapshot>& oldSnapshots) {
         // Mark nodes not in new layout for fade-out
-        auto& children = contentLayer_->getChildren();
+        auto children = contentLayer_->getChildren();
         for (auto& child : children) {
             auto pn = dynamic_pointer_cast<PhotoItemNode>(child);
             if (pn && !pn->fadingOut && newIds.count(pn->photoId) == 0) {
