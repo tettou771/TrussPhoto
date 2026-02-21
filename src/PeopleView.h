@@ -798,6 +798,18 @@ private:
         void setup() override {
             enableEvents();
             ime_.setFont(fontRef);
+
+            // Intercept Enter at IME level (prevents newline insertion)
+            ime_.onEnter = [this]() {
+                string text = ime_.getString();
+                // Trim whitespace
+                auto s = text.find_first_not_of(" \t\n\r");
+                auto e = text.find_last_not_of(" \t\n\r");
+                string trimmed = (s != string::npos) ? text.substr(s, e - s + 1) : "";
+                hide();
+                if (!trimmed.empty() && onConfirm) onConfirm(trimmed);
+                else if (onCancel) onCancel();
+            };
         }
 
         void show(const string& initialText, const string& placeholderText) {
@@ -816,20 +828,6 @@ private:
         }
 
         void update() override {
-            // Detect Enter: IME inserts newline → lines_ grows > 1
-            string text = ime_.getString();
-            if (text.find('\n') != string::npos) {
-                // Trim whitespace/newlines
-                auto s = text.find_first_not_of(" \t\n\r");
-                auto e = text.find_last_not_of(" \t\n\r");
-                string trimmed = (s != string::npos) ? text.substr(s, e - s + 1) : "";
-                // Hide immediately to prevent re-firing next frame
-                hide();
-                if (!trimmed.empty() && onConfirm) onConfirm(trimmed);
-                else if (onCancel) onCancel();
-                return;
-            }
-
             bool cursorOn = fmod(getElapsedTimef(), 1.0f) < 0.5f;
             if (cursorOn != lastCursorOn_) {
                 lastCursorOn_ = cursorOn;
@@ -900,23 +898,7 @@ private:
                 if (onCancel) onCancel();
                 return true;
             }
-            if (key == 257 /* ENTER */ || key == 335 /* KP_ENTER */) {
-                // Skip if IME is composing (let IME confirm first)
-                if (ime_.isJapaneseMode() && !ime_.getMarkedText().empty()) {
-                    return false;
-                }
-                string text = ime_.getString();
-                // Trim whitespace (spaces, tabs, newlines inserted by IME)
-                auto trimStart = text.find_first_not_of(" \t\n\r");
-                auto trimEnd = text.find_last_not_of(" \t\n\r");
-                if (trimStart != string::npos) {
-                    text = text.substr(trimStart, trimEnd - trimStart + 1);
-                } else {
-                    text.clear();
-                }
-                if (!text.empty() && onConfirm) onConfirm(text);
-                return true;
-            }
+            // Enter is handled by ime_.onEnter (no newline insertion)
             return false;
         }
 
