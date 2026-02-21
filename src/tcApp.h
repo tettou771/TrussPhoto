@@ -89,6 +89,9 @@ private:
     bool embeddingsQueued_ = false;
     bool visionModelUnloaded_ = false;
 
+    // Crop event listener
+    EventListener cropDoneListener_;
+
     // Context menu
     ContextMenu::Ptr contextMenu_;
     MenuOverlay::Ptr menuOverlay_;

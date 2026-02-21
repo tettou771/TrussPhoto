@@ -19,12 +19,12 @@ class CropPanel : public RectNode {
 public:
     using Ptr = shared_ptr<CropPanel>;
 
-    // Callbacks
-    function<void(CropAspect)> onAspectChanged;
-    function<void(bool)> onOrientationChanged;  // true = landscape
-    function<void()> onReset;
-    function<void()> onDone;
-    function<void()> onCancel;
+    // Events (consumers listen to these)
+    Event<CropAspect> aspectChanged;
+    Event<bool> orientationChanged;
+    Event<void> resetEvent;
+    Event<void> doneEvent;
+    Event<void> cancelEvent;
 
     CropPanel() {
         loadJapaneseFont(font_, 12);
@@ -55,9 +55,9 @@ public:
 
         orientToggle_ = make_shared<OrientationToggle>();
         orientToggle_->setSize(0, 28);
-        orientToggle_->onOrientationChanged = [this](bool landscape) {
-            if (onOrientationChanged) onOrientationChanged(landscape);
-        };
+        orientListener_ = orientToggle_->orientationChanged.listen([this](bool& landscape) {
+            orientationChanged.notify(landscape);
+        });
 
         aspectLabel_ = make_shared<TextLabel>("Aspect Ratio", &font_);
         aspectLabel_->setSize(0, 16);
@@ -65,7 +65,9 @@ public:
         for (int i = 0; i < kCropAspectCount; i++) {
             aspectButtons_[i] = make_shared<AspectButton>((CropAspect)i, &font_);
             aspectButtons_[i]->setSize(0, 26);
-            aspectButtons_[i]->onClick = [this](CropAspect a) { selectAspect(a); };
+            aspectListeners_[i] = aspectButtons_[i]->clicked.listen([this](CropAspect& a) {
+                selectAspect(a);
+            });
         }
         aspectButtons_[0]->selected = true;
 
@@ -83,9 +85,9 @@ public:
         buttonRow_ = make_shared<ButtonRow>(&font_);
         buttonRow_->setSize(0, 30);
 
-        buttonRow_->resetBtn->onClick = [this]() { if (onReset) onReset(); };
-        buttonRow_->cancelBtn->onClick = [this]() { if (onCancel) onCancel(); };
-        buttonRow_->doneBtn->onClick = [this]() { if (onDone) onDone(); };
+        resetListener_ = buttonRow_->resetBtn->clicked.listen([this]() { resetEvent.notify(); });
+        cancelListener_ = buttonRow_->cancelBtn->clicked.listen([this]() { cancelEvent.notify(); });
+        doneListener_ = buttonRow_->doneBtn->clicked.listen([this]() { doneEvent.notify(); });
     }
 
     void setup() override {
@@ -170,6 +172,11 @@ private:
     CropAspect currentAspect_ = CropAspect::Original;
     LayoutMod* contentLayout_ = nullptr;
 
+    // Child widget listeners
+    EventListener orientListener_;
+    EventListener aspectListeners_[kCropAspectCount];
+    EventListener resetListener_, cancelListener_, doneListener_;
+
     PlainScrollContainer::Ptr scrollContainer_;
     RectNode::Ptr content_;
     ScrollBar::Ptr scrollBar_;
@@ -190,7 +197,7 @@ private:
         for (int i = 0; i < kCropAspectCount; i++) {
             aspectButtons_[i]->selected = (i == (int)a);
         }
-        if (onAspectChanged) onAspectChanged(a);
+        aspectChanged.notify(a);
         redraw();
     }
 };

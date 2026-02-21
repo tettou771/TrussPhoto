@@ -57,7 +57,7 @@ class AspectButton : public RectNode {
 public:
     using Ptr = shared_ptr<AspectButton>;
 
-    function<void(CropAspect)> onClick;
+    Event<CropAspect> clicked;
     bool selected = false;
 
     AspectButton(CropAspect aspect, Font* font)
@@ -82,7 +82,7 @@ public:
 protected:
     bool onMousePress(Vec2 pos, int button) override {
         if (button != 0) return false;
-        if (onClick) onClick(aspect_);
+        clicked.notify(aspect_);
         return true;
     }
 
@@ -98,7 +98,7 @@ class OrientationToggle : public RectNode {
 public:
     using Ptr = shared_ptr<OrientationToggle>;
 
-    function<void(bool)> onOrientationChanged; // true = landscape
+    Event<bool> orientationChanged;
     bool isLandscape = true;
     bool grayed = false;
 
@@ -156,7 +156,7 @@ protected:
         if (pos.x >= startX && pos.x <= startX + btnW) {
             if (!isLandscape) {
                 isLandscape = true;
-                if (onOrientationChanged) onOrientationChanged(true);
+                orientationChanged.notify(isLandscape);
             }
             return true;
         }
@@ -164,7 +164,7 @@ protected:
         if (pos.x >= px && pos.x <= px + btnW) {
             if (isLandscape) {
                 isLandscape = false;
-                if (onOrientationChanged) onOrientationChanged(false);
+                orientationChanged.notify(isLandscape);
             }
             return true;
         }
@@ -179,7 +179,7 @@ class PanelButton : public RectNode {
 public:
     using Ptr = shared_ptr<PanelButton>;
 
-    function<void()> onClick;
+    Event<void> clicked;
 
     PanelButton(const string& label, bool isAccent, Font* font)
         : label_(label), isAccent_(isAccent), font_(font) {
@@ -201,7 +201,7 @@ public:
 protected:
     bool onMousePress(Vec2 pos, int button) override {
         if (button != 0) return false;
-        if (onClick) onClick();
+        clicked.notify();
         return true;
     }
 

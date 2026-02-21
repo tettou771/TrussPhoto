@@ -920,7 +920,7 @@ void tcApp::keyPressed(int key) {
         if ((key == 'R' || key == 'r') && singleView->hasFbo() && !singleView->isVideo()) {
             // Enter crop mode
             auto cv = viewManager_->cropView();
-            cv->onDone_ = [this]() {
+            cropDoneListener_ = cv->doneEvent.listen([this]() {
                 // Return to single view
                 viewManager_->switchTo(ViewMode::Single);
                 if (showDevelop_) {
@@ -930,7 +930,7 @@ void tcApp::keyPressed(int key) {
                     if (metadataPanel_) metadataPanel_->setActive(true);
                 }
                 updateLayout();
-            };
+            });
             viewManager_->switchTo(ViewMode::Crop);
             cv->enterCrop();
             // Hide metadata/develop panels (CropView has its own panel)
@@ -949,12 +949,12 @@ void tcApp::keyPressed(int key) {
         auto cv = viewManager_->cropView();
         if (key == SAPP_KEYCODE_ENTER || key == SAPP_KEYCODE_KP_ENTER) {
             cv->commitCrop();
-            cv->onDone_();
+            cv->doneEvent.notify();
         } else if (key == SAPP_KEYCODE_ESCAPE) {
             if (!cv->hasChanges() ||
                 confirmDialog("Discard Crop", "Discard crop changes?")) {
                 cv->cancelCrop();
-                cv->onDone_();
+                cv->doneEvent.notify();
             }
         } else if ((key == 'Z' || key == 'z') && cmdDown_) {
             cv->undo();

@@ -51,30 +51,30 @@ public:
         // Create panel in constructor so it's available before setup()
         panel_ = make_shared<CropPanel>();
 
-        panel_->onAspectChanged = [this](CropAspect a) {
+        aspectListener_ = panel_->aspectChanged.listen([this](CropAspect& a) {
             applyAspect(a);
             if (ctx_ && ctx_->redraw) ctx_->redraw(1);
-        };
-        panel_->onOrientationChanged = [this](bool landscape) {
+        });
+        orientListener_ = panel_->orientationChanged.listen([this](bool& landscape) {
             isLandscape_ = landscape;
             applyAspect(panel_->aspect());
             if (ctx_ && ctx_->redraw) ctx_->redraw(1);
-        };
-        panel_->onReset = [this]() {
+        });
+        resetListener_ = panel_->resetEvent.listen([this]() {
             pushUndo();
             cropX_ = 0; cropY_ = 0; cropW_ = 1; cropH_ = 1;
             isLandscape_ = (originalAspect_ >= 1.0f);
             panel_->setOrientation(isLandscape_);
             if (ctx_ && ctx_->redraw) ctx_->redraw(1);
-        };
-        panel_->onDone = [this]() {
+        });
+        panelDoneListener_ = panel_->doneEvent.listen([this]() {
             commitCrop();
-            if (onDone_) onDone_();
-        };
-        panel_->onCancel = [this]() {
+            doneEvent.notify();
+        });
+        panelCancelListener_ = panel_->cancelEvent.listen([this]() {
             cancelCrop();
-            if (onDone_) onDone_();
-        };
+            doneEvent.notify();
+        });
     }
 
     void setup() override {
@@ -161,8 +161,7 @@ public:
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
-    // Callbacks
-    function<void()> onDone_;
+    Event<void> doneEvent;
 
     // Handle key input (Cmd+Z is handled by tcApp)
     bool handleKey(int key) {
@@ -528,6 +527,10 @@ private:
     ViewContext* ctx_ = nullptr;
     shared_ptr<SingleView> singleView_;
     CropPanel::Ptr panel_;
+
+    // Panel event listeners
+    EventListener aspectListener_, orientListener_, resetListener_;
+    EventListener panelDoneListener_, panelCancelListener_;
 
     // Borrowed FBO handles
     sg_view fboView_ = {};
