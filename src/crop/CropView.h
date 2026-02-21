@@ -643,8 +643,8 @@ private:
 
     void updateBoundingBox() {
         float totalRot = rotation90_ * TAU / 4 + angle_;
-        float absRot = abs(totalRot);
-        float cosA = cos(absRot), sinA = sin(absRot);
+        float cosA = abs(cos(totalRot));
+        float sinA = abs(sin(totalRot));
         bbW_ = (float)fboW_ * cosA + (float)fboH_ * sinA;
         bbH_ = (float)fboW_ * sinA + (float)fboH_ * cosA;
         bbAspect_ = bbW_ / max(1.0f, bbH_);
@@ -685,13 +685,49 @@ private:
 
     void rotate90(int dir) {
         pushUndo();
-        float oldBBW = bbW_;
-        float oldBBH = bbH_;
+
+        // Save old state for coordinate transformation
+        float oldTotalRot = rotation90_ * TAU / 4 + angle_;
+        float oldBBW = bbW_, oldBBH = bbH_;
 
         rotation90_ = (rotation90_ + dir + 4) % 4;
         updateBoundingBox();
 
-        rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
+        // Transform crop center: old BB-norm → image space → new BB-norm
+        float cx = cropX_ + cropW_ / 2;
+        float cy = cropY_ + cropH_ / 2;
+
+        // Old BB-norm to centered BB pixel coords
+        float cx_bb = (cx - 0.5f) * oldBBW;
+        float cy_bb = (cy - 0.5f) * oldBBH;
+
+        // BB pixel → image pixel (inverse of old rotation)
+        float cosOld = cos(oldTotalRot), sinOld = sin(oldTotalRot);
+        float img_x =  cx_bb * cosOld + cy_bb * sinOld;
+        float img_y = -cx_bb * sinOld + cy_bb * cosOld;
+
+        // Image pixel → new BB pixel (forward new rotation)
+        float newTotalRot = rotation90_ * TAU / 4 + angle_;
+        float cosNew = cos(newTotalRot), sinNew = sin(newTotalRot);
+        float new_cx_bb = img_x * cosNew - img_y * sinNew;
+        float new_cy_bb = img_x * sinNew + img_y * cosNew;
+
+        // New BB pixel → new BB-norm
+        float newCx = new_cx_bb / bbW_ + 0.5f;
+        float newCy = new_cy_bb / bbH_ + 0.5f;
+
+        // Swap crop W/H: image rotated 90° under screen-horizontal crop
+        float newCropW = cropH_ * oldBBH / bbW_;
+        float newCropH = cropW_ * oldBBW / bbH_;
+
+        cropW_ = newCropW;
+        cropH_ = newCropH;
+        cropX_ = newCx - cropW_ / 2;
+        cropY_ = newCy - cropH_ / 2;
+
+        // Flip landscape/portrait to follow image rotation
+        isLandscape_ = !isLandscape_;
+        panel_->setOrientation(isLandscape_);
 
         constrainCropToBounds();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
