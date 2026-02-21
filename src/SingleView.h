@@ -348,8 +348,7 @@ public:
         // Compute bounding box of rotated source image
         float bbW = srcW, bbH = srcH;
         if (hasRotation) {
-            float absRot = abs(totalRot);
-            float cosA = cos(absRot), sinA = sin(absRot);
+            float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
             bbW = srcW * cosA + srcH * sinA;
             bbH = srcW * sinA + srcH * cosA;
         }
@@ -747,9 +746,13 @@ private:
         string outPath = PhotoExporter::makeExportPath(
             ctx_->provider->getCatalogDir(), entry->filename);
 
+        int srcW = developShader_.getFboWidth();
+        int srcH = developShader_.getFboHeight();
+        auto quad = entry->getCropQuad(srcW, srcH);
+        auto [outW, outH] = entry->getCropOutputSize(srcW, srcH);
+
         if (PhotoExporter::exportJpeg(developShader_, outPath, settings,
-                entry->userCropX, entry->userCropY,
-                entry->userCropW, entry->userCropH)) {
+                quad.data(), outW, outH)) {
             logNotice() << "[Export] " << outPath;
             revealInFinder(outPath);
         } else {

@@ -5,6 +5,8 @@
 // =============================================================================
 
 #include <string>
+#include <array>
+#include <cmath>
 #include <nlohmann/json.hpp>
 #include "Constants.h"
 
@@ -108,6 +110,36 @@ struct PhotoEntry {
     float totalRotation() const {
         constexpr float kHalfPi = 1.5707963267948966f;
         return userRotation90 * kHalfPi + userAngle;
+    }
+
+    // Compute 4-corner UV coordinates for crop+rotation export
+    // Returns {u0,v0, u1,v1, u2,v2, u3,v3} (TL, TR, BR, BL)
+    array<float, 8> getCropQuad(int srcW, int srcH) const {
+        float totalRot = totalRotation();
+        float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
+        float bbW = srcW * cosA + srcH * sinA;
+        float bbH = srcW * sinA + srcH * cosA;
+        auto toUV = [&](float bx, float by) -> pair<float,float> {
+            float dx = (bx - 0.5f) * bbW, dy = (by - 0.5f) * bbH;
+            float cosR = cos(-totalRot), sinR = sin(-totalRot);
+            return {(dx*cosR - dy*sinR) / srcW + 0.5f,
+                    (dx*sinR + dy*cosR) / srcH + 0.5f};
+        };
+        auto [u0,v0] = toUV(userCropX, userCropY);
+        auto [u1,v1] = toUV(userCropX + userCropW, userCropY);
+        auto [u2,v2] = toUV(userCropX + userCropW, userCropY + userCropH);
+        auto [u3,v3] = toUV(userCropX, userCropY + userCropH);
+        return {u0,v0, u1,v1, u2,v2, u3,v3};
+    }
+
+    // Compute output pixel dimensions for crop+rotation
+    pair<int,int> getCropOutputSize(int srcW, int srcH) const {
+        float totalRot = totalRotation();
+        float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
+        float bbW = srcW * cosA + srcH * sinA;
+        float bbH = srcW * sinA + srcH * cosA;
+        return {max(1, (int)round(userCropW * bbW)),
+                max(1, (int)round(userCropH * bbH))};
     }
 
     // Stacking (RAW+JPG, Live Photo grouping)
