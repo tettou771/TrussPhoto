@@ -92,9 +92,22 @@ struct PhotoEntry {
     float userCropW = 1.0f;
     float userCropH = 1.0f;
 
+    // User rotation
+    float userAngle = 0.0f;   // Fine rotation (radians, ±TAU/8)
+    int userRotation90 = 0;    // 90° steps (0-3, counterclockwise)
+
     bool hasCrop() const {
         return userCropX != 0.0f || userCropY != 0.0f ||
                userCropW != 1.0f || userCropH != 1.0f;
+    }
+
+    bool hasRotation() const {
+        return userAngle != 0.0f || userRotation90 != 0;
+    }
+
+    float totalRotation() const {
+        constexpr float kHalfPi = 1.5707963267948966f;
+        return userRotation90 * kHalfPi + userAngle;
     }
 
     // Stacking (RAW+JPG, Live Photo grouping)
@@ -182,7 +195,9 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"userCropX", e.userCropX},
         {"userCropY", e.userCropY},
         {"userCropW", e.userCropW},
-        {"userCropH", e.userCropH}
+        {"userCropH", e.userCropH},
+        {"userAngle", e.userAngle},
+        {"userRotation90", e.userRotation90}
     };
 }
 
@@ -248,6 +263,8 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.userCropY = j.value("userCropY", 0.0f);
     e.userCropW = j.value("userCropW", 1.0f);
     e.userCropH = j.value("userCropH", 1.0f);
+    e.userAngle = j.value("userAngle", 0.0f);
+    e.userRotation90 = j.value("userRotation90", 0);
 
     int state = j.value("syncState", 0);
     e.syncState = static_cast<SyncState>(state);

@@ -212,6 +212,177 @@ private:
 };
 
 // =============================================================================
+// AngleSlider - Center-zero slider for rotation angle (±45°)
+// =============================================================================
+class AngleSlider : public RectNode {
+public:
+    using Ptr = shared_ptr<AngleSlider>;
+
+    Event<float> angleChanged;  // radians
+    float angle = 0;            // radians
+
+    AngleSlider(Font* font) : font_(font) {
+        enableEvents();
+    }
+
+    void setAngle(float a) {
+        angle = a;
+    }
+
+    void draw() override {
+        float w = getWidth();
+        float h = getHeight();
+        float pad = 12.0f;
+        float trackY = 24.0f;
+        float trackH = 4.0f;
+        float knobR = 6.0f;
+
+        // Label + value
+        float degrees = angle * (180.0f / 3.14159265f);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.1f", degrees);
+        if (font_) {
+            setColor(0.45f, 0.45f, 0.5f);
+            font_->drawString("Angle", pad, 12, Left, Center);
+            setColor(0.65f, 0.65f, 0.7f);
+            string valStr = string(buf) + "\xC2\xB0";  // UTF-8 degree sign
+            font_->drawString(valStr, w - pad, 12, Right, Center);
+        }
+
+        // Track background
+        float trackLeft = pad;
+        float trackRight = w - pad;
+        float trackW = trackRight - trackLeft;
+        float centerX = trackLeft + trackW / 2;
+
+        setColor(0.2f, 0.2f, 0.24f);
+        fill();
+        drawRect(trackLeft, trackY, trackW, trackH);
+
+        // Center mark
+        setColor(0.35f, 0.35f, 0.4f);
+        drawRect(centerX - 0.5f, trackY - 2, 1, trackH + 4);
+
+        // Fill from center
+        constexpr float maxAngle = 3.14159265f / 4.0f;  // TAU/8 = PI/4
+        float t = clamp(angle / maxAngle, -1.0f, 1.0f);
+        float fillStart = centerX;
+        float fillEnd = centerX + (trackW / 2) * t;
+        if (fillEnd < fillStart) swap(fillStart, fillEnd);
+        setColor(0.4f, 0.6f, 0.9f);
+        drawRect(fillStart, trackY, fillEnd - fillStart, trackH);
+
+        // Knob
+        float knobX = centerX + (trackW / 2) * t;
+        float knobY = trackY + trackH / 2;
+        setColor(0.8f, 0.85f, 0.9f);
+        drawCircle(knobX, knobY, knobR);
+    }
+
+protected:
+    bool onMousePress(Vec2 pos, int button) override {
+        if (button != 0) return false;
+        // Double-click: reset to 0
+        auto now = chrono::steady_clock::now();
+        auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - lastClick_).count();
+        lastClick_ = now;
+        if (elapsed < 350) {
+            angle = 0;
+            angleChanged.notify(angle);
+            return true;
+        }
+        dragging_ = true;
+        updateFromMouse(pos.x);
+        return true;
+    }
+
+    bool onMouseDrag(Vec2 pos, int button) override {
+        if (!dragging_ || button != 0) return false;
+        updateFromMouse(pos.x);
+        return true;
+    }
+
+    bool onMouseRelease(Vec2 pos, int button) override {
+        (void)pos;
+        if (button == 0) dragging_ = false;
+        return true;
+    }
+
+private:
+    Font* font_;
+    bool dragging_ = false;
+    chrono::steady_clock::time_point lastClick_;
+
+    void updateFromMouse(float mx) {
+        float pad = 12.0f;
+        float trackLeft = pad;
+        float trackRight = getWidth() - pad;
+        float trackW = trackRight - trackLeft;
+        float centerX = trackLeft + trackW / 2;
+
+        // t: -1 to +1
+        float t = (mx - centerX) / (trackW / 2);
+        t = clamp(t, -1.0f, 1.0f);
+
+        constexpr float maxAngle = 3.14159265f / 4.0f;  // PI/4 = 45°
+        angle = t * maxAngle;
+        angleChanged.notify(angle);
+    }
+};
+
+// =============================================================================
+// Rotate90Row - Two 90° rotation buttons side by side (↺ | ↻)
+// =============================================================================
+class Rotate90Row : public RectNode {
+public:
+    using Ptr = shared_ptr<Rotate90Row>;
+
+    Event<int> rotated;  // -1 = CCW, +1 = CW
+
+    Rotate90Row(Font* font) : font_(font) {
+        enableEvents();
+    }
+
+    void draw() override {
+        float w = getWidth();
+        float h = getHeight();
+        float btnW = (w - 6) / 2;  // 6px gap
+
+        // Left button (CCW)
+        setColor(0.18f, 0.18f, 0.2f);
+        fill();
+        drawRect(0, 0, btnW, h);
+        setColor(0.7f, 0.7f, 0.75f);
+        if (font_) font_->drawString("\xE2\x86\xBA 90\xC2\xB0", btnW / 2, h / 2, Center, Center);
+
+        // Right button (CW)
+        setColor(0.18f, 0.18f, 0.2f);
+        fill();
+        drawRect(btnW + 6, 0, btnW, h);
+        setColor(0.7f, 0.7f, 0.75f);
+        if (font_) font_->drawString("\xE2\x86\xBB 90\xC2\xB0", btnW + 6 + btnW / 2, h / 2, Center, Center);
+    }
+
+protected:
+    bool onMousePress(Vec2 pos, int button) override {
+        if (button != 0) return false;
+        float w = getWidth();
+        float btnW = (w - 6) / 2;
+        if (pos.x < btnW) {
+            int dir = -1;
+            rotated.notify(dir);
+        } else if (pos.x > btnW + 6) {
+            int dir = 1;
+            rotated.notify(dir);
+        }
+        return true;
+    }
+
+private:
+    Font* font_;
+};
+
+// =============================================================================
 // ButtonRow - Horizontal container for action buttons (Reset | Cancel | Done)
 // =============================================================================
 class ButtonRow : public RectNode {

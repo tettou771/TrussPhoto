@@ -15,7 +15,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 13;
+    static constexpr int SCHEMA_VERSION = 14;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -93,7 +93,9 @@ public:
                 "  user_crop_x         REAL NOT NULL DEFAULT 0.0,"
                 "  user_crop_y         REAL NOT NULL DEFAULT 0.0,"
                 "  user_crop_w         REAL NOT NULL DEFAULT 1.0,"
-                "  user_crop_h         REAL NOT NULL DEFAULT 1.0"
+                "  user_crop_h         REAL NOT NULL DEFAULT 1.0,"
+                "  user_angle          REAL NOT NULL DEFAULT 0.0,"
+                "  user_rotation90     INTEGER NOT NULL DEFAULT 0"
                 ")"
             );
             if (!ok) return false;
@@ -306,8 +308,25 @@ public:
                     return false;
                 }
             }
+            version = 13;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v12 -> v13";
+        }
+
+        // v13 -> v14: add user rotation columns
+        if (version == 13) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN user_angle REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN user_rotation90 INTEGER NOT NULL DEFAULT 0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v13->v14 failed: " << sql;
+                    return false;
+                }
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v12 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v13 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -464,6 +483,17 @@ public:
         return stmt.execute();
     }
 
+    bool updateUserRotation(const string& id, float angle, int rot90) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "UPDATE photos SET user_angle=?1, user_rotation90=?2 WHERE id=?3");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, (double)angle);
+        stmt.bind(2, rot90);
+        stmt.bind(3, id);
+        return stmt.execute();
+    }
+
     bool updateFaceScanned(const string& id, bool scanned) {
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare("UPDATE photos SET face_scanned=?1 WHERE id=?2");
@@ -598,7 +628,8 @@ public:
             "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
             "stack_id, stack_primary, "
             "dev_exposure, dev_wb_temp, dev_wb_tint, "
-            "user_crop_x, user_crop_y, user_crop_w, user_crop_h "
+            "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
+            "user_angle, user_rotation90 "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -664,6 +695,8 @@ public:
             e.userCropY          = (float)stmt.getDouble(56);
             e.userCropW          = (float)stmt.getDouble(57);
             e.userCropH          = (float)stmt.getDouble(58);
+            e.userAngle          = (float)stmt.getDouble(59);
+            e.userRotation90     = stmt.getInt(60);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -1249,11 +1282,12 @@ private:
             "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
             "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
             "stack_id, stack_primary, dev_exposure, dev_wb_temp, dev_wb_tint, "
-            "user_crop_x, user_crop_y, user_crop_w, user_crop_h) "
+            "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
+            "user_angle, user_rotation90) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
             "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,"
-            "?56,?57,?58,?59)";
+            "?56,?57,?58,?59,?60,?61)";
     }
 
     static void bindEntry(Database::Statement& stmt, const PhotoEntry& e) {
@@ -1316,5 +1350,7 @@ private:
         stmt.bind(57, (double)e.userCropY);
         stmt.bind(58, (double)e.userCropW);
         stmt.bind(59, (double)e.userCropH);
+        stmt.bind(60, (double)e.userAngle);
+        stmt.bind(61, e.userRotation90);
     }
 };

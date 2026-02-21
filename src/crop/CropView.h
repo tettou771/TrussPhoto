@@ -1,10 +1,12 @@
 #pragma once
 
 // =============================================================================
-// CropView.h - Interactive crop editing view
+// CropView.h - Interactive crop editing view with rotation support
 // =============================================================================
 // Displays the developed FBO image with a draggable crop rectangle overlay.
 // Left area: image + crop overlay. Right 220px: CropPanel.
+// Supports fine rotation (±45°) via drag outside crop area + slider,
+// and 90° step rotation.
 // =============================================================================
 
 #include <TrussC.h>
@@ -25,13 +27,15 @@ public:
 
     // Drag handle identification
     enum class DragMode {
-        None, Move,
+        None, Move, Rotate,
         TL, T, TR, L, R, BL, B, BR
     };
 
     // Undo history entry
     struct CropState {
         float x, y, w, h;
+        float angle;
+        int rot90;
     };
 
     void beginView(ViewContext& ctx) override {
@@ -60,11 +64,19 @@ public:
             applyAspect(panel_->aspect());
             if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         });
+        angleListener_ = panel_->angleChanged.listen([this](float& a) {
+            setAngle(a);
+        });
+        rotate90Listener_ = panel_->rotate90Event.listen([this](int& dir) {
+            rotate90(dir);
+        });
         resetListener_ = panel_->resetEvent.listen([this]() {
             pushUndo();
             cropX_ = 0; cropY_ = 0; cropW_ = 1; cropH_ = 1;
+            angle_ = 0; rotation90_ = 0;
             isLandscape_ = (originalAspect_ >= 1.0f);
             panel_->setOrientation(isLandscape_);
+            panel_->setAngle(0);
             if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         });
         panelDoneListener_ = panel_->doneEvent.listen([this]() {
@@ -103,7 +115,7 @@ public:
         }
         originalAspect_ = (float)fboW_ / max(1, fboH_);
 
-        // Load current crop from entry
+        // Load current crop + rotation from entry
         string pid = singleView_->currentPhotoId();
         auto* entry = ctx_->provider->getPhoto(pid);
         if (entry) {
@@ -111,8 +123,11 @@ public:
             cropY_ = entry->userCropY;
             cropW_ = entry->userCropW;
             cropH_ = entry->userCropH;
+            angle_ = entry->userAngle;
+            rotation90_ = entry->userRotation90;
         } else {
             cropX_ = 0; cropY_ = 0; cropW_ = 1; cropH_ = 1;
+            angle_ = 0; rotation90_ = 0;
         }
 
         // Determine initial orientation from crop shape
@@ -120,27 +135,31 @@ public:
         float pixelCropH = cropH_ * fboH_;
         isLandscape_ = (pixelCropW >= pixelCropH);
         panel_->setOrientation(isLandscape_);
+        panel_->setAngle(angle_);
 
         // Save initial state for cancel
-        initialCrop_ = { cropX_, cropY_, cropW_, cropH_ };
+        initialCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_ };
         undoStack_.clear();
     }
 
-    // Save crop to DB (Done / Enter)
+    // Save crop + rotation to DB (Done / Enter)
     void commitCrop() {
         if (!ctx_ || !singleView_) return;
         string pid = singleView_->currentPhotoId();
         if (!pid.empty()) {
             ctx_->provider->setUserCrop(pid, cropX_, cropY_, cropW_, cropH_);
+            ctx_->provider->setUserRotation(pid, angle_, rotation90_);
         }
     }
 
-    // Revert to initial crop (Cancel / ESC)
+    // Revert to initial state (Cancel / ESC)
     void cancelCrop() {
         cropX_ = initialCrop_.x;
         cropY_ = initialCrop_.y;
         cropW_ = initialCrop_.w;
         cropH_ = initialCrop_.h;
+        angle_ = initialCrop_.angle;
+        rotation90_ = initialCrop_.rot90;
         // Also save reverted state to DB
         commitCrop();
     }
@@ -148,7 +167,8 @@ public:
     // Check if crop has been modified from initial state
     bool hasChanges() const {
         return cropX_ != initialCrop_.x || cropY_ != initialCrop_.y ||
-               cropW_ != initialCrop_.w || cropH_ != initialCrop_.h;
+               cropW_ != initialCrop_.w || cropH_ != initialCrop_.h ||
+               angle_ != initialCrop_.angle || rotation90_ != initialCrop_.rot90;
     }
 
     // Undo last drag operation (Cmd+Z)
@@ -158,6 +178,8 @@ public:
         undoStack_.pop_back();
         cropX_ = s.x; cropY_ = s.y;
         cropW_ = s.w; cropH_ = s.h;
+        angle_ = s.angle; rotation90_ = s.rot90;
+        panel_->setAngle(angle_);
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
@@ -191,15 +213,35 @@ public:
         float availW = imgAreaW - padding * 2;
         float availH = h - padding * 2;
 
-        float imgAspect = (float)fboW_ / fboH_;
-        float fitScale = min(availW / fboW_, availH / fboH_);
+        // Account for rotation when fitting: the rotated image bounding box is larger
+        float totalRot = rotation90_ * TAU / 4 + angle_;
+        float absAngle = abs(totalRot);
+        float cosA = cos(absAngle), sinA = sin(absAngle);
+
+        // Rotated bounding box size
+        float rotBoundsW = (float)fboW_ * cosA + (float)fboH_ * sinA;
+        float rotBoundsH = (float)fboW_ * sinA + (float)fboH_ * cosA;
+
+        float fitScale = min(availW / rotBoundsW, availH / rotBoundsH);
         float drawW = fboW_ * fitScale;
         float drawH = fboH_ * fitScale;
-        float imgX = padding + (availW - drawW) / 2;
-        float imgY = padding + (availH - drawH) / 2;
 
-        // Store for hit testing
+        // Center of image area
+        float imgCenterX = padding + availW / 2;
+        float imgCenterY = padding + availH / 2;
+
+        // Image rect top-left (before rotation)
+        float imgX = imgCenterX - drawW / 2;
+        float imgY = imgCenterY - drawH / 2;
+
+        // Store for hit testing (pre-rotation image rect)
         imgRect_ = { imgX, imgY, drawW, drawH };
+
+        // Apply rotation around image center
+        pushMatrix();
+        translate(imgCenterX, imgCenterY);
+        rotate(totalRot);
+        translate(-imgCenterX, -imgCenterY);
 
         // Draw full image (dimmed)
         setColor(0.6f, 0.6f, 0.6f);
@@ -215,7 +257,7 @@ public:
         sgl_end();
         sgl_disable_texture();
 
-        // Crop rectangle in screen coords
+        // Crop rectangle in screen coords (within rotated space)
         float cx = imgX + cropX_ * drawW;
         float cy = imgY + cropY_ * drawH;
         float cw = cropW_ * drawW;
@@ -273,6 +315,8 @@ public:
         drawRect(cx - hs, cy + ch / 2 - hs, hs * 2, hs * 2);
         drawRect(cx + cw - hs, cy + ch / 2 - hs, hs * 2, hs * 2);
 
+        popMatrix();
+
         // Update panel preview
         int outputW = (int)round(fboW_ * cropW_);
         int outputH = (int)round(fboH_ * cropH_);
@@ -286,6 +330,9 @@ protected:
     bool onMousePress(Vec2 pos, int button) override {
         if (button != 0) return false;
 
+        // Transform mouse to rotated image space
+        Vec2 rpos = screenToImageSpace(pos);
+
         // Check if inside image area
         float cx = imgRect_.x + cropX_ * imgRect_.w;
         float cy = imgRect_.y + cropY_ * imgRect_.h;
@@ -298,25 +345,41 @@ protected:
         dragMode_ = DragMode::None;
 
         // Corners
-        if (hitTest(pos, cx, cy, hs))                dragMode_ = DragMode::TL;
-        else if (hitTest(pos, cx + cw, cy, hs))      dragMode_ = DragMode::TR;
-        else if (hitTest(pos, cx, cy + ch, hs))       dragMode_ = DragMode::BL;
-        else if (hitTest(pos, cx + cw, cy + ch, hs))  dragMode_ = DragMode::BR;
+        if (hitTest(rpos, cx, cy, hs))                dragMode_ = DragMode::TL;
+        else if (hitTest(rpos, cx + cw, cy, hs))      dragMode_ = DragMode::TR;
+        else if (hitTest(rpos, cx, cy + ch, hs))       dragMode_ = DragMode::BL;
+        else if (hitTest(rpos, cx + cw, cy + ch, hs))  dragMode_ = DragMode::BR;
         // Edge midpoints
-        else if (hitTest(pos, cx + cw/2, cy, hs))     dragMode_ = DragMode::T;
-        else if (hitTest(pos, cx + cw/2, cy + ch, hs)) dragMode_ = DragMode::B;
-        else if (hitTest(pos, cx, cy + ch/2, hs))      dragMode_ = DragMode::L;
-        else if (hitTest(pos, cx + cw, cy + ch/2, hs)) dragMode_ = DragMode::R;
+        else if (hitTest(rpos, cx + cw/2, cy, hs))     dragMode_ = DragMode::T;
+        else if (hitTest(rpos, cx + cw/2, cy + ch, hs)) dragMode_ = DragMode::B;
+        else if (hitTest(rpos, cx, cy + ch/2, hs))      dragMode_ = DragMode::L;
+        else if (hitTest(rpos, cx + cw, cy + ch/2, hs)) dragMode_ = DragMode::R;
         // Interior
-        else if (pos.x >= cx && pos.x <= cx + cw &&
-                 pos.y >= cy && pos.y <= cy + ch) {
+        else if (rpos.x >= cx && rpos.x <= cx + cw &&
+                 rpos.y >= cy && rpos.y <= cy + ch) {
             dragMode_ = DragMode::Move;
+        }
+        // Outside crop but inside image area → Rotate
+        else if (rpos.x >= imgRect_.x && rpos.x <= imgRect_.x + imgRect_.w &&
+                 rpos.y >= imgRect_.y && rpos.y <= imgRect_.y + imgRect_.h) {
+            dragMode_ = DragMode::Rotate;
         }
 
         if (dragMode_ != DragMode::None) {
             pushUndo();
-            dragStart_ = pos;
-            dragStartCrop_ = { cropX_, cropY_, cropW_, cropH_ };
+            dragStart_ = pos;           // screen coords for rotation
+            dragStartRotated_ = rpos;   // rotated coords for crop ops
+            dragStartCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_ };
+
+            if (dragMode_ == DragMode::Rotate) {
+                // Calculate initial mouse angle from crop center
+                float ccx = imgRect_.x + (cropX_ + cropW_/2) * imgRect_.w;
+                float ccy = imgRect_.y + (cropY_ + cropH_/2) * imgRect_.h;
+                // Use image center in screen space (before rotation transform)
+                float imgCenterX = imgRect_.x + imgRect_.w / 2;
+                float imgCenterY = imgRect_.y + imgRect_.h / 2;
+                dragStartMouseAngle_ = atan2(pos.y - imgCenterY, pos.x - imgCenterX);
+            }
             return true;
         }
 
@@ -326,8 +389,25 @@ protected:
     bool onMouseDrag(Vec2 pos, int button) override {
         if (button != 0 || dragMode_ == DragMode::None) return false;
 
-        float dx = (pos.x - dragStart_.x) / imgRect_.w;
-        float dy = (pos.y - dragStart_.y) / imgRect_.h;
+        if (dragMode_ == DragMode::Rotate) {
+            // Rotation drag: use screen coords relative to image center
+            float imgCenterX = imgRect_.x + imgRect_.w / 2;
+            float imgCenterY = imgRect_.y + imgRect_.h / 2;
+            float mouseAngle = atan2(pos.y - imgCenterY, pos.x - imgCenterX);
+            float delta = mouseAngle - dragStartMouseAngle_;
+            // Wrap delta to [-TAU/2, TAU/2]
+            while (delta > TAU / 2) delta -= TAU;
+            while (delta < -TAU / 2) delta += TAU;
+            float newAngle = clamp(dragStartCrop_.angle + delta, -TAU / 8, TAU / 8);
+            setAngle(newAngle);
+            if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+            return true;
+        }
+
+        // For crop operations, use rotated coordinates
+        Vec2 rpos = screenToImageSpace(pos);
+        float dx = (rpos.x - dragStartRotated_.x) / imgRect_.w;
+        float dy = (rpos.y - dragStartRotated_.y) / imgRect_.h;
 
         auto& s = dragStartCrop_;
         bool locked = panel_->aspect() != CropAspect::Free;
@@ -341,12 +421,9 @@ protected:
                            dragMode_ == DragMode::L || dragMode_ == DragMode::R);
 
             if (isEdge) {
-                // Edge drag: drag axis — dragged side follows, opposite fixed.
-                // Orthogonal axis — symmetric from center (when AR locked).
                 float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
                 bool isHoriz = (dragMode_ == DragMode::L || dragMode_ == DragMode::R);
 
-                // Drag axis: one side follows mouse, opposite anchored
                 if (dragMode_ == DragMode::L) { nx = s.x + dx; nw = s.w - dx; }
                 if (dragMode_ == DragMode::R) { nw = s.w + dx; }
                 if (dragMode_ == DragMode::T) { ny = s.y + dy; nh = s.h - dy; }
@@ -357,12 +434,10 @@ protected:
                 if (dragMode_ == DragMode::L && nw <= minSize) nx = s.x + s.w - minSize;
                 if (dragMode_ == DragMode::T && nh <= minSize) ny = s.y + s.h - minSize;
 
-                // Orthogonal axis: symmetric from center (AR locked)
                 if (locked) {
                     float targetAR = getTargetAspectNorm();
                     if (targetAR > 0) {
                         if (isHoriz) {
-                            // Width changed -> adjust height symmetrically
                             float cy = s.y + s.h / 2;
                             nh = nw / targetAR;
                             float maxH = min(cy, 1.0f - cy) * 2;
@@ -370,7 +445,6 @@ protected:
                             ny = cy - nh / 2;
                             if (dragMode_ == DragMode::L) nx = s.x + s.w - nw;
                         } else {
-                            // Height changed -> adjust width symmetrically
                             float cx = s.x + s.w / 2;
                             nw = nh * targetAR;
                             float maxW = min(cx, 1.0f - cx) * 2;
@@ -381,7 +455,6 @@ protected:
                     }
                 }
 
-                // Clamp to image bounds
                 nx = clamp(nx, 0.0f, 1.0f - minSize);
                 ny = clamp(ny, 0.0f, 1.0f - minSize);
                 nw = clamp(nw, minSize, 1.0f - nx);
@@ -390,7 +463,6 @@ protected:
                 cropX_ = nx; cropY_ = ny;
                 cropW_ = nw; cropH_ = nh;
             } else {
-                // Corner drag: anchor opposite corner
                 float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
 
                 bool moveLeft = (dragMode_ == DragMode::TL || dragMode_ == DragMode::BL);
@@ -403,22 +475,19 @@ protected:
                 if (moveTop)    { ny = s.y + dy; nh = s.h - dy; }
                 if (moveBottom) { nh = s.h + dy; }
 
-                // Enforce minimum size
                 if (nw < minSize) { if (moveLeft) nx = s.x + s.w - minSize; nw = minSize; }
                 if (nh < minSize) { if (moveTop) ny = s.y + s.h - minSize; nh = minSize; }
 
-                // Auto-flip orientation during corner drag (only when AR locked, not 1:1)
+                // Auto-flip orientation during corner drag
                 if (locked && panel_->aspect() != CropAspect::A1_1) {
-                    // Anchor corner in screen coords
                     float anchorNX = moveLeft ? (s.x + s.w) : s.x;
                     float anchorNY = moveTop  ? (s.y + s.h) : s.y;
                     float anchorSX = imgRect_.x + anchorNX * imgRect_.w;
                     float anchorSY = imgRect_.y + anchorNY * imgRect_.h;
 
-                    // Normalize by imgRect to remove photo aspect bias
-                    float dx = abs(pos.x - anchorSX) / imgRect_.w;
-                    float dy = abs(pos.y - anchorSY) / imgRect_.h;
-                    float a = isLandscape_ ? atan2(dy, dx) : atan2(dx, dy);
+                    float adx = abs(rpos.x - anchorSX) / imgRect_.w;
+                    float ady = abs(rpos.y - anchorSY) / imgRect_.h;
+                    float a = isLandscape_ ? atan2(ady, adx) : atan2(adx, ady);
                     bool shouldFlip = (a > TAU / 8 * kFlipThreshold);
 
                     if (shouldFlip) {
@@ -427,7 +496,6 @@ protected:
                     }
                 }
 
-                // Aspect ratio constraint
                 if (locked) {
                     float targetAR = getTargetAspectNorm();
                     if (targetAR > 0) {
@@ -441,7 +509,6 @@ protected:
                     }
                 }
 
-                // Clamp to image bounds
                 nx = clamp(nx, 0.0f, 1.0f - minSize);
                 ny = clamp(ny, 0.0f, 1.0f - minSize);
                 nw = clamp(nw, minSize, 1.0f - nx);
@@ -466,17 +533,18 @@ protected:
     }
 
     bool onMouseScroll(Vec2 pos, Vec2 scroll) override {
-        // Only respond if pointer is inside the crop rect (screen coords)
+        // Transform to rotated space for hit testing
+        Vec2 rpos = screenToImageSpace(pos);
+
         float cx = imgRect_.x + cropX_ * imgRect_.w;
         float cy = imgRect_.y + cropY_ * imgRect_.h;
         float cw = cropW_ * imgRect_.w;
         float ch = cropH_ * imgRect_.h;
-        if (pos.x < cx || pos.x > cx + cw || pos.y < cy || pos.y > cy + ch)
+        if (rpos.x < cx || rpos.x > cx + cw || rpos.y < cy || rpos.y > cy + ch)
             return false;
 
         pushUndo();
 
-        // Scale factor: scroll up = shrink crop (zoom in), scroll down = expand
         float factor = 1.0f - scroll.y * 0.03f;
         factor = clamp(factor, 0.8f, 1.2f);
 
@@ -488,11 +556,9 @@ protected:
         float nw = cropW_ * factor;
         float nh = cropH_ * factor;
 
-        // Enforce min/max
         nw = clamp(nw, minSize, 1.0f);
         nh = clamp(nh, minSize, 1.0f);
 
-        // Maintain aspect ratio if locked
         if (locked) {
             float targetAR = getTargetAspectNorm();
             if (targetAR > 0) {
@@ -504,11 +570,9 @@ protected:
             }
         }
 
-        // Center the crop
         float nx = centerX - nw / 2;
         float ny = centerY - nh / 2;
 
-        // Clamp to image bounds
         nx = clamp(nx, 0.0f, 1.0f - nw);
         ny = clamp(ny, 0.0f, 1.0f - nh);
         nw = min(nw, 1.0f - nx);
@@ -528,6 +592,7 @@ private:
 
     // Panel event listeners
     EventListener aspectListener_, orientListener_, resetListener_;
+    EventListener angleListener_, rotate90Listener_;
     EventListener panelDoneListener_, panelCancelListener_;
 
     // Borrowed FBO handles
@@ -542,26 +607,72 @@ private:
     // Current crop (normalized 0-1)
     float cropX_ = 0, cropY_ = 0, cropW_ = 1, cropH_ = 1;
 
-    // Initial crop for cancel
-    CropState initialCrop_ = {0, 0, 1, 1};
+    // Rotation state
+    float angle_ = 0;       // fine rotation (radians, ±TAU/8)
+    int rotation90_ = 0;    // 90° steps (0-3)
+
+    // Initial state for cancel
+    CropState initialCrop_ = {0, 0, 1, 1, 0, 0};
 
     // Undo stack
     vector<CropState> undoStack_;
 
     // Drag state
     DragMode dragMode_ = DragMode::None;
-    Vec2 dragStart_;
-    CropState dragStartCrop_ = {0, 0, 1, 1};
+    Vec2 dragStart_;         // screen coords
+    Vec2 dragStartRotated_;  // rotated image-space coords
+    CropState dragStartCrop_ = {0, 0, 1, 1, 0, 0};
+    float dragStartMouseAngle_ = 0;  // atan2 at drag start (rotation mode)
 
-    // Cached image rect (screen coords)
+    // Cached image rect (screen coords, pre-rotation)
     struct Rect { float x, y, w, h; };
     Rect imgRect_ = {0, 0, 0, 0};
 
     float handleSize_ = 4.0f;
 
+    // --- Rotation helpers ---
+
+    void setAngle(float a) {
+        angle_ = clamp(a, -TAU / 8, TAU / 8);
+        panel_->setAngle(angle_);
+        constrainCropToBounds();
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+    }
+
+    void rotate90(int dir) {
+        pushUndo();
+        rotation90_ = (rotation90_ + dir + 4) % 4;
+        constrainCropToBounds();
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+    }
+
+    // Constrain crop rect to image bounds (simple clamp)
+    void constrainCropToBounds() {
+        cropX_ = clamp(cropX_, 0.0f, 1.0f - cropW_);
+        cropY_ = clamp(cropY_, 0.0f, 1.0f - cropH_);
+    }
+
+    // Transform screen coords to rotated image space (inverse rotation)
+    Vec2 screenToImageSpace(Vec2 pos) {
+        float totalRot = rotation90_ * TAU / 4 + angle_;
+        if (totalRot == 0) return pos;
+
+        float imgCenterX = imgRect_.x + imgRect_.w / 2;
+        float imgCenterY = imgRect_.y + imgRect_.h / 2;
+
+        // Inverse rotation around image center
+        float dx = pos.x - imgCenterX;
+        float dy = pos.y - imgCenterY;
+        float cosA = cos(-totalRot);
+        float sinA = sin(-totalRot);
+        return {
+            imgCenterX + dx * cosA - dy * sinA,
+            imgCenterY + dx * sinA + dy * cosA
+        };
+    }
+
     void pushUndo() {
-        undoStack_.push_back({cropX_, cropY_, cropW_, cropH_});
-        // Limit stack size
+        undoStack_.push_back({cropX_, cropY_, cropW_, cropH_, angle_, rotation90_});
         if (undoStack_.size() > 50) {
             undoStack_.erase(undoStack_.begin());
         }
@@ -583,9 +694,7 @@ private:
             case CropAspect::A5_4:     ar = 5.0f / 4.0f; break;
             case CropAspect::Free:     return 0;
         }
-        // Flip for portrait orientation
         if (!isLandscape_) ar = 1.0f / ar;
-        // Convert from pixel aspect to normalized aspect
         return ar / originalAspect_;
     }
 
@@ -599,7 +708,6 @@ private:
         float centerX = cropX_ + cropW_ / 2;
         float centerY = cropY_ + cropH_ / 2;
 
-        // Compute maximum possible crop at this AR within image bounds
         float maxW, maxH;
         if (normAR >= 1.0f) {
             maxW = 1.0f; maxH = 1.0f / normAR;
@@ -607,7 +715,6 @@ private:
             maxH = 1.0f; maxW = normAR;
         }
 
-        // Scale down to preserve current crop's larger dimension
         float currentMax = max(cropW_, cropH_);
         float newMax = max(maxW, maxH);
         float newW = maxW, newH = maxH;

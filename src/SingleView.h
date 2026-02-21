@@ -310,8 +310,10 @@ public:
         bool hasImage = hasFbo || hasPreviewRaw || fullImage_.isAllocated();
         if (!hasImage) return;
 
-        // Get user crop from entry (if available)
+        // Get user crop + rotation from entry (if available)
         float ucX = 0, ucY = 0, ucW = 1, ucH = 1;
+        float ucAngle = 0;
+        int ucRot90 = 0;
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
             const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
             auto* entry = ctx_->provider->getPhoto(pid);
@@ -320,6 +322,10 @@ public:
                 ucY = entry->userCropY;
                 ucW = entry->userCropW;
                 ucH = entry->userCropH;
+            }
+            if (entry && entry->hasRotation()) {
+                ucAngle = entry->userAngle;
+                ucRot90 = entry->userRotation90;
             }
         }
 
@@ -335,17 +341,62 @@ public:
             imgH = fullImage_.getHeight() * ucH;
         }
 
-        auto [x, y, drawW, drawH] = calcDrawRect(imgW, imgH);
+        float totalRot = ucRot90 * TAU / 4 + ucAngle;
+
+        // For 90° rotations (odd multiples), swap display dimensions
+        bool swapDims = (ucRot90 % 2 != 0);
+        float fitW = swapDims ? imgH : imgW;
+        float fitH = swapDims ? imgW : imgH;
+
+        // Account for fine rotation in bounding box
+        if (ucAngle != 0) {
+            float absA = abs(ucAngle);
+            float cA = cos(absA), sA = sin(absA);
+            float bw = fitW * cA + fitH * sA;
+            float bh = fitW * sA + fitH * cA;
+            fitW = bw;
+            fitH = bh;
+        }
+
+        auto [x, y, drawW, drawH] = calcDrawRect(fitW, fitH);
+
+        // Actual image draw size (before rotation bounding box expansion)
+        float actualDrawW, actualDrawH;
+        {
+            float winW = getWidth(), winH = getHeight();
+            float fitScale = min(winW / fitW, winH / fitH) * zoomLevel_;
+            actualDrawW = imgW * fitScale;
+            actualDrawH = imgH * fitScale;
+        }
+
+        // Draw center
+        float cx = x + drawW / 2;
+        float cy = y + drawH / 2;
+
+        if (totalRot != 0) {
+            pushMatrix();
+            translate(cx, cy);
+            rotate(totalRot);
+            translate(-cx, -cy);
+        }
+
+        // Center the actual image within the draw rect
+        float ix = cx - actualDrawW / 2;
+        float iy = cy - actualDrawH / 2;
 
         setColor(1.0f, 1.0f, 1.0f);
         if (hasFbo) {
-            // Draw FBO result texture with user crop UV
             drawTextureView(developShader_.getFboView(), developShader_.getFboSampler(),
-                            x, y, drawW, drawH, ucX, ucY, ucX + ucW, ucY + ucH);
+                            ix, iy, actualDrawW, actualDrawH,
+                            ucX, ucY, ucX + ucW, ucY + ucH);
         } else if (hasPreviewRaw) {
-            previewTexture_.draw(x, y, drawW, drawH);
+            previewTexture_.draw(ix, iy, actualDrawW, actualDrawH);
         } else {
-            fullImage_.draw(x, y, drawW, drawH);
+            fullImage_.draw(ix, iy, actualDrawW, actualDrawH);
+        }
+
+        if (totalRot != 0) {
+            popMatrix();
         }
     }
 
