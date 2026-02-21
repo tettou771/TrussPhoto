@@ -415,12 +415,10 @@ protected:
                     float anchorSX = imgRect_.x + anchorNX * imgRect_.w;
                     float anchorSY = imgRect_.y + anchorNY * imgRect_.h;
 
-                    float sdx = abs(pos.x - anchorSX);
-                    float sdy = abs(pos.y - anchorSY);
-                    float angle = atan2(sdy, sdx); // angle from horizontal
-
-                    // Angle from current orientation's axis
-                    float a = isLandscape_ ? atan2(sdy, sdx) : atan2(sdx, sdy);
+                    // Normalize by imgRect to remove photo aspect bias
+                    float dx = abs(pos.x - anchorSX) / imgRect_.w;
+                    float dy = abs(pos.y - anchorSY) / imgRect_.h;
+                    float a = isLandscape_ ? atan2(dy, dx) : atan2(dx, dy);
                     bool shouldFlip = (a > TAU / 8 * kFlipThreshold);
 
                     if (shouldFlip) {
@@ -577,7 +575,7 @@ private:
     float getTargetAspectNorm() {
         float ar = 0;
         switch (panel_->aspect()) {
-            case CropAspect::Original: ar = originalAspect_; break;
+            case CropAspect::Original: ar = max(originalAspect_, 1.0f / originalAspect_); break;
             case CropAspect::A16_9:    ar = 16.0f / 9.0f; break;
             case CropAspect::A4_3:     ar = 4.0f / 3.0f; break;
             case CropAspect::A3_2:     ar = 3.0f / 2.0f; break;
