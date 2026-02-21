@@ -15,8 +15,8 @@ class DevelopPanel : public RectNode {
 public:
     using Ptr = shared_ptr<DevelopPanel>;
 
-    // Callback when any setting changes
-    function<void()> onSettingsChanged;
+    // Event when any setting changes
+    Event<void> settingsChanged;
 
     DevelopPanel() {
         scrollContainer_ = make_shared<PlainScrollContainer>();
@@ -32,13 +32,13 @@ public:
         tintSlider_ = make_shared<DevelopSlider>("Tint", 0.0f, -1.0f, 1.0f);
 
         exposureSlider_->onChange = [this](float) {
-            if (onSettingsChanged) onSettingsChanged();
+            settingsChanged.notify();
         };
         tempSlider_->onChange = [this](float) {
-            if (onSettingsChanged) onSettingsChanged();
+            settingsChanged.notify();
         };
         tintSlider_->onChange = [this](float) {
-            if (onSettingsChanged) onSettingsChanged();
+            settingsChanged.notify();
         };
 
         // Noise Reduction section (CPU, with debounce)
@@ -48,10 +48,10 @@ public:
         lumaSlider_->setDebounceTime(0.2);
 
         chromaSlider_->onChange = [this](float) {
-            if (onSettingsChanged) onSettingsChanged();
+            settingsChanged.notify();
         };
         lumaSlider_->onChange = [this](float) {
-            if (onSettingsChanged) onSettingsChanged();
+            settingsChanged.notify();
         };
     }
 

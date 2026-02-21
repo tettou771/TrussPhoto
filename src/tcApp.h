@@ -89,8 +89,17 @@ private:
     bool embeddingsQueued_ = false;
     bool visionModelUnloaded_ = false;
 
-    // Crop event listener
+    // Event listeners (RAII — auto-disconnect on destroy)
     EventListener cropDoneListener_;
+    EventListener gridClickListener_;
+    EventListener gridContextMenuListener_;
+    EventListener gridRepairListener_;
+    EventListener gridConsolidateListener_;
+    EventListener gridDeleteListener_;
+    EventListener searchListener_;
+    EventListener developListener_;
+    EventListener leftToggleListener_;
+    EventListener rightToggleListener_;
 
     // Context menu
     ContextMenu::Ptr contextMenu_;

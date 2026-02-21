@@ -15,7 +15,7 @@ public:
     enum Direction { Left, Right };
 
     Direction direction = Right;
-    function<void()> onClick;
+    Event<void> clicked;
 
     PaneToggle() {
         enableEvents();
@@ -51,7 +51,7 @@ protected:
     bool onMousePress(Vec2 local, int button) override {
         (void)local;
         if (button != 0) return false;
-        if (onClick) onClick();
+        clicked.notify();
         return true;
     }
 };

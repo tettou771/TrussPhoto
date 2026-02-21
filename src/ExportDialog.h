@@ -17,8 +17,8 @@ class ExportDialog : public RectNode {
 public:
     using Ptr = shared_ptr<ExportDialog>;
 
-    function<void(const ExportSettings&)> onExport;
-    function<void()> onCancel;
+    Event<ExportSettings> exportRequested;
+    Event<void> cancelled;
 
     void setup() override {
         enableEvents();
@@ -219,7 +219,7 @@ public:
 
         // Cancel button
         if (hitTest(pos, cancelRect_)) {
-            if (onCancel) onCancel();
+            cancelled.notify();
             return true;
         }
 
@@ -248,7 +248,7 @@ public:
 
     bool onKeyPress(int key) override {
         if (key == 256 /* ESCAPE */) {
-            if (onCancel) onCancel();
+            cancelled.notify();
             return true;
         }
         if (key == 257 /* ENTER */ || key == 335 /* KP_ENTER */) {
@@ -304,8 +304,7 @@ private:
     }
 
     void doExport() {
-        if (onExport) {
-            onExport(currentSettings());
-        }
+        auto settings = currentSettings();
+        exportRequested.notify(settings);
     }
 };

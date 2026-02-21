@@ -139,7 +139,7 @@ class StackBadge : public RectNode {
 public:
     using Ptr = shared_ptr<StackBadge>;
 
-    function<void()> onClick;
+    Event<void> clicked;
 
     StackBadge() {
         enableEvents();
@@ -185,8 +185,8 @@ public:
 protected:
     bool onMousePress(Vec2 local, int button) override {
         (void)local;
-        if (button == 0 && onClick) {
-            onClick();
+        if (button == 0) {
+            clicked.notify();
             return true; // consume event
         }
         return RectNode::onMousePress(local, button);
@@ -201,7 +201,7 @@ class CompanionPreview : public RectNode {
 public:
     using Ptr = shared_ptr<CompanionPreview>;
 
-    function<void()> onClick;
+    Event<void> clicked;
 
     CompanionPreview() {
         enableEvents();
@@ -277,8 +277,8 @@ public:
 protected:
     bool onMousePress(Vec2 local, int button) override {
         (void)local;
-        if (button == 0 && onClick) {
-            onClick();
+        if (button == 0) {
+            clicked.notify();
             return true;
         }
         return RectNode::onMousePress(local, button);
@@ -295,12 +295,12 @@ class PhotoItem : public RectNode {
 public:
     using Ptr = shared_ptr<PhotoItem>;
 
-    // Callbacks (set by parent)
-    function<void()> onClick;
-    function<void()> onRightClick;
-    function<void()> onStackClick;
-    function<void(int)> onRequestLoad;
-    function<void(int)> onRequestUnload;
+    // Events (subscribe via EventListener)
+    Event<void> clicked;
+    Event<void> rightClicked;
+    Event<void> stackClicked;
+    Event<int> loadRequested;
+    Event<int> unloadRequested;
 
     PhotoItem(int entryIndex, float thumbnailSize = 120) : entryIndex_(entryIndex) {
         enableEvents();
@@ -322,9 +322,9 @@ public:
         // Stack badge (top-right of thumbnail)
         stackBadge_ = make_shared<StackBadge>();
         stackBadge_->setPos(thumbnailSize - 28, 0);
-        stackBadge_->onClick = [this]() {
-            if (onStackClick) onStackClick();
-        };
+        stackBadgeListener_ = stackBadge_->clicked.listen([this]() {
+            stackClicked.notify();
+        });
         addChild(stackBadge_);
 
         // Label node
@@ -381,8 +381,8 @@ public:
     void rebindAndLoad(int dataIndex, const string& label, SyncState syncState,
                        bool selected, bool isVideo, Font* font, int stackSize = 0) {
         // Cancel pending load for old data
-        if (loadState_ == LoadState::Loading && onRequestUnload)
-            onRequestUnload(entryIndex_);
+        if (loadState_ == LoadState::Loading)
+            unloadRequested.notify(entryIndex_);
 
         entryIndex_ = dataIndex;
         setLabelText(label);
@@ -396,7 +396,7 @@ public:
 
         // Set Loading before firing request to prevent onActiveChanged re-request
         loadState_ = LoadState::Loading;
-        if (onRequestLoad) onRequestLoad(entryIndex_);
+        loadRequested.notify(entryIndex_);
     }
     
     void update() override {
@@ -474,11 +474,11 @@ public:
 protected:
     bool onMousePress(Vec2 local, int button) override {
         (void)local;
-        if (button == 0 && onClick) {
-            onClick();
+        if (button == 0) {
+            clicked.notify();
         }
-        if (button == 1 && onRightClick) {
-            onRightClick();
+        if (button == 1) {
+            rightClicked.notify();
             return true;
         }
         return RectNode::onMousePress(local, button);
@@ -487,23 +487,19 @@ protected:
     void onActiveChanged(bool active) override {
         if (active) {
             // Becoming visible - request load if needed
-            if (loadState_ == LoadState::Unloaded && onRequestLoad) {
+            if (loadState_ == LoadState::Unloaded) {
                 loadState_ = LoadState::Loading;
-                onRequestLoad(entryIndex_);
+                loadRequested.notify(entryIndex_);
             }
         } else {
             // Becoming invisible - unload to save memory
             if (loadState_ == LoadState::Loaded) {
                 unloadImage();
-                if (onRequestUnload) {
-                    onRequestUnload(entryIndex_);
-                }
+                unloadRequested.notify(entryIndex_);
             } else if (loadState_ == LoadState::Loading) {
                 // Cancel pending load
                 loadState_ = LoadState::Unloaded;
-                if (onRequestUnload) {
-                    onRequestUnload(entryIndex_);
-                }
+                unloadRequested.notify(entryIndex_);
             }
         }
     }
@@ -513,6 +509,7 @@ private:
     ThumbnailNode::Ptr thumbnail_;
     LabelNode::Ptr label_;
     StackBadge::Ptr stackBadge_;
+    EventListener stackBadgeListener_;
     bool isSelected_ = false;
     bool isVideo_ = false;
     bool clipMatch_ = false;

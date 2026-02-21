@@ -123,7 +123,7 @@ void tcApp::setup() {
     searchBar_ = make_shared<SearchBar>();
     addChild(searchBar_);
 
-    searchBar_->onSearch = [this](const string& query) {
+    searchListener_ = searchBar_->searched.listen([this](string& query) {
         auto g = grid();
         if (!g) return;
 
@@ -147,7 +147,7 @@ void tcApp::setup() {
             searchLocation(parsed.location, parsed.text);
         }
         redraw();
-    };
+    });
 
     // 5b. Create folder tree sidebar
     folderTree_ = make_shared<FolderTree>();
@@ -274,7 +274,7 @@ void tcApp::setup() {
     addChild(developPanel_);
     developPanel_->setActive(false);
 
-    developPanel_->onSettingsChanged = [this]() {
+    developListener_ = developPanel_->settingsChanged.listen([this]() {
         auto sv = viewManager_->singleView();
         if (viewMode() == ViewMode::Single && sv) {
             sv->onDevelopChanged(developPanel_->getExposure(),
@@ -283,7 +283,7 @@ void tcApp::setup() {
                                  developPanel_->getChromaDenoise(),
                                  developPanel_->getLumaDenoise());
         }
-    };
+    });
 
     // Set metadataPanel in ViewContext after creation
     viewCtx_.metadataPanel = metadataPanel_;
@@ -292,21 +292,21 @@ void tcApp::setup() {
     // 5e. Create pane toggle buttons
     leftToggle_ = make_shared<PaneToggle>();
     addChild(leftToggle_);
-    leftToggle_->onClick = [this]() {
+    leftToggleListener_ = leftToggle_->clicked.listen([this]() {
         showSidebar_ = !showSidebar_;
         float from = leftPaneWidth_;
         float to = showSidebar_ ? sidebarWidth_ : 0;
         leftTween_.from(from).to(to).duration(0.2f).ease(EaseType::Cubic, EaseMode::Out).start();
-    };
+    });
 
     rightToggle_ = make_shared<PaneToggle>();
     addChild(rightToggle_);
-    rightToggle_->onClick = [this]() {
+    rightToggleListener_ = rightToggle_->clicked.listen([this]() {
         showMetadata_ = !showMetadata_;
         float from = rightPaneWidth_;
         float to = showMetadata_ ? metadataWidth_ : 0;
         rightTween_.from(from).to(to).duration(0.2f).ease(EaseType::Cubic, EaseMode::Out).start();
-    };
+    });
 
     // Initialize tween state
     lastTime_ = getElapsedTime();
@@ -315,7 +315,7 @@ void tcApp::setup() {
 
     updateLayout();
 
-    grid()->onItemClick = [this](int index) {
+    gridClickListener_ = grid()->itemClicked.listen([this](int& index) {
         auto now = chrono::steady_clock::now();
         bool isDoubleClick = (index == lastClickIndex_ &&
             chrono::duration_cast<chrono::milliseconds>(now - lastClickTime_).count() < 400);
@@ -348,15 +348,15 @@ void tcApp::setup() {
             g->toggleSelection(index);
             updateMetadataPanel();
         }
-    };
+    });
 
     // Context menu callbacks
-    grid()->onContextMenu = [this](ContextMenu::Ptr menu) {
+    gridContextMenuListener_ = grid()->contextMenuRequested.listen([this](ContextMenu::Ptr& menu) {
         showContextMenu(menu);
-    };
-    grid()->onRepairLibrary = [this]() { repairLibrary(); };
-    grid()->onConsolidateLibrary = [this]() { consolidateLibrary(); };
-    grid()->onDeleteRequest = [this](vector<string> ids) {
+    });
+    gridRepairListener_ = grid()->repairRequested.listen([this]() { repairLibrary(); });
+    gridConsolidateListener_ = grid()->consolidateRequested.listen([this]() { consolidateLibrary(); });
+    gridDeleteListener_ = grid()->deleteRequested.listen([this](vector<string>& ids) {
         int count = (int)ids.size();
         string msg = format("Delete {} photo{}?\nThis will permanently remove the file{} from disk.",
             count, count > 1 ? "s" : "", count > 1 ? "s" : "");
@@ -367,7 +367,7 @@ void tcApp::setup() {
             rebuildFolderTree();
             redraw();
         }
-    };
+    });
     viewManager_->singleView()->onContextMenu = [this](ContextMenu::Ptr menu) {
         showContextMenu(menu);
     };

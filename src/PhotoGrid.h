@@ -19,12 +19,12 @@ class PhotoGrid : public RecyclerGrid<PhotoItem> {
 public:
     using Ptr = shared_ptr<PhotoGrid>;
 
-    // Callbacks
-    function<void(int)> onItemClick;           // normal click -> full view
-    function<void(vector<string>)> onDeleteRequest;  // delete selected photos
-    function<void(ContextMenu::Ptr)> onContextMenu;  // right-click -> context menu
-    function<void()> onRepairLibrary;
-    function<void()> onConsolidateLibrary;
+    // Events
+    Event<int> itemClicked;
+    Event<vector<string>> deleteRequested;
+    Event<ContextMenu::Ptr> contextMenuRequested;
+    Event<void> repairRequested;
+    Event<void> consolidateRequested;
 
     PhotoGrid() {
         itemWidth_ = 140;
@@ -250,18 +250,22 @@ protected:
     int getDataCount() const override { return (int)photoIds_.size(); }
 
     ItemPtr createPoolItem(int poolIdx) override {
+        if (poolIdx == 0) poolListeners_.clear();
+        poolListeners_.resize(poolIdx + 1);
+        auto& L = poolListeners_[poolIdx];
+
         auto item = make_shared<PhotoItem>(-1, itemSize_);
 
-        item->onClick = [this, poolIdx]() {
+        L.click = item->clicked.listen([this, poolIdx]() {
             int dataIdx = reverseMap_[poolIdx];
-            if (dataIdx >= 0 && onItemClick) {
-                onItemClick(dataIdx);
+            if (dataIdx >= 0) {
+                itemClicked.notify(dataIdx);
             }
-        };
+        });
 
-        item->onRightClick = [this, poolIdx]() {
+        L.rightClick = item->rightClicked.listen([this, poolIdx]() {
             int dataIdx = reverseMap_[poolIdx];
-            if (dataIdx < 0 || !onContextMenu || !provider_) return;
+            if (dataIdx < 0 || !provider_) return;
 
             string photoId = photoIds_[dataIdx];
             auto* photo = provider_->getPhoto(photoId);
@@ -278,36 +282,37 @@ protected:
 
             menu->addChild(make_shared<MenuItem>("Delete",
                 [this, photoId]() {
-                    if (onDeleteRequest) onDeleteRequest({photoId});
+                    vector<string> ids = {photoId};
+                    deleteRequested.notify(ids);
                 }));
 
             menu->addChild(make_shared<MenuSeparator>());
 
             menu->addChild(make_shared<MenuItem>("Repair Library",
                 [this]() {
-                    if (onRepairLibrary) onRepairLibrary();
+                    repairRequested.notify();
                 }));
             menu->addChild(make_shared<MenuItem>("Consolidate Library",
                 [this]() {
-                    if (onConsolidateLibrary) onConsolidateLibrary();
+                    consolidateRequested.notify();
                 }));
 
-            onContextMenu(menu);
-        };
+            contextMenuRequested.notify(menu);
+        });
 
-        item->onStackClick = [this, poolIdx]() {
+        L.stackClick = item->stackClicked.listen([this, poolIdx]() {
             int dataIdx = reverseMap_[poolIdx];
             if (dataIdx >= 0) {
                 toggleCompanionPreview(dataIdx);
             }
-        };
+        });
 
-        item->onRequestLoad = [this](int idx) {
+        L.load = item->loadRequested.listen([this](int& idx) {
             requestLoad(idx);
-        };
-        item->onRequestUnload = [this](int idx) {
+        });
+        L.unload = item->unloadRequested.listen([this](int& idx) {
             loader_.cancelRequest(idx);
-        };
+        });
 
         return item;
     }
@@ -385,11 +390,18 @@ private:
     Font labelFont_;
     ScrollBar::Ptr scrollBar_;
 
+    // --- Pool item listeners ---
+    struct PoolListeners {
+        EventListener click, rightClick, stackClick, load, unload;
+    };
+    vector<PoolListeners> poolListeners_;
+
     // --- Grid params ---
     float itemSize_ = 140;
 
     // --- Stack companion preview ---
     CompanionPreview::Ptr companionPreview_;
+    EventListener companionClickListener_;
     int companionDataIdx_ = -1;
     string companionId_;
     bool companionLoading_ = false;
@@ -397,13 +409,13 @@ private:
     void ensureCompanionPreview() {
         if (companionPreview_) return;
         companionPreview_ = make_shared<CompanionPreview>();
-        companionPreview_->onClick = [this]() {
+        companionClickListener_ = companionPreview_->clicked.listen([this]() {
             // Open the primary photo in SingleView (companion's parent)
-            if (companionDataIdx_ >= 0 && onItemClick) {
+            if (companionDataIdx_ >= 0) {
                 companionPreview_->hide();
-                onItemClick(companionDataIdx_);
+                itemClicked.notify(companionDataIdx_);
             }
-        };
+        });
     }
 
     // =========================================================================

@@ -646,13 +646,13 @@ public:
 
         if (!exportDialog_) {
             exportDialog_ = make_shared<ExportDialog>();
-            exportDialog_->onExport = [this](const ExportSettings& s) {
+            exportExportListener_ = exportDialog_->exportRequested.listen([this](ExportSettings& s) {
                 executeExport(s);
-            };
-            exportDialog_->onCancel = [this]() {
+            });
+            exportCancelListener_ = exportDialog_->cancelled.listen([this]() {
                 exportDialog_->hide();
                 if (ctx_ && ctx_->redraw) ctx_->redraw(1);
-            };
+            });
             addChild(exportDialog_);
             exportDialog_->setActive(false);
         }
@@ -753,6 +753,8 @@ private:
 
     // Export dialog
     ExportDialog::Ptr exportDialog_;
+    EventListener exportExportListener_;
+    EventListener exportCancelListener_;
     ExportSettings lastExportSettings_ = {0, 92}; // Full res, quality 92
 
     // Draw a texture by view+sampler via sgl (for FBO result)

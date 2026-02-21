@@ -14,9 +14,9 @@ class SearchBar : public RectNode {
 public:
     using Ptr = shared_ptr<SearchBar>;
 
-    // Callbacks
-    function<void(const string&)> onSearch;
-    function<void()> onDeactivate;
+    // Events
+    Event<string> searched;
+    Event<void> deactivated;
 
     // Parsed query: text part + location (@xxx) part
     struct ParsedQuery {
@@ -66,7 +66,7 @@ public:
         // Enter key triggers search (not incremental)
         ime_.onEnter = [this]() {
             string q = getQuery();
-            if (onSearch) onSearch(q);
+            searched.notify(q);
         };
     }
 
@@ -82,7 +82,7 @@ public:
         if (!active_) return;
         active_ = false;
         ime_.disable();
-        if (onDeactivate) onDeactivate();
+        deactivated.notify();
         redraw();
     }
 
@@ -91,7 +91,8 @@ public:
     void clear() {
         ime_.clear();
         lastQuery_.clear();
-        if (onSearch) onSearch("");
+        string empty;
+        searched.notify(empty);
         redraw();
     }
 
