@@ -15,7 +15,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 12;
+    static constexpr int SCHEMA_VERSION = 13;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -89,7 +89,11 @@ public:
                 "  stack_primary       INTEGER NOT NULL DEFAULT 0,"
                 "  dev_exposure        REAL NOT NULL DEFAULT 0.0,"
                 "  dev_wb_temp         REAL NOT NULL DEFAULT 0.0,"
-                "  dev_wb_tint         REAL NOT NULL DEFAULT 0.0"
+                "  dev_wb_tint         REAL NOT NULL DEFAULT 0.0,"
+                "  user_crop_x         REAL NOT NULL DEFAULT 0.0,"
+                "  user_crop_y         REAL NOT NULL DEFAULT 0.0,"
+                "  user_crop_w         REAL NOT NULL DEFAULT 1.0,"
+                "  user_crop_h         REAL NOT NULL DEFAULT 1.0"
                 ")"
             );
             if (!ok) return false;
@@ -283,8 +287,27 @@ public:
                     return false;
                 }
             }
+            version = 12;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v11 -> v12";
+        }
+
+        // v12 -> v13: add user crop columns
+        if (version == 12) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN user_crop_x REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN user_crop_y REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN user_crop_w REAL NOT NULL DEFAULT 1.0",
+                "ALTER TABLE photos ADD COLUMN user_crop_h REAL NOT NULL DEFAULT 1.0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v12->v13 failed: " << sql;
+                    return false;
+                }
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v11 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v12 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -294,23 +317,7 @@ public:
 
     bool insertPhoto(const PhotoEntry& e) {
         lock_guard<mutex> lock(db_.writeMutex());
-        auto stmt = db_.prepare(
-            "INSERT OR REPLACE INTO photos "
-            "(id, filename, file_size, date_time_original, local_path, local_thumbnail_path, "
-            "smart_preview_path, "
-            "camera_make, camera, lens, lens_make, width, height, is_raw, is_video, creative_style, "
-            "focal_length, aperture, iso, sync_state, "
-            "rating, color_label, flag, memo, tags, "
-            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
-            "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
-            "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
-            "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
-            "stack_id, stack_primary, dev_exposure, dev_wb_temp, dev_wb_tint) "
-            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
-            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55)"
-        );
+        auto stmt = db_.prepare(insertSql());
         if (!stmt.valid()) return false;
         bindEntry(stmt, e);
         return stmt.execute();
@@ -443,6 +450,20 @@ public:
         return stmt.execute();
     }
 
+    bool updateUserCrop(const string& id, float x, float y, float w, float h) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "UPDATE photos SET user_crop_x=?1, user_crop_y=?2, "
+            "user_crop_w=?3, user_crop_h=?4 WHERE id=?5");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, (double)x);
+        stmt.bind(2, (double)y);
+        stmt.bind(3, (double)w);
+        stmt.bind(4, (double)h);
+        stmt.bind(5, id);
+        return stmt.execute();
+    }
+
     bool updateFaceScanned(const string& id, bool scanned) {
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare("UPDATE photos SET face_scanned=?1 WHERE id=?2");
@@ -541,23 +562,7 @@ public:
         lock_guard<mutex> lock(db_.writeMutex());
         db_.beginTransaction();
 
-        auto stmt = db_.prepare(
-            "INSERT OR REPLACE INTO photos "
-            "(id, filename, file_size, date_time_original, local_path, local_thumbnail_path, "
-            "smart_preview_path, "
-            "camera_make, camera, lens, lens_make, width, height, is_raw, is_video, creative_style, "
-            "focal_length, aperture, iso, sync_state, "
-            "rating, color_label, flag, memo, tags, "
-            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
-            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
-            "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
-            "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
-            "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
-            "stack_id, stack_primary, dev_exposure, dev_wb_temp, dev_wb_tint) "
-            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
-            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
-            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55)"
-        );
+        auto stmt = db_.prepare(insertSql());
         if (!stmt.valid()) {
             db_.rollback();
             return false;
@@ -592,7 +597,8 @@ public:
             "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
             "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
             "stack_id, stack_primary, "
-            "dev_exposure, dev_wb_temp, dev_wb_tint "
+            "dev_exposure, dev_wb_temp, dev_wb_tint, "
+            "user_crop_x, user_crop_y, user_crop_w, user_crop_h "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -654,6 +660,10 @@ public:
             e.devExposure        = (float)stmt.getDouble(52);
             e.devWbTemp          = (float)stmt.getDouble(53);
             e.devWbTint          = (float)stmt.getDouble(54);
+            e.userCropX          = (float)stmt.getDouble(55);
+            e.userCropY          = (float)stmt.getDouble(56);
+            e.userCropW          = (float)stmt.getDouble(57);
+            e.userCropH          = (float)stmt.getDouble(58);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -1226,6 +1236,26 @@ private:
         return ok;
     }
 
+    static const char* insertSql() {
+        return "INSERT OR REPLACE INTO photos "
+            "(id, filename, file_size, date_time_original, local_path, local_thumbnail_path, "
+            "smart_preview_path, "
+            "camera_make, camera, lens, lens_make, width, height, is_raw, is_video, creative_style, "
+            "focal_length, aperture, iso, sync_state, "
+            "rating, color_label, flag, memo, tags, "
+            "rating_updated_at, color_label_updated_at, flag_updated_at, memo_updated_at, tags_updated_at, "
+            "latitude, longitude, altitude, develop_settings, is_managed, face_scanned, "
+            "lens_correction_params, exposure_time, exposure_bias, orientation, white_balance, "
+            "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
+            "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
+            "stack_id, stack_primary, dev_exposure, dev_wb_temp, dev_wb_tint, "
+            "user_crop_x, user_crop_y, user_crop_w, user_crop_h) "
+            "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
+            "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
+            "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,"
+            "?56,?57,?58,?59)";
+    }
+
     static void bindEntry(Database::Statement& stmt, const PhotoEntry& e) {
         stmt.bind(1, e.id);
         stmt.bind(2, e.filename);
@@ -1282,5 +1312,9 @@ private:
         stmt.bind(53, (double)e.devExposure);
         stmt.bind(54, (double)e.devWbTemp);
         stmt.bind(55, (double)e.devWbTint);
+        stmt.bind(56, (double)e.userCropX);
+        stmt.bind(57, (double)e.userCropY);
+        stmt.bind(58, (double)e.userCropW);
+        stmt.bind(59, (double)e.userCropH);
     }
 };

@@ -16,7 +16,8 @@ enum class ViewMode {
     Single,
     Map,
     Related,
-    People
+    People,
+    Crop
 };
 
 class ViewContainer : public RectNode {

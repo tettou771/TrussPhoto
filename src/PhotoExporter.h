@@ -83,10 +83,27 @@ inline void resizeU8(const Pixels& src, Pixels& dst, int newW, int newH) {
     }
 }
 
+// Crop a U8 RGBA pixel buffer in-place
+inline void cropU8(const Pixels& src, Pixels& dst,
+                   int cx, int cy, int cw, int ch) {
+    int srcW = src.getWidth();
+    int channels = src.getChannels();
+    dst.allocate(cw, ch, channels);
+    auto* srcData = src.getData();
+    auto* dstData = dst.getData();
+    for (int y = 0; y < ch; y++) {
+        memcpy(dstData + y * cw * channels,
+               srcData + ((cy + y) * srcW + cx) * channels,
+               cw * channels);
+    }
+}
+
 // Full export pipeline
 inline bool exportJpeg(const DevelopShader& shader,
                        const string& outPath,
-                       const ExportSettings& settings = {}) {
+                       const ExportSettings& settings = {},
+                       float cropX = 0, float cropY = 0,
+                       float cropW = 1, float cropH = 1) {
     if (!shader.isFboReady()) return false;
 
     // 1. Read FBO
@@ -95,11 +112,28 @@ inline bool exportJpeg(const DevelopShader& shader,
                        shader.getFboWidth(), shader.getFboHeight(), pixels))
         return false;
 
+    // 1b. Apply user crop
+    Pixels cropped;
+    Pixels* srcPtr = &pixels;
+    if (cropX != 0 || cropY != 0 || cropW != 1 || cropH != 1) {
+        int pw = pixels.getWidth(), ph = pixels.getHeight();
+        int cx = (int)round(cropX * pw);
+        int cy = (int)round(cropY * ph);
+        int cw = (int)round(cropW * pw);
+        int ch = (int)round(cropH * ph);
+        cx = clamp(cx, 0, pw - 1);
+        cy = clamp(cy, 0, ph - 1);
+        cw = clamp(cw, 1, pw - cx);
+        ch = clamp(ch, 1, ph - cy);
+        cropU8(pixels, cropped, cx, cy, cw, ch);
+        srcPtr = &cropped;
+    }
+
     // 2. Resize if needed
-    Pixels* outPtr = &pixels;
+    Pixels* outPtr = srcPtr;
     Pixels resized;
     if (settings.maxEdge > 0) {
-        int w = pixels.getWidth(), h = pixels.getHeight();
+        int w = outPtr->getWidth(), h = outPtr->getHeight();
         int longEdge = max(w, h);
         if (longEdge > settings.maxEdge) {
             float scale = (float)settings.maxEdge / longEdge;

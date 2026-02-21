@@ -86,6 +86,17 @@ struct PhotoEntry {
     string subsecTimeOriginal; // "625" etc (for pairing timestamp)
     string companionFiles;     // JSON array: companion paths (future use)
 
+    // User crop (normalized 0-1 relative to developed FBO output)
+    float userCropX = 0.0f;
+    float userCropY = 0.0f;
+    float userCropW = 1.0f;
+    float userCropH = 1.0f;
+
+    bool hasCrop() const {
+        return userCropX != 0.0f || userCropY != 0.0f ||
+               userCropW != 1.0f || userCropH != 1.0f;
+    }
+
     // Stacking (RAW+JPG, Live Photo grouping)
     string stackId;              // same value = same stack ("" = not stacked)
     bool stackPrimary = false;   // true = visible in grid, false = hidden companion
@@ -167,7 +178,11 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"subsecTimeOriginal", e.subsecTimeOriginal},
         {"companionFiles", e.companionFiles},
         {"stackId", e.stackId},
-        {"stackPrimary", e.stackPrimary}
+        {"stackPrimary", e.stackPrimary},
+        {"userCropX", e.userCropX},
+        {"userCropY", e.userCropY},
+        {"userCropW", e.userCropW},
+        {"userCropH", e.userCropH}
     };
 }
 
@@ -229,6 +244,10 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.companionFiles = j.value("companionFiles", string(""));
     e.stackId = j.value("stackId", string(""));
     e.stackPrimary = j.value("stackPrimary", false);
+    e.userCropX = j.value("userCropX", 0.0f);
+    e.userCropY = j.value("userCropY", 0.0f);
+    e.userCropW = j.value("userCropW", 1.0f);
+    e.userCropH = j.value("userCropH", 1.0f);
 
     int state = j.value("syncState", 0);
     e.syncState = static_cast<SyncState>(state);

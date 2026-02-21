@@ -107,13 +107,13 @@ public:
 
         // "Basic" section header
         setColor(0.45f, 0.45f, 0.5f);
-        drawBitmapString("Basic", 12, 20);
+        drawBitmapString("Basic", 12, 7);
         setColor(0.25f, 0.25f, 0.28f);
         drawLine(12, 28, w - 12, 28);
 
         // "Noise Reduction" section header
         setColor(0.45f, 0.45f, 0.5f);
-        drawBitmapString("Noise Reduction", 12, nrSectionY_ + 14);
+        drawBitmapString("Noise Reduction", 12, nrSectionY_ + 1);
         setColor(0.25f, 0.25f, 0.28f);
         drawLine(12, nrSectionY_ + 22, w - 12, nrSectionY_ + 22);
     }

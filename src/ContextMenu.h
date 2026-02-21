@@ -43,7 +43,7 @@ public:
     MenuItem(const string& label, function<void()> action = nullptr)
         : label_(label), action_(action) {
         setHeight(itemHeight_);
-        loadJapaneseFont(font_, 13);
+        loadJapaneseFont(font_, (int)(itemHeight_ - textPadY_ * 2));
         enableEvents();
     }
 
@@ -65,14 +65,14 @@ public:
         if (isMouseOver()) {
             setColor(0.28f, 0.45f, 0.72f);
             fill();
-            drawRect(1, 0, w - 2, h);
+            drawRect(0, 0, w, h);
         }
 
         // Label text
         float brightness = isMouseOver() ? 1.0f : 0.85f;
         setColor(brightness, brightness, brightness);
-        font_.drawString(label_, textPadX_, h / 2.0f,
-            Direction::Left, Direction::Center);
+        font_.drawString(label_, textPadX_, textPadY_,
+            Direction::Left, Direction::Top);
     }
 
     bool onMousePress(Vec2 local, int button) override;  // defined after ContextMenu
@@ -83,8 +83,9 @@ private:
     shared_ptr<ContextMenu> menu_;
     Font font_;
     bool prevHover_ = false;
-    static constexpr float itemHeight_ = 28.0f;
-    static constexpr float textPadX_ = 12.0f;
+    static constexpr float itemHeight_ = 20.0f;
+    static constexpr float textPadX_ = 6.0f;
+    static constexpr float textPadY_ = 3.0f;
 };
 
 // =============================================================================
@@ -100,7 +101,7 @@ public:
 
     void draw() override {
         float w = getWidth();
-        float margin = 6.0f;
+        float margin = 5.0f;
         setColor(0.35f, 0.35f, 0.38f);
         fill();
         drawRect(margin, sepHeight_ / 2.0f, w - margin * 2, 1);

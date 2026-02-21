@@ -696,6 +696,17 @@ public:
         return true;
     }
 
+    bool setUserCrop(const string& id, float x, float y, float w, float h) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        it->second.userCropX = x;
+        it->second.userCropY = y;
+        it->second.userCropW = w;
+        it->second.userCropH = h;
+        db_.updateUserCrop(id, x, y, w, h);
+        return true;
+    }
+
     bool setColorLabel(const string& id, const string& label) {
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;

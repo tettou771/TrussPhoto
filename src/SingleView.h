@@ -41,6 +41,13 @@ public:
         ctx_ = nullptr;
     }
 
+    void suspendView() override {
+        // Keep FBO + textures + ctx alive (CropView borrows them)
+        if (isVideo_) videoPlayer_.togglePause();
+    }
+
+    bool hasState() const override { return selectedIndex_ >= 0; }
+
     bool wantsSearchBar() const override { return false; }
     bool wantsLeftSidebar() const override { return false; }
 
@@ -303,25 +310,38 @@ public:
         bool hasImage = hasFbo || hasPreviewRaw || fullImage_.isAllocated();
         if (!hasImage) return;
 
+        // Get user crop from entry (if available)
+        float ucX = 0, ucY = 0, ucW = 1, ucH = 1;
+        if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
+            const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
+            auto* entry = ctx_->provider->getPhoto(pid);
+            if (entry && entry->hasCrop()) {
+                ucX = entry->userCropX;
+                ucY = entry->userCropY;
+                ucW = entry->userCropW;
+                ucH = entry->userCropH;
+            }
+        }
+
         float imgW, imgH;
         if (hasFbo) {
-            imgW = (float)displayW_;
-            imgH = (float)displayH_;
+            imgW = (float)displayW_ * ucW;
+            imgH = (float)displayH_ * ucH;
         } else if (hasPreviewRaw) {
-            imgW = previewTexture_.getWidth();
-            imgH = previewTexture_.getHeight();
+            imgW = previewTexture_.getWidth() * ucW;
+            imgH = previewTexture_.getHeight() * ucH;
         } else {
-            imgW = fullImage_.getWidth();
-            imgH = fullImage_.getHeight();
+            imgW = fullImage_.getWidth() * ucW;
+            imgH = fullImage_.getHeight() * ucH;
         }
 
         auto [x, y, drawW, drawH] = calcDrawRect(imgW, imgH);
 
         setColor(1.0f, 1.0f, 1.0f);
         if (hasFbo) {
-            // Draw FBO result texture via sgl (10-bit RGB10A2)
+            // Draw FBO result texture with user crop UV
             drawTextureView(developShader_.getFboView(), developShader_.getFboSampler(),
-                            x, y, drawW, drawH);
+                            x, y, drawW, drawH, ucX, ucY, ucX + ucW, ucY + ucH);
         } else if (hasPreviewRaw) {
             previewTexture_.draw(x, y, drawW, drawH);
         } else {
@@ -559,6 +579,15 @@ protected:
 
 public:
 
+    // FBO accessors (for CropView to borrow)
+    sg_view fboView() const { return developShader_.getFboView(); }
+    sg_sampler fboSampler() const { return developShader_.getFboSampler(); }
+    int fboWidth() const { return developShader_.getFboWidth(); }
+    int fboHeight() const { return developShader_.getFboHeight(); }
+    bool hasFbo() const { return developShader_.isFboReady(); }
+    int displayWidth() const { return displayW_; }
+    int displayHeight() const { return displayH_; }
+
     // Accessors
     int selectedIndex() const { return selectedIndex_; }
     float zoom() const { return zoomLevel_; }
@@ -651,7 +680,9 @@ private:
         string outPath = PhotoExporter::makeExportPath(
             ctx_->provider->getCatalogDir(), entry->filename);
 
-        if (PhotoExporter::exportJpeg(developShader_, outPath, settings)) {
+        if (PhotoExporter::exportJpeg(developShader_, outPath, settings,
+                entry->userCropX, entry->userCropY,
+                entry->userCropW, entry->userCropH)) {
             logNotice() << "[Export] " << outPath;
             revealInFinder(outPath);
         } else {
@@ -726,16 +757,17 @@ private:
 
     // Draw a texture by view+sampler via sgl (for FBO result)
     void drawTextureView(sg_view view, sg_sampler sampler,
-                         float x, float y, float w, float h) {
+                         float x, float y, float w, float h,
+                         float u0 = 0, float v0 = 0, float u1 = 1, float v1 = 1) {
         sgl_enable_texture();
         sgl_texture(view, sampler);
         Color col = getDefaultContext().getColor();
         sgl_begin_quads();
         sgl_c4f(col.r, col.g, col.b, col.a);
-        sgl_v2f_t2f(x, y, 0, 0);
-        sgl_v2f_t2f(x + w, y, 1, 0);
-        sgl_v2f_t2f(x + w, y + h, 1, 1);
-        sgl_v2f_t2f(x, y + h, 0, 1);
+        sgl_v2f_t2f(x, y, u0, v0);
+        sgl_v2f_t2f(x + w, y, u1, v0);
+        sgl_v2f_t2f(x + w, y + h, u1, v1);
+        sgl_v2f_t2f(x, y + h, u0, v1);
         sgl_end();
         sgl_disable_texture();
     }

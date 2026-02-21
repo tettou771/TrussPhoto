@@ -23,6 +23,8 @@ public:
     function<void(int)> onItemClick;           // normal click -> full view
     function<void(vector<string>)> onDeleteRequest;  // delete selected photos
     function<void(ContextMenu::Ptr)> onContextMenu;  // right-click -> context menu
+    function<void()> onRepairLibrary;
+    function<void()> onConsolidateLibrary;
 
     PhotoGrid() {
         itemWidth_ = 140;
@@ -277,6 +279,17 @@ protected:
             menu->addChild(make_shared<MenuItem>("Delete",
                 [this, photoId]() {
                     if (onDeleteRequest) onDeleteRequest({photoId});
+                }));
+
+            menu->addChild(make_shared<MenuSeparator>());
+
+            menu->addChild(make_shared<MenuItem>("Repair Library",
+                [this]() {
+                    if (onRepairLibrary) onRepairLibrary();
+                }));
+            menu->addChild(make_shared<MenuItem>("Consolidate Library",
+                [this]() {
+                    if (onConsolidateLibrary) onConsolidateLibrary();
                 }));
 
             onContextMenu(menu);

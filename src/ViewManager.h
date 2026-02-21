@@ -13,6 +13,7 @@
 #include "MapView.h"
 #include "RelatedView.h"
 #include "PeopleView.h"
+#include "CropView.h"
 
 using namespace std;
 using namespace tc;
@@ -27,7 +28,10 @@ public:
         , mapView_(make_shared<MapView>())
         , relatedView_(make_shared<RelatedView>())
         , peopleView_(make_shared<PeopleView>())
-    {}
+        , cropView_(make_shared<CropView>())
+    {
+        cropView_->setSingleView(singleView_);
+    }
 
     ViewMode activeView() const { return active_; }
     ViewMode previousView() const { return previous_; }
@@ -42,8 +46,9 @@ public:
         // Deactivate current view
         auto* prev = containerFor(active_);
         if (prev) {
-            // People uses suspend (preserves state), others use endView
+            // People/Single use suspend (preserves state), others use endView
             if (active_ == ViewMode::People) prev->suspendView();
+            else if (active_ == ViewMode::Single && target == ViewMode::Crop) prev->suspendView();
             else prev->endView();
             static_cast<RectNode*>(prev)->setActive(false);
         }
@@ -108,6 +113,7 @@ public:
     MapView::Ptr mapView() { return mapView_; }
     RelatedView::Ptr relatedView() { return relatedView_; }
     PeopleView::Ptr peopleView() { return peopleView_; }
+    CropView::Ptr cropView() { return cropView_; }
 
     void setup() override {
         addChild(gridView_);
@@ -123,6 +129,9 @@ public:
 
         addChild(peopleView_);
         peopleView_->setActive(false);
+
+        addChild(cropView_);
+        cropView_->setActive(false);
     }
 
     void draw() override {
@@ -159,6 +168,7 @@ private:
     MapView::Ptr mapView_;
     RelatedView::Ptr relatedView_;
     PeopleView::Ptr peopleView_;
+    CropView::Ptr cropView_;
 
     ViewContainer* containerFor(ViewMode mode) {
         switch (mode) {
@@ -167,6 +177,7 @@ private:
             case ViewMode::Map:     return mapView_.get();
             case ViewMode::Related: return relatedView_.get();
             case ViewMode::People:  return peopleView_.get();
+            case ViewMode::Crop:    return cropView_.get();
         }
         return nullptr;
     }

@@ -354,6 +354,8 @@ void tcApp::setup() {
     grid()->onContextMenu = [this](ContextMenu::Ptr menu) {
         showContextMenu(menu);
     };
+    grid()->onRepairLibrary = [this]() { repairLibrary(); };
+    grid()->onConsolidateLibrary = [this]() { consolidateLibrary(); };
     grid()->onDeleteRequest = [this](vector<string> ids) {
         int count = (int)ids.size();
         string msg = format("Delete {} photo{}?\nThis will permanently remove the file{} from disk.",
@@ -655,9 +657,11 @@ void tcApp::update() {
     provider_.processConsolidateResults();
 
     // Process background RAW load / video update
-    if (viewMode() == ViewMode::Single) {
+    if (viewMode() == ViewMode::Single || viewMode() == ViewMode::Crop) {
         viewManager_->singleView()->processRawLoadCompletion();
-        viewManager_->singleView()->processVideoUpdate();
+        if (viewMode() == ViewMode::Single) {
+            viewManager_->singleView()->processVideoUpdate();
+        }
     }
 
     // Process upload results
@@ -706,7 +710,7 @@ void tcApp::draw() {
     clear(0.06f, 0.06f, 0.08f);
 
     // Render develop shader to offscreen FBO (before Node tree draws)
-    if (viewMode() == ViewMode::Single) {
+    if (viewMode() == ViewMode::Single || viewMode() == ViewMode::Crop) {
         viewManager_->singleView()->renderDevelopFbo();
     }
 
@@ -913,8 +917,48 @@ void tcApp::keyPressed(int key) {
             singleView->doExport();
         }
 
+        if ((key == 'R' || key == 'r') && singleView->hasFbo() && !singleView->isVideo()) {
+            // Enter crop mode
+            auto cv = viewManager_->cropView();
+            cv->onDone_ = [this]() {
+                // Return to single view
+                viewManager_->switchTo(ViewMode::Single);
+                if (showDevelop_) {
+                    if (developPanel_) developPanel_->setActive(true);
+                    if (metadataPanel_) metadataPanel_->setActive(false);
+                } else {
+                    if (metadataPanel_) metadataPanel_->setActive(true);
+                }
+                updateLayout();
+            };
+            viewManager_->switchTo(ViewMode::Crop);
+            cv->enterCrop();
+            // Hide metadata/develop panels (CropView has its own panel)
+            if (metadataPanel_) metadataPanel_->setActive(false);
+            if (developPanel_) developPanel_->setActive(false);
+            rightPaneWidth_ = 0;
+            rightTween_.finish();
+            leftPaneWidth_ = 0;
+            leftTween_.finish();
+            updateLayout();
+        }
+
         // Update metadata panel with current state
         singleView->updateMetadata();
+    } else if (viewMode() == ViewMode::Crop) {
+        auto cv = viewManager_->cropView();
+        if (key == SAPP_KEYCODE_ENTER || key == SAPP_KEYCODE_KP_ENTER) {
+            cv->commitCrop();
+            cv->onDone_();
+        } else if (key == SAPP_KEYCODE_ESCAPE) {
+            if (!cv->hasChanges() ||
+                confirmDialog("Discard Crop", "Discard crop changes?")) {
+                cv->cancelCrop();
+                cv->onDone_();
+            }
+        } else if ((key == 'Z' || key == 'z') && cmdDown_) {
+            cv->undo();
+        }
     } else if (viewMode() == ViewMode::People) {
         if (key == SAPP_KEYCODE_ESCAPE) {
             if (!peopleView->hasSelection() && !peopleView->isNameEditing()) {
@@ -1044,14 +1088,58 @@ void tcApp::keyPressed(int key) {
                 }
             }
         } else if (key == 'R' || key == 'r') {
-            repairLibrary();
-        } else if (key == 'C') {
-            consolidateLibrary();
+            // R key: enter crop mode for single selected photo
+            if (g->getSelectionCount() == 1) {
+                auto ids = g->getSelectedIds();
+                if (!ids.empty()) {
+                    // Find index in grid
+                    for (int i = 0; i < (int)g->getPhotoIdCount(); i++) {
+                        if (g->getPhotoId(i) == ids[0]) {
+                            g->clearSelection();
+                            viewManager_->showFullImage(i);
+                            if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
+                            leftPaneWidth_ = 0;
+                            leftTween_.finish();
+                            updateLayout();
+
+                            // Now enter crop mode (same as R key in SingleView)
+                            auto singleView = viewManager_->singleView();
+                            if (singleView->hasFbo() && !singleView->isVideo()) {
+                                auto cv = viewManager_->cropView();
+                                cv->onDone_ = [this]() {
+                                    viewManager_->switchTo(ViewMode::Single);
+                                    if (showDevelop_) {
+                                        if (developPanel_) developPanel_->setActive(true);
+                                        if (metadataPanel_) metadataPanel_->setActive(false);
+                                    } else {
+                                        if (metadataPanel_) metadataPanel_->setActive(true);
+                                    }
+                                    updateLayout();
+                                };
+                                viewManager_->switchTo(ViewMode::Crop);
+                                cv->enterCrop();
+                                if (metadataPanel_) metadataPanel_->setActive(false);
+                                if (developPanel_) developPanel_->setActive(false);
+                                rightPaneWidth_ = 0;
+                                rightTween_.finish();
+                                leftPaneWidth_ = 0;
+                                leftTween_.finish();
+                                updateLayout();
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     // Map/Related: no mode-specific keys (just G to go back, handled below)
 
-    // Mode-independent keys
+    // Mode-independent keys (skip in Crop mode — it handles its own keys)
+    if (viewMode() == ViewMode::Crop) {
+        redraw();
+        return;
+    }
     if (key == 'G' || key == 'g') {
         if (viewMode() != ViewMode::Grid) {
             viewManager_->switchTo(ViewMode::Grid);
@@ -1177,7 +1265,8 @@ void tcApp::mousePressed(Vec2 pos, int button) {
     }
 
     if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related ||
-        viewMode() == ViewMode::People || viewMode() == ViewMode::Single) return;
+        viewMode() == ViewMode::People || viewMode() == ViewMode::Single ||
+        viewMode() == ViewMode::Crop) return;
 }
 
 void tcApp::showContextMenu(ContextMenu::Ptr menu) {
@@ -1223,7 +1312,8 @@ void tcApp::mouseMoved(Vec2 pos) {
 
 void tcApp::mouseDragged(Vec2 pos, int button) {
     if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related ||
-        viewMode() == ViewMode::People || viewMode() == ViewMode::Single) return;
+        viewMode() == ViewMode::People || viewMode() == ViewMode::Single ||
+        viewMode() == ViewMode::Crop) return;
 }
 
 void tcApp::mouseScrolled(Vec2 delta) {
