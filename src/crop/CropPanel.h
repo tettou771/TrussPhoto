@@ -22,6 +22,8 @@ public:
     // Events (consumers listen to these)
     Event<CropAspect> aspectChanged;
     Event<bool> orientationChanged;
+    Event<float> angleChanged;    // fine angle (radians)
+    Event<int> rotate90Event;     // +1 or -1
     Event<void> resetEvent;
     Event<void> doneEvent;
     Event<void> cancelEvent;
@@ -74,6 +76,24 @@ public:
         separator2_ = make_shared<Separator>();
         separator2_->setSize(0, 12);
 
+        rotationLabel_ = make_shared<TextLabel>("Rotation", &font_);
+        rotationLabel_->setSize(0, 16);
+
+        rotate90Row_ = make_shared<Rotate90Row>(&font_);
+        rotate90Row_->setSize(0, 28);
+        rotate90Listener_ = rotate90Row_->rotated.listen([this](int& dir) {
+            rotate90Event.notify(dir);
+        });
+
+        angleSlider_ = make_shared<AngleSlider>(&font_);
+        angleSlider_->setSize(0, 38);
+        angleListener_ = angleSlider_->angleChanged.listen([this](float& a) {
+            angleChanged.notify(a);
+        });
+
+        separator3_ = make_shared<Separator>();
+        separator3_->setSize(0, 12);
+
         outputLabel_ = make_shared<TextLabel>("Output", &font_);
         outputLabel_->setSize(0, 16);
 
@@ -103,6 +123,10 @@ public:
             content_->addChild(aspectButtons_[i]);
         }
         content_->addChild(separator2_);
+        content_->addChild(rotationLabel_);
+        content_->addChild(rotate90Row_);
+        content_->addChild(angleSlider_);
+        content_->addChild(separator3_);
         content_->addChild(outputLabel_);
         content_->addChild(outputSize_);
         content_->addChild(buttonRow_);
@@ -112,10 +136,17 @@ public:
     bool isLandscape() const { return orientToggle_->isLandscape; }
     void setOrientation(bool landscape) { orientToggle_->isLandscape = landscape; }
 
+    void setAngle(float radians) {
+        angleSlider_->setAngle(radians);
+    }
+
+    // Per-vertex UV pairs: TL, TR, BR, BL (supports rotated crop)
     void setPreviewInfo(sg_view view, sg_sampler sampler,
                         float u0, float v0, float u1, float v1,
+                        float u2, float v2, float u3, float v3,
                         int outputW, int outputH) {
-        preview_->setPreviewInfo(view, sampler, u0, v0, u1, v1, outputW, outputH);
+        preview_->setPreviewInfo(view, sampler, u0, v0, u1, v1, u2, v2, u3, v3,
+                                 outputW, outputH);
         outputSize_->text = to_string(outputW) + " x " + to_string(outputH);
     }
 
@@ -175,6 +206,7 @@ private:
     // Child widget listeners
     EventListener orientListener_;
     EventListener aspectListeners_[kCropAspectCount];
+    EventListener angleListener_, rotate90Listener_;
     EventListener resetListener_, cancelListener_, doneListener_;
 
     PlainScrollContainer::Ptr scrollContainer_;
@@ -188,6 +220,10 @@ private:
     TextLabel::Ptr aspectLabel_;
     AspectButton::Ptr aspectButtons_[kCropAspectCount];
     Separator::Ptr separator2_;
+    TextLabel::Ptr rotationLabel_;
+    Rotate90Row::Ptr rotate90Row_;
+    AngleSlider::Ptr angleSlider_;
+    Separator::Ptr separator3_;
     TextLabel::Ptr outputLabel_;
     TextLabel::Ptr outputSize_;
     ButtonRow::Ptr buttonRow_;

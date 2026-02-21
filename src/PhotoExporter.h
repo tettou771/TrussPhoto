@@ -83,27 +83,63 @@ inline void resizeU8(const Pixels& src, Pixels& dst, int newW, int newH) {
     }
 }
 
-// Crop a U8 RGBA pixel buffer in-place
-inline void cropU8(const Pixels& src, Pixels& dst,
-                   int cx, int cy, int cw, int ch) {
-    int srcW = src.getWidth();
+// Bilinear UV transform: map output pixels through 4-corner UVs
+// corners: {u0,v0, u1,v1, u2,v2, u3,v3} = TL, TR, BR, BL
+inline void transformU8(const Pixels& src, Pixels& dst,
+                        const float corners[8], int outW, int outH) {
+    int srcW = src.getWidth(), srcH = src.getHeight();
     int channels = src.getChannels();
-    dst.allocate(cw, ch, channels);
+    dst.allocate(outW, outH, channels);
     auto* srcData = src.getData();
     auto* dstData = dst.getData();
-    for (int y = 0; y < ch; y++) {
-        memcpy(dstData + y * cw * channels,
-               srcData + ((cy + y) * srcW + cx) * channels,
-               cw * channels);
+
+    float u0 = corners[0], v0 = corners[1]; // TL
+    float u1 = corners[2], v1 = corners[3]; // TR
+    float u2 = corners[4], v2 = corners[5]; // BR
+    float u3 = corners[6], v3 = corners[7]; // BL
+
+    for (int y = 0; y < outH; y++) {
+        float ty = (y + 0.5f) / outH;
+        // Left edge: lerp(TL, BL)
+        float lU = u0 + (u3 - u0) * ty, lV = v0 + (v3 - v0) * ty;
+        // Right edge: lerp(TR, BR)
+        float rU = u1 + (u2 - u1) * ty, rV = v1 + (v2 - v1) * ty;
+
+        for (int x = 0; x < outW; x++) {
+            float tx = (x + 0.5f) / outW;
+            float u = lU + (rU - lU) * tx;
+            float v = lV + (rV - lV) * tx;
+
+            // Bilinear sample from source
+            float sx = u * srcW - 0.5f;
+            float sy = v * srcH - 0.5f;
+            int ix = (int)floor(sx), iy = (int)floor(sy);
+            float fx = sx - ix, fy = sy - iy;
+
+            int outIdx = (y * outW + x) * channels;
+            for (int c = 0; c < channels; c++) {
+                auto sample = [&](int px, int py) -> float {
+                    px = clamp(px, 0, srcW - 1);
+                    py = clamp(py, 0, srcH - 1);
+                    return srcData[(py * srcW + px) * channels + c];
+                };
+                float v00 = sample(ix, iy);
+                float v10 = sample(ix + 1, iy);
+                float v01 = sample(ix, iy + 1);
+                float v11 = sample(ix + 1, iy + 1);
+                float val = v00*(1-fx)*(1-fy) + v10*fx*(1-fy) +
+                            v01*(1-fx)*fy + v11*fx*fy;
+                dstData[outIdx + c] = (unsigned char)clamp(val, 0.f, 255.f);
+            }
+        }
     }
 }
 
-// Full export pipeline
+// Full export pipeline (4-corner UV quad for crop+rotation)
 inline bool exportJpeg(const DevelopShader& shader,
                        const string& outPath,
-                       const ExportSettings& settings = {},
-                       float cropX = 0, float cropY = 0,
-                       float cropW = 1, float cropH = 1) {
+                       const ExportSettings& settings,
+                       const float corners[8], int outW, int outH) {
     if (!shader.isFboReady()) return false;
 
     // 1. Read FBO
@@ -112,21 +148,17 @@ inline bool exportJpeg(const DevelopShader& shader,
                        shader.getFboWidth(), shader.getFboHeight(), pixels))
         return false;
 
-    // 1b. Apply user crop
-    Pixels cropped;
+    // 1b. Apply UV transform (crop + rotation)
+    Pixels transformed;
     Pixels* srcPtr = &pixels;
-    if (cropX != 0 || cropY != 0 || cropW != 1 || cropH != 1) {
-        int pw = pixels.getWidth(), ph = pixels.getHeight();
-        int cx = (int)round(cropX * pw);
-        int cy = (int)round(cropY * ph);
-        int cw = (int)round(cropW * pw);
-        int ch = (int)round(cropH * ph);
-        cx = clamp(cx, 0, pw - 1);
-        cy = clamp(cy, 0, ph - 1);
-        cw = clamp(cw, 1, pw - cx);
-        ch = clamp(ch, 1, ph - cy);
-        cropU8(pixels, cropped, cx, cy, cw, ch);
-        srcPtr = &cropped;
+    bool isIdentity = (outW == pixels.getWidth() && outH == pixels.getHeight() &&
+                       corners[0] == 0 && corners[1] == 0 &&
+                       corners[2] == 1 && corners[3] == 0 &&
+                       corners[4] == 1 && corners[5] == 1 &&
+                       corners[6] == 0 && corners[7] == 1);
+    if (!isIdentity) {
+        transformU8(pixels, transformed, corners, outW, outH);
+        srcPtr = &transformed;
     }
 
     // 2. Resize if needed
@@ -139,7 +171,7 @@ inline bool exportJpeg(const DevelopShader& shader,
             float scale = (float)settings.maxEdge / longEdge;
             int newW = max(1, (int)round(w * scale));
             int newH = max(1, (int)round(h * scale));
-            resizeU8(pixels, resized, newW, newH);
+            resizeU8(*outPtr, resized, newW, newH);
             outPtr = &resized;
         }
     }

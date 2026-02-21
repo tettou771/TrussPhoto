@@ -5,6 +5,8 @@
 // =============================================================================
 
 #include <string>
+#include <array>
+#include <cmath>
 #include <nlohmann/json.hpp>
 #include "Constants.h"
 
@@ -92,9 +94,52 @@ struct PhotoEntry {
     float userCropW = 1.0f;
     float userCropH = 1.0f;
 
+    // User rotation
+    float userAngle = 0.0f;   // Fine rotation (radians, ±TAU/8)
+    int userRotation90 = 0;    // 90° steps (0-3, counterclockwise)
+
     bool hasCrop() const {
         return userCropX != 0.0f || userCropY != 0.0f ||
                userCropW != 1.0f || userCropH != 1.0f;
+    }
+
+    bool hasRotation() const {
+        return userAngle != 0.0f || userRotation90 != 0;
+    }
+
+    float totalRotation() const {
+        constexpr float kHalfPi = 1.5707963267948966f;
+        return userRotation90 * kHalfPi + userAngle;
+    }
+
+    // Compute 4-corner UV coordinates for crop+rotation export
+    // Returns {u0,v0, u1,v1, u2,v2, u3,v3} (TL, TR, BR, BL)
+    array<float, 8> getCropQuad(int srcW, int srcH) const {
+        float totalRot = totalRotation();
+        float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
+        float bbW = srcW * cosA + srcH * sinA;
+        float bbH = srcW * sinA + srcH * cosA;
+        auto toUV = [&](float bx, float by) -> pair<float,float> {
+            float dx = (bx - 0.5f) * bbW, dy = (by - 0.5f) * bbH;
+            float cosR = cos(-totalRot), sinR = sin(-totalRot);
+            return {(dx*cosR - dy*sinR) / srcW + 0.5f,
+                    (dx*sinR + dy*cosR) / srcH + 0.5f};
+        };
+        auto [u0,v0] = toUV(userCropX, userCropY);
+        auto [u1,v1] = toUV(userCropX + userCropW, userCropY);
+        auto [u2,v2] = toUV(userCropX + userCropW, userCropY + userCropH);
+        auto [u3,v3] = toUV(userCropX, userCropY + userCropH);
+        return {u0,v0, u1,v1, u2,v2, u3,v3};
+    }
+
+    // Compute output pixel dimensions for crop+rotation
+    pair<int,int> getCropOutputSize(int srcW, int srcH) const {
+        float totalRot = totalRotation();
+        float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
+        float bbW = srcW * cosA + srcH * sinA;
+        float bbH = srcW * sinA + srcH * cosA;
+        return {max(1, (int)round(userCropW * bbW)),
+                max(1, (int)round(userCropH * bbH))};
     }
 
     // Stacking (RAW+JPG, Live Photo grouping)
@@ -182,7 +227,9 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"userCropX", e.userCropX},
         {"userCropY", e.userCropY},
         {"userCropW", e.userCropW},
-        {"userCropH", e.userCropH}
+        {"userCropH", e.userCropH},
+        {"userAngle", e.userAngle},
+        {"userRotation90", e.userRotation90}
     };
 }
 
@@ -248,6 +295,8 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.userCropY = j.value("userCropY", 0.0f);
     e.userCropW = j.value("userCropW", 1.0f);
     e.userCropH = j.value("userCropH", 1.0f);
+    e.userAngle = j.value("userAngle", 0.0f);
+    e.userRotation90 = j.value("userRotation90", 0);
 
     int state = j.value("syncState", 0);
     e.syncState = static_cast<SyncState>(state);

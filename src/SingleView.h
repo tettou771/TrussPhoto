@@ -310,8 +310,10 @@ public:
         bool hasImage = hasFbo || hasPreviewRaw || fullImage_.isAllocated();
         if (!hasImage) return;
 
-        // Get user crop from entry (if available)
+        // Get user crop + rotation from entry (if available)
         float ucX = 0, ucY = 0, ucW = 1, ucH = 1;
+        float ucAngle = 0;
+        int ucRot90 = 0;
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
             const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
             auto* entry = ctx_->provider->getPhoto(pid);
@@ -321,31 +323,95 @@ public:
                 ucW = entry->userCropW;
                 ucH = entry->userCropH;
             }
+            if (entry && entry->hasRotation()) {
+                ucAngle = entry->userAngle;
+                ucRot90 = entry->userRotation90;
+            }
         }
 
-        float imgW, imgH;
+        // Source dimensions (what we're reading from)
+        float srcW, srcH;
         if (hasFbo) {
-            imgW = (float)displayW_ * ucW;
-            imgH = (float)displayH_ * ucH;
+            srcW = (float)displayW_;
+            srcH = (float)displayH_;
         } else if (hasPreviewRaw) {
-            imgW = previewTexture_.getWidth() * ucW;
-            imgH = previewTexture_.getHeight() * ucH;
+            srcW = previewTexture_.getWidth();
+            srcH = previewTexture_.getHeight();
         } else {
-            imgW = fullImage_.getWidth() * ucW;
-            imgH = fullImage_.getHeight() * ucH;
+            srcW = fullImage_.getWidth();
+            srcH = fullImage_.getHeight();
         }
 
-        auto [x, y, drawW, drawH] = calcDrawRect(imgW, imgH);
+        float totalRot = ucRot90 * TAU / 4 + ucAngle;
+        bool hasRotation = (totalRot != 0);
 
-        setColor(1.0f, 1.0f, 1.0f);
-        if (hasFbo) {
-            // Draw FBO result texture with user crop UV
-            drawTextureView(developShader_.getFboView(), developShader_.getFboSampler(),
-                            x, y, drawW, drawH, ucX, ucY, ucX + ucW, ucY + ucH);
-        } else if (hasPreviewRaw) {
-            previewTexture_.draw(x, y, drawW, drawH);
+        // Compute bounding box of rotated source image
+        float bbW = srcW, bbH = srcH;
+        if (hasRotation) {
+            float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
+            bbW = srcW * cosA + srcH * sinA;
+            bbH = srcW * sinA + srcH * cosA;
+        }
+
+        // Crop area in BB pixels (the output dimensions)
+        float cropPxW = ucW * bbW;
+        float cropPxH = ucH * bbH;
+
+        auto [x, y, drawW, drawH] = calcDrawRect(cropPxW, cropPxH);
+
+        if (hasRotation && hasFbo) {
+            // Per-vertex UV mapping for rotated + cropped display
+            float drawCX = x + drawW / 2;
+            float drawCY = y + drawH / 2;
+
+            // Crop center offset from BB center (in BB pixels)
+            float cropCenterBBX = (ucX + ucW / 2 - 0.5f) * bbW;
+            float cropCenterBBY = (ucY + ucH / 2 - 0.5f) * bbH;
+
+            // Screen pixels per BB pixel
+            float scale = drawW / cropPxW;
+
+            // Screen point -> texture UV via inverse rotation
+            auto screenToUV = [&](float sx, float sy) -> pair<float,float> {
+                float bbx = (sx - drawCX) / scale + cropCenterBBX;
+                float bby = (sy - drawCY) / scale + cropCenterBBY;
+                float cosR = cos(-totalRot), sinR = sin(-totalRot);
+                float ix = bbx * cosR - bby * sinR;
+                float iy = bbx * sinR + bby * cosR;
+                float u = ix / srcW + 0.5f;
+                float v = iy / srcH + 0.5f;
+                return {u, v};
+            };
+
+            auto [u0, v0] = screenToUV(x, y);
+            auto [u1, v1] = screenToUV(x + drawW, y);
+            auto [u2, v2] = screenToUV(x + drawW, y + drawH);
+            auto [u3, v3] = screenToUV(x, y + drawH);
+
+            setColor(1.0f, 1.0f, 1.0f);
+            sgl_enable_texture();
+            sgl_texture(developShader_.getFboView(), developShader_.getFboSampler());
+            Color col = getDefaultContext().getColor();
+            sgl_begin_quads();
+            sgl_c4f(col.r, col.g, col.b, col.a);
+            sgl_v2f_t2f(x, y, u0, v0);
+            sgl_v2f_t2f(x + drawW, y, u1, v1);
+            sgl_v2f_t2f(x + drawW, y + drawH, u2, v2);
+            sgl_v2f_t2f(x, y + drawH, u3, v3);
+            sgl_end();
+            sgl_disable_texture();
         } else {
-            fullImage_.draw(x, y, drawW, drawH);
+            // No rotation: simple axis-aligned draw
+            setColor(1.0f, 1.0f, 1.0f);
+            if (hasFbo) {
+                drawTextureView(developShader_.getFboView(), developShader_.getFboSampler(),
+                                x, y, drawW, drawH,
+                                ucX, ucY, ucX + ucW, ucY + ucH);
+            } else if (hasPreviewRaw) {
+                previewTexture_.draw(x, y, drawW, drawH);
+            } else {
+                fullImage_.draw(x, y, drawW, drawH);
+            }
         }
     }
 
@@ -680,9 +746,13 @@ private:
         string outPath = PhotoExporter::makeExportPath(
             ctx_->provider->getCatalogDir(), entry->filename);
 
+        int srcW = developShader_.getFboWidth();
+        int srcH = developShader_.getFboHeight();
+        auto quad = entry->getCropQuad(srcW, srcH);
+        auto [outW, outH] = entry->getCropOutputSize(srcW, srcH);
+
         if (PhotoExporter::exportJpeg(developShader_, outPath, settings,
-                entry->userCropX, entry->userCropY,
-                entry->userCropW, entry->userCropH)) {
+                quad.data(), outW, outH)) {
             logNotice() << "[Export] " << outPath;
             revealInFinder(outPath);
         } else {

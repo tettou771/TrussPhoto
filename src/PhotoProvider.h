@@ -707,6 +707,15 @@ public:
         return true;
     }
 
+    bool setUserRotation(const string& id, float angle, int rot90) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        it->second.userAngle = angle;
+        it->second.userRotation90 = rot90;
+        db_.updateUserRotation(id, angle, rot90);
+        return true;
+    }
+
     bool setColorLabel(const string& id, const string& label) {
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
