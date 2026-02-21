@@ -83,8 +83,10 @@ inline void resizeU8(const Pixels& src, Pixels& dst, int newW, int newH) {
     }
 }
 
-// Bilinear UV transform: map output pixels through 4-corner UVs
+// Bilinear UV transform with adaptive supersampling.
 // corners: {u0,v0, u1,v1, u2,v2, u3,v3} = TL, TR, BR, BL
+// Supersampling factor is derived from the quad's max source-pixel footprint
+// (min 2x2 for rotation quality, scales up for perspective).
 inline void transformU8(const Pixels& src, Pixels& dst,
                         const float corners[8], int outW, int outH) {
     int srcW = src.getWidth(), srcH = src.getHeight();
@@ -98,38 +100,51 @@ inline void transformU8(const Pixels& src, Pixels& dst,
     float u2 = corners[4], v2 = corners[5]; // BR
     float u3 = corners[6], v3 = corners[7]; // BL
 
+    // Estimate max source-pixel footprint per output pixel from quad edges
+    float topSpan  = hypot((u1-u0)*srcW, (v1-v0)*srcH) / outW;
+    float botSpan  = hypot((u2-u3)*srcW, (v2-v3)*srcH) / outW;
+    float leftSpan = hypot((u3-u0)*srcW, (v3-v0)*srcH) / outH;
+    float rightSpan= hypot((u2-u1)*srcW, (v2-v1)*srcH) / outH;
+    float maxFoot = max({topSpan, botSpan, leftSpan, rightSpan});
+    int ss = clamp((int)ceil(maxFoot), 2, 8);
+    float invSS2 = 1.0f / (ss * ss);
+
     for (int y = 0; y < outH; y++) {
-        float ty = (y + 0.5f) / outH;
-        // Left edge: lerp(TL, BL)
-        float lU = u0 + (u3 - u0) * ty, lV = v0 + (v3 - v0) * ty;
-        // Right edge: lerp(TR, BR)
-        float rU = u1 + (u2 - u1) * ty, rV = v1 + (v2 - v1) * ty;
-
         for (int x = 0; x < outW; x++) {
-            float tx = (x + 0.5f) / outW;
-            float u = lU + (rU - lU) * tx;
-            float v = lV + (rV - lV) * tx;
+            float sum[4] = {0, 0, 0, 0};
 
-            // Bilinear sample from source
-            float sx = u * srcW - 0.5f;
-            float sy = v * srcH - 0.5f;
-            int ix = (int)floor(sx), iy = (int)floor(sy);
-            float fx = sx - ix, fy = sy - iy;
+            for (int sj = 0; sj < ss; sj++) {
+                float ty = (y + (sj + 0.5f) / ss) / outH;
+                float lU = u0 + (u3-u0)*ty, lV = v0 + (v3-v0)*ty;
+                float rU = u1 + (u2-u1)*ty, rV = v1 + (v2-v1)*ty;
+
+                for (int si = 0; si < ss; si++) {
+                    float tx = (x + (si + 0.5f) / ss) / outW;
+                    float u = lU + (rU-lU)*tx;
+                    float v = lV + (rV-lV)*tx;
+
+                    float sx = u * srcW - 0.5f;
+                    float sy = v * srcH - 0.5f;
+                    int ix = (int)floor(sx), iy = (int)floor(sy);
+                    float fx = sx - ix, fy = sy - iy;
+
+                    for (int c = 0; c < channels; c++) {
+                        auto sample = [&](int px, int py) -> float {
+                            px = clamp(px, 0, srcW - 1);
+                            py = clamp(py, 0, srcH - 1);
+                            return srcData[(py * srcW + px) * channels + c];
+                        };
+                        sum[c] += sample(ix,iy)*(1-fx)*(1-fy)
+                                + sample(ix+1,iy)*fx*(1-fy)
+                                + sample(ix,iy+1)*(1-fx)*fy
+                                + sample(ix+1,iy+1)*fx*fy;
+                    }
+                }
+            }
 
             int outIdx = (y * outW + x) * channels;
             for (int c = 0; c < channels; c++) {
-                auto sample = [&](int px, int py) -> float {
-                    px = clamp(px, 0, srcW - 1);
-                    py = clamp(py, 0, srcH - 1);
-                    return srcData[(py * srcW + px) * channels + c];
-                };
-                float v00 = sample(ix, iy);
-                float v10 = sample(ix + 1, iy);
-                float v01 = sample(ix, iy + 1);
-                float v11 = sample(ix + 1, iy + 1);
-                float val = v00*(1-fx)*(1-fy) + v10*fx*(1-fy) +
-                            v01*(1-fx)*fy + v11*fx*fy;
-                dstData[outIdx + c] = (unsigned char)clamp(val, 0.f, 255.f);
+                dstData[outIdx + c] = (unsigned char)clamp(sum[c] * invSS2, 0.f, 255.f);
             }
         }
     }
