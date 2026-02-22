@@ -386,6 +386,10 @@ public:
         tmpEntry.userPerspV = ucPerspV;
         tmpEntry.userPerspH = ucPerspH;
         tmpEntry.userShear = ucShear;
+        if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
+            auto* e = ctx_->provider->getPhoto(ctx_->grid->getPhotoId(selectedIndex_));
+            if (e) tmpEntry.focalLength35mm = e->focalLength35mm;
+        }
 
         // Compute bounding box (perspective-aware)
         auto [bbW, bbH] = tmpEntry.computeBB((int)srcW, (int)srcH);

@@ -98,9 +98,9 @@ struct PhotoEntry {
     float userAngle = 0.0f;   // Fine rotation (radians, ±TAU/8)
     int userRotation90 = 0;    // 90° steps (0-3, counterclockwise)
 
-    // Perspective / shear correction
-    float userPerspV = 0.0f;   // vertical perspective (-1 to +1)
-    float userPerspH = 0.0f;   // horizontal perspective (-1 to +1)
+    // Perspective / shear correction (tilt angles in degrees)
+    float userPerspV = 0.0f;   // vertical tilt (degrees, ±45)
+    float userPerspH = 0.0f;   // horizontal tilt (degrees, ±45)
     float userShear = 0.0f;    // rolling shutter shear (-1 to +1)
 
     bool hasCrop() const {
@@ -121,71 +121,83 @@ struct PhotoEntry {
         return userRotation90 * kHalfPi + userAngle;
     }
 
-    // Forward transform: source UV → warped position (shear + perspective)
-    // Returns warped (u', v') in source coordinate space
+    // Forward transform: source UV → warped position (shear + homography)
+    // Uses proper projective geometry with focal length.
     pair<float,float> forwardWarp(float u, float v) const {
-        // 1. Shear: horizontal shift proportional to distance from center
+        // 1. Shear
         float u2 = u + userShear * (v - 0.5f);
         float v2 = v;
-        // 2. Perspective
-        float vScale = 1.0f + userPerspV * (2.0f * v2 - 1.0f);
-        float hScale = 1.0f + userPerspH * (2.0f * u2 - 1.0f);
-        float wu = 0.5f + (u2 - 0.5f) * vScale;
-        float wv = 0.5f + (v2 - 0.5f) * hScale;
+
+        if (userPerspV == 0 && userPerspH == 0) return {u2, v2};
+
+        // Normalized focal length (default 28mm ≈ iPhone standard)
+        float focal = (focalLength35mm > 0) ? (float)focalLength35mm : 28.0f;
+        float fx = focal / 36.0f;
+        float fy = focal / 24.0f;
+
+        // Tilt angles → radians
+        constexpr float kDeg2Rad = 3.14159265f / 180.0f;
+        float tv = userPerspV * kDeg2Rad;
+        float th = userPerspH * kDeg2Rad;
+        float cosV = cosf(tv), sinV = sinf(tv);
+        float cosH = cosf(th), sinH = sinf(th);
+
+        // Source pixel → 3D ray
+        float rx = (u2 - 0.5f) / fx;
+        float ry = (v2 - 0.5f) / fy;
+
+        // Horizontal tilt correction (Y-axis rotation by -θ_h)
+        float x1 = cosH * rx + sinH;
+        float y1 = ry;
+        float z1 = -sinH * rx + cosH;
+
+        // Vertical tilt correction (X-axis rotation by -θ_v)
+        float xf = x1;
+        float yf = cosV * y1 - sinV * z1;
+        float zf = sinV * y1 + cosV * z1;
+
+        // Project back (clamp denominator to prevent singularity)
+        if (zf < 0.001f) zf = 0.001f;
+        float wu = fx * xf / zf + 0.5f;
+        float wv = fy * yf / zf + 0.5f;
         return {wu, wv};
     }
 
     // Inverse transform: warped position → source UV
-    // Uses Newton iteration for perspective inversion
+    // Analytical inverse of the homography (inverse rotation = transpose)
     pair<float,float> inverseWarp(float wu, float wv) const {
         if (!hasPerspective()) return {wu, wv};
 
-        // Start with identity guess
-        float u = wu, v = wv;
+        float focal = (focalLength35mm > 0) ? (float)focalLength35mm : 28.0f;
+        float fx = focal / 36.0f;
+        float fy = focal / 24.0f;
 
-        // Newton iteration (2-3 rounds sufficient)
-        for (int iter = 0; iter < 4; iter++) {
-            // Forward: compute warped from current guess
-            float u2 = u + userShear * (v - 0.5f);
-            float v2 = v;
-            float vScale = 1.0f + userPerspV * (2.0f * v2 - 1.0f);
-            float hScale = 1.0f + userPerspH * (2.0f * u2 - 1.0f);
-            float fu = 0.5f + (u2 - 0.5f) * vScale;
-            float fv = 0.5f + (v2 - 0.5f) * hScale;
+        constexpr float kDeg2Rad = 3.14159265f / 180.0f;
+        float tv = userPerspV * kDeg2Rad;
+        float th = userPerspH * kDeg2Rad;
+        float cosV = cosf(tv), sinV = sinf(tv);
+        float cosH = cosf(th), sinH = sinf(th);
 
-            // Residual
-            float du = wu - fu;
-            float dv = wv - fv;
-            if (fabs(du) < 1e-6f && fabs(dv) < 1e-6f) break;
+        // Warped pixel → 3D ray
+        float rx = (wu - 0.5f) / fx;
+        float ry = (wv - 0.5f) / fy;
 
-            // Jacobian (partial derivatives)
-            // dfu/du = vScale + (u2-0.5)*(-2*perspH*vScale) ... simplified:
-            // Use numerical Jacobian for robustness
-            float eps = 1e-5f;
-            float u2p = (u+eps) + userShear * (v - 0.5f);
-            float v2p = v;
-            float vSp = 1.0f + userPerspV * (2.0f * v2p - 1.0f);
-            float hSp = 1.0f + userPerspH * (2.0f * u2p - 1.0f);
-            float fu_du = 0.5f + (u2p - 0.5f) * vSp;
-            float fv_du = 0.5f + (v2p - 0.5f) * hSp;
+        // Inverse vertical (X-axis rotation by +θ_v)
+        float x1 = rx;
+        float y1 = cosV * ry + sinV;
+        float z1 = -sinV * ry + cosV;
 
-            float u2q = u + userShear * ((v+eps) - 0.5f);
-            float v2q = v + eps;
-            float vSq = 1.0f + userPerspV * (2.0f * v2q - 1.0f);
-            float hSq = 1.0f + userPerspH * (2.0f * u2q - 1.0f);
-            float fu_dv = 0.5f + (u2q - 0.5f) * vSq;
-            float fv_dv = 0.5f + (v2q - 0.5f) * hSq;
+        // Inverse horizontal (Y-axis rotation by +θ_h)
+        float xf = cosH * x1 - sinH * z1;
+        float yf = y1;
+        float zf = sinH * x1 + cosH * z1;
 
-            float j00 = (fu_du - fu) / eps, j01 = (fu_dv - fu) / eps;
-            float j10 = (fv_du - fv) / eps, j11 = (fv_dv - fv) / eps;
+        if (zf < 0.001f) zf = 0.001f;
+        float u = fx * xf / zf + 0.5f;
+        float v = fy * yf / zf + 0.5f;
 
-            // Invert 2x2 Jacobian
-            float det = j00 * j11 - j01 * j10;
-            if (fabs(det) < 1e-12f) break;
-            float invDet = 1.0f / det;
-            u += ( j11 * du - j01 * dv) * invDet;
-            v += (-j10 * du + j00 * dv) * invDet;
-        }
+        // Inverse shear
+        u = u - userShear * (v - 0.5f);
         return {u, v};
     }
 

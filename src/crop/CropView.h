@@ -257,7 +257,7 @@ public:
             setCursor(Cursor::ResizeEW);
         else if (pos.x >= cx && pos.x <= cx + cw && pos.y >= cy && pos.y <= cy + ch) {
             bool shiftHeld = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
-            if (shiftHeld && focalLength35mm_ > 0)
+            if (shiftHeld)
                 setCursor(Cursor::Hand);
             else
                 setCursor(Cursor::ResizeAll);
@@ -321,11 +321,7 @@ public:
         bbRect_ = { bbDrawX, bbDrawY, bbDrawW, bbDrawH };
 
         // --- Step 1: Draw rotated image (dimmed) ---
-        // Build a temporary PhotoEntry to reuse forwardWarp/inverseWarp
-        PhotoEntry tmpEntry;
-        tmpEntry.userPerspV = perspV_;
-        tmpEntry.userPerspH = perspH_;
-        tmpEntry.userShear = shear_;
+        auto tmpEntry = makeTmpEntry();
 
         if (!hasPersp) {
             // Simple rotation: draw as rotated quad
@@ -568,6 +564,9 @@ protected:
             dragStart_ = pos;
             dragStartCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_,
                                perspV_, perspH_, shear_ };
+            dragStartBBRect_ = bbRect_;
+            dragStartBBW_ = bbW_;
+            dragStartBBH_ = bbH_;
             updateCursorForDrag();
 
             if (dragMode_ == DragMode::Rotate) {
@@ -597,84 +596,21 @@ protected:
             return true;
         }
 
-        float dx = (pos.x - dragStart_.x) / bbRect_.w;
-        float dy = (pos.y - dragStart_.y) / bbRect_.h;
+        // Use drag-start bbRect for stable coordinate mapping
+        // (prevents feedback loop when perspective changes BB mid-drag)
+        auto& bb = dragStartBBRect_;
+        float dx = (pos.x - dragStart_.x) / bb.w;
+        float dy = (pos.y - dragStart_.y) / bb.h;
 
         auto& s = dragStartCrop_;
         bool locked = panel_->aspect() != CropAspect::Free;
         constexpr float minSize = 0.02f;
 
         float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
+        bool shiftPerspDrag = false;
 
         if (dragMode_ == DragMode::Move) {
-            bool shiftHeld = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
-            if (shiftHeld && focalLength35mm_ > 0) {
-                // Shift+drag: perspective tied to crop position.
-                // Move first (with boundary), then derive perspective from displacement.
-
-                // Temporarily restore start perspective for boundary computation
-                perspV_ = s.perspV;
-                perspH_ = s.perspH;
-                updateBoundingBox();
-
-                // Boundary-constrained move (same logic as normal Move)
-                float moveNX = s.x + dx;
-                float moveNY = s.y + dy;
-                float blockNX = 0, blockNY = 0;
-                float tMax = computeDragLimit(s, moveNX, moveNY, s.w, s.h, &blockNX, &blockNY);
-                moveNX = s.x + (moveNX - s.x) * tMax;
-                moveNY = s.y + (moveNY - s.y) * tMax;
-
-                // Edge sliding
-                if (tMax < 0.999f && (blockNX != 0 || blockNY != 0)) {
-                    float remainDx = dx * (1.0f - tMax);
-                    float remainDy = dy * (1.0f - tMax);
-                    float tanX = -blockNY, tanY = blockNX;
-                    float dot = remainDx * tanX + remainDy * tanY;
-                    float slideDx = dot * tanX;
-                    float slideDy = dot * tanY;
-                    if (abs(slideDx) > 0.0001f || abs(slideDy) > 0.0001f) {
-                        CropState cur = {moveNX, moveNY, s.w, s.h, s.angle, s.rot90,
-                                         s.perspV, s.perspH, s.shear};
-                        float tSlide = computeDragLimit(cur,
-                            moveNX + slideDx, moveNY + slideDy, s.w, s.h);
-                        moveNX += slideDx * tSlide;
-                        moveNY += slideDy * tSlide;
-                    }
-                }
-
-                // Derive perspective from actual crop displacement
-                float actualDX = moveNX - s.x;
-                float actualDY = moveNY - s.y;
-                float k = 40.0f / max((float)focalLength35mm_, 24.0f);
-                float newPV = clamp(s.perspV - actualDY * k, -1.0f, 1.0f);
-                float newPH = clamp(s.perspH - actualDX * k, -1.0f, 1.0f);
-
-                // BB is currently at start perspective; record it
-                float startBBW = bbW_, startBBH = bbH_;
-
-                // Apply new perspective
-                perspV_ = newPV;
-                perspH_ = newPH;
-                updateBoundingBox();
-
-                // Rescale from start BB to new BB
-                float scaleX = startBBW / max(1.0f, bbW_);
-                float scaleY = startBBH / max(1.0f, bbH_);
-                cropW_ = s.w * scaleX;
-                cropH_ = s.h * scaleY;
-
-                float cx = 0.5f + ((moveNX + s.w / 2) - 0.5f) * scaleX;
-                float cy = 0.5f + ((moveNY + s.h / 2) - 0.5f) * scaleY;
-                cropX_ = cx - cropW_ / 2;
-                cropY_ = cy - cropH_ / 2;
-
-                panel_->setPerspV(perspV_);
-                panel_->setPerspH(perspH_);
-                constrainCropToBounds();
-                if (ctx_ && ctx_->redraw) ctx_->redraw(1);
-                return true;
-            }
+            shiftPerspDrag = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
             nx = s.x + dx;
             ny = s.y + dy;
         } else {
@@ -802,7 +738,8 @@ protected:
         }
 
         // --- Boundary constraint (mode-specific) ---
-        if (dragMode_ == DragMode::Move) {
+        // Skip for Shift+Move (perspective drag) — bounds handled separately
+        if (dragMode_ == DragMode::Move && !shiftPerspDrag) {
             // Pass 1: constrain the combined (dx, dy) movement
             float blockNX = 0, blockNY = 0;
             float tMax = computeDragLimit(s, nx, ny, nw, nh, &blockNX, &blockNY);
@@ -866,6 +803,47 @@ protected:
 
         cropX_ = nx; cropY_ = ny;
         cropW_ = nw; cropH_ = nh;
+
+        // Shift+Move: derive perspective from actual crop displacement
+        if (shiftPerspDrag) {
+            // Screen-space displacement (stable, uses drag-start bbRect)
+            float screenDx = pos.x - dragStart_.x;
+            float screenDy = pos.y - dragStart_.y;
+
+            // Convert screen displacement → warped-image UV (for angle computation)
+            float totalRot = (float)rotation90_ * (TAU / 4.0f) + angle_;
+            float cosR = cosf(-totalRot), sinR = sinf(-totalRot);
+            float startFitScale = dragStartBBRect_.w / max(1.0f, dragStartBBW_);
+            float imgDx = screenDx / startFitScale;  // screen px → image px
+            float imgDy = screenDy / startFitScale;
+            // Undo rotation → warped-image displacement
+            float du = (imgDx * cosR - imgDy * sinR) / max(1.0f, (float)fboW_);
+            float dv = (imgDx * sinR + imgDy * cosR) / max(1.0f, (float)fboH_);
+
+            // Displacement → tilt angle (projective camera model)
+            float focal = (focalLength35mm_ > 0) ? (float)focalLength35mm_ : 28.0f;
+            float fx = focal / 36.0f;
+            float fy = focal / 24.0f;
+            constexpr float kRad2Deg = 180.0f / 3.14159265f;
+
+            perspH_ = clamp(s.perspH - atanf(du / fx) * kRad2Deg, -45.0f, 45.0f);
+            perspV_ = clamp(s.perspV + atanf(dv / fy) * kRad2Deg, -45.0f, 45.0f);
+            updateBoundingBox();
+
+            // Place crop in new BB-normalized coords so it stays at the same
+            // screen position with the same screen size (only the image warps)
+            auto newBB = predictBBRect();
+            auto& sb = dragStartBBRect_;
+            float startScreenX = sb.x + s.x * sb.w;
+            float startScreenY = sb.y + s.y * sb.h;
+            cropX_ = (startScreenX + screenDx - newBB.x) / newBB.w;
+            cropY_ = (startScreenY + screenDy - newBB.y) / newBB.h;
+            cropW_ = (s.w * sb.w) / newBB.w;
+            cropH_ = (s.h * sb.h) / newBB.h;
+
+            panel_->setPerspV(perspV_);
+            panel_->setPerspH(perspH_);
+        }
 
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         return true;
@@ -988,23 +966,42 @@ private:
     // Cached BB draw rect (screen coords)
     struct Rect { float x, y, w, h; };
     Rect bbRect_ = {0, 0, 0, 0};
+    Rect dragStartBBRect_ = {0, 0, 0, 0};  // bbRect_ at drag start (stable during drag)
+    float dragStartBBW_ = 0, dragStartBBH_ = 0;  // BB dimensions at drag start
 
     float handleSize_ = 4.0f;
 
     // --- Bounding box computation ---
 
+    // Build a PhotoEntry with current crop/rotation/perspective state
+    PhotoEntry makeTmpEntry() const {
+        PhotoEntry e;
+        e.userAngle = angle_;
+        e.userRotation90 = rotation90_;
+        e.userPerspV = perspV_;
+        e.userPerspH = perspH_;
+        e.userShear = shear_;
+        e.focalLength35mm = focalLength35mm_;
+        return e;
+    }
+
     void updateBoundingBox() {
-        // Use PhotoEntry::computeBB for perspective-aware BB
-        PhotoEntry tmpEntry;
-        tmpEntry.userAngle = angle_;
-        tmpEntry.userRotation90 = rotation90_;
-        tmpEntry.userPerspV = perspV_;
-        tmpEntry.userPerspH = perspH_;
-        tmpEntry.userShear = shear_;
+        auto tmpEntry = makeTmpEntry();
         auto [w, h] = tmpEntry.computeBB(fboW_, fboH_);
         bbW_ = w;
         bbH_ = h;
         bbAspect_ = bbW_ / max(1.0f, bbH_);
+    }
+
+    // Predict screen-space BB rect from current bbW_/bbH_ (same formula as draw())
+    Rect predictBBRect() const {
+        float panelW = 220, padding = 40;
+        float availW = getWidth() - panelW - padding * 2;
+        float availH = getHeight() - padding * 2;
+        float fitScale = min(availW / bbW_, availH / bbH_);
+        float bw = bbW_ * fitScale, bh = bbH_ * fitScale;
+        float cx = padding + availW / 2, cy = padding + availH / 2;
+        return {cx - bw / 2, cy - bh / 2, bw, bh};
     }
 
     // Transform crop coords when bounding box changes (keeps crop in same
@@ -1045,7 +1042,7 @@ private:
     void setPerspV(float v) {
         pushUndo();
         float oldBBW = bbW_, oldBBH = bbH_;
-        perspV_ = clamp(v, -1.0f, 1.0f);
+        perspV_ = clamp(v, -45.0f, 45.0f);
         updateBoundingBox();
         rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
         panel_->setPerspV(perspV_);
@@ -1056,7 +1053,7 @@ private:
     void setPerspH(float v) {
         pushUndo();
         float oldBBW = bbW_, oldBBH = bbH_;
-        perspH_ = clamp(v, -1.0f, 1.0f);
+        perspH_ = clamp(v, -45.0f, 45.0f);
         updateBoundingBox();
         rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
         panel_->setPerspH(perspH_);
@@ -1175,13 +1172,7 @@ private:
         if (hasPersp) {
             // Perspective mode: check crop corners via inverse warp
             // If any corner maps outside [0,1]², shrink crop uniformly around center
-            PhotoEntry tmpEntry;
-            tmpEntry.userAngle = angle_;
-            tmpEntry.userRotation90 = rotation90_;
-            tmpEntry.userPerspV = perspV_;
-            tmpEntry.userPerspH = perspH_;
-            tmpEntry.userShear = shear_;
-
+            auto tmpEntry = makeTmpEntry();
             auto [bbW, bbH] = tmpEntry.computeBB(fboW_, fboH_);
             float totalRot = tmpEntry.totalRotation();
             float cosR = cos(-totalRot), sinR = sin(-totalRot);
@@ -1336,13 +1327,7 @@ private:
                            float nx, float ny, float nw, float nh,
                            float* blockNormalX = nullptr,
                            float* blockNormalY = nullptr) {
-        PhotoEntry tmpEntry;
-        tmpEntry.userAngle = angle_;
-        tmpEntry.userRotation90 = rotation90_;
-        tmpEntry.userPerspV = perspV_;
-        tmpEntry.userPerspH = perspH_;
-        tmpEntry.userShear = shear_;
-
+        auto tmpEntry = makeTmpEntry();
         auto [bbW, bbH] = tmpEntry.computeBB(fboW_, fboH_);
         float totalRot = tmpEntry.totalRotation();
         float cosR = cos(totalRot), sinR = sin(totalRot);

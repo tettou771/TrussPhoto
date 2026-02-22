@@ -331,14 +331,15 @@ private:
 };
 
 // =============================================================================
-// PerspSlider - Center-zero slider for perspective/shear values (±1)
+// PerspSlider - Center-zero slider for tilt angle (±45°) or shear (±1)
 // =============================================================================
 class PerspSlider : public RectNode {
 public:
     using Ptr = shared_ptr<PerspSlider>;
 
     Event<float> valueChanged;
-    float value = 0;         // -1 to +1
+    float value = 0;
+    float maxVal = 45.0f;    // ±maxVal range (45° for tilt, 1 for shear)
     string label = "V";
 
     PerspSlider(const string& lbl, Font* font) : label(lbl), font_(font) {
@@ -357,7 +358,10 @@ public:
 
         // Label + value
         char buf[16];
-        snprintf(buf, sizeof(buf), "%+.0f%%", value * 100.0f);
+        if (maxVal > 1.5f)
+            snprintf(buf, sizeof(buf), "%+.1f\xC2\xB0", value); // degrees
+        else
+            snprintf(buf, sizeof(buf), "%+.0f%%", value * 100.0f);
         if (font_) {
             setColor(0.45f, 0.45f, 0.5f);
             font_->drawString(label, pad, 12, Left, Center);
@@ -379,8 +383,8 @@ public:
         setColor(0.35f, 0.35f, 0.4f);
         drawRect(centerX - 0.5f, trackY - 2, 1, trackH + 4);
 
-        // Fill from center
-        float t = clamp(value, -1.0f, 1.0f);
+        // Fill from center (normalized to ±1 range for display)
+        float t = clamp(value / maxVal, -1.0f, 1.0f);
         float fillStart = centerX;
         float fillEnd = centerX + (trackW / 2) * t;
         if (fillEnd < fillStart) swap(fillStart, fillEnd);
@@ -438,7 +442,7 @@ private:
         float t = (mx - centerX) / (trackW / 2);
         t = clamp(t, -1.0f, 1.0f);
 
-        value = t;
+        value = t * maxVal;
         valueChanged.notify(value);
     }
 };
