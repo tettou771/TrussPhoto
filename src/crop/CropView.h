@@ -90,6 +90,7 @@ public:
             angle_ = 0; rotation90_ = 0;
             perspV_ = 0; perspH_ = 0; shear_ = 0;
             updateBoundingBox();
+            syncViewAnchor();
             isLandscape_ = (originalAspect_ >= 1.0f);
             panel_->setOrientation(isLandscape_);
             panel_->setAngle(0);
@@ -161,8 +162,10 @@ public:
             focalLength35mm_ = 0;
         }
 
+        viewZoom_ = 1.0f;
         updateBoundingBox();
         constrainCropToBounds();
+        syncViewAnchor();
 
         // Determine initial orientation from crop shape (in BB pixels)
         float pixelCropW = cropW_ * bbW_;
@@ -228,6 +231,7 @@ public:
         angle_ = s.angle; rotation90_ = s.rot90;
         perspV_ = s.perspV; perspH_ = s.perspH; shear_ = s.shear;
         updateBoundingBox();
+        syncViewAnchor();
         panel_->setAngle(angle_);
         panel_->setPerspV(perspV_);
         panel_->setPerspH(perspH_);
@@ -307,15 +311,16 @@ public:
         float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
         float rotBBW = (float)fboW_ * cosA + (float)fboH_ * sinA;
         float rotBBH = (float)fboW_ * sinA + (float)fboH_ * cosA;
-        float fitScale = min(availW / rotBBW, availH / rotBBH);
+        float fitScale = min(availW / rotBBW, availH / rotBBH) * viewZoom_;
         float bbDrawW = bbW_ * fitScale;
         float bbDrawH = bbH_ * fitScale;
         float imgDrawW = (float)fboW_ * fitScale;
         float imgDrawH = (float)fboH_ * fitScale;
 
-        // Center of display area = center of BB = center of image
-        float centerX = padding + availW / 2;
-        float centerY = padding + availH / 2;
+        // viewAnchor = BB-norm point that appears at screen center.
+        // Move/perspective update it incrementally; resize leaves it frozen.
+        float centerX = padding + availW / 2 + (0.5f - viewAnchorX_) * bbDrawW;
+        float centerY = padding + availH / 2 + (0.5f - viewAnchorY_) * bbDrawH;
 
         float bbDrawX = centerX - bbDrawW / 2;
         float bbDrawY = centerY - bbDrawH / 2;
@@ -527,6 +532,15 @@ public:
 
 protected:
     bool onMousePress(Vec2 pos, int button) override {
+        // Right-click: start view pan (no crop changes)
+        if (button == 1) {
+            viewPanDragging_ = true;
+            viewPanStart_ = pos;
+            viewPanAnchorStartX_ = viewAnchorX_;
+            viewPanAnchorStartY_ = viewAnchorY_;
+            setCursor(Cursor::Hand);
+            return true;
+        }
         if (button != 0) return false;
 
         // Crop rect in screen coords
@@ -570,6 +584,8 @@ protected:
             dragStartBBRect_ = bbRect_;
             dragStartBBW_ = bbW_;
             dragStartBBH_ = bbH_;
+            viewAnchorStartX_ = viewAnchorX_;
+            viewAnchorStartY_ = viewAnchorY_;
             updateCursorForDrag();
 
             if (dragMode_ == DragMode::Rotate) {
@@ -584,6 +600,16 @@ protected:
     }
 
     bool onMouseDrag(Vec2 pos, int button) override {
+        // Right-drag: view pan
+        if (button == 1 && viewPanDragging_) {
+            float dx = pos.x - viewPanStart_.x;
+            float dy = pos.y - viewPanStart_.y;
+            // bbRect_.w = bbW_ * fitScale * viewZoom_, independent of viewAnchor
+            viewAnchorX_ = viewPanAnchorStartX_ - dx / max(1.0f, bbRect_.w);
+            viewAnchorY_ = viewPanAnchorStartY_ - dy / max(1.0f, bbRect_.h);
+            if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+            return true;
+        }
         if (button != 0 || dragMode_ == DragMode::None) return false;
 
         if (dragMode_ == DragMode::Rotate) {
@@ -612,10 +638,15 @@ protected:
         float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
         bool shiftPerspDrag = false;
 
+        bool movePanDrag = false;
+
         if (dragMode_ == DragMode::Move) {
-            shiftPerspDrag = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
-            nx = s.x + dx;
-            ny = s.y + dy;
+            bool isShift = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
+            if (isShift) {
+                shiftPerspDrag = true;  // perspective block handles it
+            } else {
+                movePanDrag = true;     // translation block handles it
+            }
         } else {
             bool isEdge = (dragMode_ == DragMode::T || dragMode_ == DragMode::B ||
                            dragMode_ == DragMode::L || dragMode_ == DragMode::R);
@@ -807,45 +838,63 @@ protected:
         cropX_ = nx; cropY_ = ny;
         cropW_ = nw; cropH_ = nh;
 
-        // Shift+Move: derive perspective from actual crop displacement
+        // Shift+Move: perspective correction
         if (shiftPerspDrag) {
-            // Screen-space displacement (stable, uses drag-start bbRect)
             float screenDx = pos.x - dragStart_.x;
             float screenDy = pos.y - dragStart_.y;
 
-            // Convert screen displacement → warped-image UV (for angle computation)
             float totalRot = (float)rotation90_ * (TAU / 4.0f) + angle_;
             float cosR = cosf(-totalRot), sinR = sinf(-totalRot);
             float startFitScale = dragStartBBRect_.w / max(1.0f, dragStartBBW_);
-            float imgDx = screenDx / startFitScale;  // screen px → image px
+            float imgDx = screenDx / startFitScale;
             float imgDy = screenDy / startFitScale;
-            // Undo rotation → warped-image displacement
             float du = (imgDx * cosR - imgDy * sinR) / max(1.0f, (float)fboW_);
             float dv = (imgDx * sinR + imgDy * cosR) / max(1.0f, (float)fboH_);
 
-            // Displacement → tilt angle (projective camera model)
             float focal = (focalLength35mm_ > 0) ? (float)focalLength35mm_ : 28.0f;
             float fx = focal / 36.0f;
             float fy = focal / 24.0f;
             constexpr float kRad2Deg = 180.0f / 3.14159265f;
 
-            perspH_ = clamp(s.perspH - atanf(du / fx) * kRad2Deg, -45.0f, 45.0f);
-            perspV_ = clamp(s.perspV + atanf(dv / fy) * kRad2Deg, -45.0f, 45.0f);
+            perspH_ = clamp(s.perspH + atanf(du / fx) * kRad2Deg, -45.0f, 45.0f);
+            perspV_ = clamp(s.perspV - atanf(dv / fy) * kRad2Deg, -45.0f, 45.0f);
             updateBoundingBox();
 
-            // Place crop in new BB-normalized coords so it stays at the same
-            // screen position with the same screen size (only the image warps)
+            // Keep crop at its original screen position
             auto newBB = predictBBRect();
             auto& sb = dragStartBBRect_;
             float startScreenX = sb.x + s.x * sb.w;
             float startScreenY = sb.y + s.y * sb.h;
-            cropX_ = (startScreenX + screenDx - newBB.x) / newBB.w;
-            cropY_ = (startScreenY + screenDy - newBB.y) / newBB.h;
+            cropX_ = (startScreenX - newBB.x) / newBB.w;
+            cropY_ = (startScreenY - newBB.y) / newBB.h;
             cropW_ = (s.w * sb.w) / newBB.w;
             cropH_ = (s.h * sb.h) / newBB.h;
 
+            // Track crop movement so image shifts, crop stays on screen
+            float startMidX = s.x + s.w / 2;
+            float startMidY = s.y + s.h / 2;
+            viewAnchorX_ = viewAnchorStartX_ + ((cropX_ + cropW_ / 2) - startMidX);
+            viewAnchorY_ = viewAnchorStartY_ + ((cropY_ + cropH_ / 2) - startMidY);
+
             panel_->setPerspV(perspV_);
             panel_->setPerspH(perspH_);
+        }
+
+        // Normal Move: translate photo behind fixed crop frame
+        if (movePanDrag) {
+            float screenDx = pos.x - dragStart_.x;
+            float screenDy = pos.y - dragStart_.y;
+            auto& sb = dragStartBBRect_;
+            // Drag right → photo moves right → crop shifts left in BB-norm
+            cropX_ = s.x - screenDx / sb.w;
+            cropY_ = s.y - screenDy / sb.h;
+            cropW_ = s.w;
+            cropH_ = s.h;
+            // Track crop movement so image shifts, crop stays on screen
+            float startMidX = s.x + s.w / 2;
+            float startMidY = s.y + s.h / 2;
+            viewAnchorX_ = viewAnchorStartX_ + ((cropX_ + cropW_ / 2) - startMidX);
+            viewAnchorY_ = viewAnchorStartY_ + ((cropY_ + cropH_ / 2) - startMidY);
         }
 
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
@@ -854,6 +903,11 @@ protected:
 
     bool onMouseRelease(Vec2 pos, int button) override {
         (void)pos;
+        if (button == 1 && viewPanDragging_) {
+            viewPanDragging_ = false;
+            setCursor(Cursor::Default);
+            return true;
+        }
         if (button == 0) {
             dragMode_ = DragMode::None;
             setCursor(Cursor::Default);
@@ -863,53 +917,35 @@ protected:
     }
 
     bool onMouseScroll(Vec2 pos, Vec2 scroll) override {
-        // Hit test against screen-aligned crop rect
-        float cx = bbRect_.x + cropX_ * bbRect_.w;
-        float cy = bbRect_.y + cropY_ * bbRect_.h;
-        float cw = cropW_ * bbRect_.w;
-        float ch = cropH_ * bbRect_.h;
-        if (pos.x < cx || pos.x > cx + cw || pos.y < cy || pos.y > cy + ch)
-            return false;
+        // View zoom: scroll changes magnification, not crop parameters
+        float factor = 1.0f + scroll.y * 0.05f;
+        factor = clamp(factor, 0.8f, 1.25f);
 
-        pushUndo();
+        // Zoom range: min = show full BB, max = 4x
+        float totalRot = rotation90_ * TAU / 4 + angle_;
+        float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
+        float rotBBW = (float)fboW_ * cosA + (float)fboH_ * sinA;
+        float rotBBH = (float)fboW_ * sinA + (float)fboH_ * cosA;
+        float bbZoom = min(rotBBW / max(1.0f, bbW_), rotBBH / max(1.0f, bbH_));
+        float minZoom = min(bbZoom, 0.75f);  // allow some zoom-out even without perspective
+        constexpr float maxZoom = 4.0f;
 
-        float factor = 1.0f - scroll.y * 0.03f;
-        factor = clamp(factor, 0.8f, 1.2f);
+        float newZoom = clamp(viewZoom_ * factor, minZoom, maxZoom);
+        float actualFactor = newZoom / viewZoom_;
+        if (fabs(actualFactor - 1.0f) < 0.001f) return true;
 
-        constexpr float minSize = 0.02f;
-        bool locked = panel_->aspect() != CropAspect::Free;
+        // Adjust viewAnchor to keep pointer position stable
+        float panelW = 220, padding = 40;
+        float screenCenterX = padding + (getWidth() - panelW - padding * 2) / 2;
+        float screenCenterY = padding + (getHeight() - padding * 2) / 2;
 
-        float centerX = cropX_ + cropW_ / 2;
-        float centerY = cropY_ + cropH_ / 2;
-
-        float nw = max(cropW_ * factor, minSize);
-        float nh = max(cropH_ * factor, minSize);
-
-        if (locked) {
-            float targetAR = getTargetAspectNorm();
-            if (targetAR > 0) {
-                if (nw / nh > targetAR) nw = nh * targetAR;
-                else nh = nw / targetAR;
-            }
+        if (bbRect_.w > 1 && bbRect_.h > 1) {
+            float k = 1.0f - 1.0f / actualFactor;
+            viewAnchorX_ += (pos.x - screenCenterX) / bbRect_.w * k;
+            viewAnchorY_ += (pos.y - screenCenterY) / bbRect_.h * k;
         }
 
-        float dnx = centerX - nw / 2;
-        float dny = centerY - nh / 2;
-
-        // Use analytical constraint (center-preserving zoom)
-        CropState start = {cropX_, cropY_, cropW_, cropH_, angle_, rotation90_,
-                           perspV_, perspH_, shear_};
-        float tMax = computeDragLimit(start, dnx, dny, nw, nh);
-        if (tMax < 0.999f) {
-            dnx = cropX_ + (dnx - cropX_) * tMax;
-            dny = cropY_ + (dny - cropY_) * tMax;
-            nw = cropW_ + (nw - cropW_) * tMax;
-            nh = cropH_ + (nh - cropH_) * tMax;
-        }
-
-        cropX_ = dnx; cropY_ = dny;
-        cropW_ = nw; cropH_ = nh;
-
+        viewZoom_ = newZoom;
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         return true;
     }
@@ -972,7 +1008,26 @@ private:
     Rect dragStartBBRect_ = {0, 0, 0, 0};  // bbRect_ at drag start (stable during drag)
     float dragStartBBW_ = 0, dragStartBBH_ = 0;  // BB dimensions at drag start
 
+    // View anchor: BB-norm point that maps to screen center.
+    // Move/perspective update it incrementally; resize leaves it frozen.
+    float viewAnchorX_ = 0.5f, viewAnchorY_ = 0.5f;
+    float viewAnchorStartX_ = 0.5f, viewAnchorStartY_ = 0.5f;  // saved at drag start
+
+    // View zoom (1.0 = fit rotation-only BB to screen)
+    float viewZoom_ = 1.0f;
+
+    // Right-drag view pan state
+    bool viewPanDragging_ = false;
+    Vec2 viewPanStart_;
+    float viewPanAnchorStartX_ = 0, viewPanAnchorStartY_ = 0;
+
     float handleSize_ = 4.0f;
+
+    // Sync view anchor to current crop center (re-centers the view)
+    void syncViewAnchor() {
+        viewAnchorX_ = cropX_ + cropW_ / 2;
+        viewAnchorY_ = cropY_ + cropH_ / 2;
+    }
 
     // --- Bounding box computation ---
 
@@ -1006,9 +1061,11 @@ private:
         float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
         float rotBBW = (float)fboW_ * cosA + (float)fboH_ * sinA;
         float rotBBH = (float)fboW_ * sinA + (float)fboH_ * cosA;
-        float fitScale = min(availW / rotBBW, availH / rotBBH);
+        float fitScale = min(availW / rotBBW, availH / rotBBH) * viewZoom_;
         float bw = bbW_ * fitScale, bh = bbH_ * fitScale;
-        float cx = padding + availW / 2, cy = padding + availH / 2;
+        // Use viewAnchor (matches draw())
+        float cx = padding + availW / 2 + (0.5f - viewAnchorX_) * bw;
+        float cy = padding + availH / 2 + (0.5f - viewAnchorY_) * bh;
         return {cx - bw / 2, cy - bh / 2, bw, bh};
     }
 
@@ -1042,6 +1099,7 @@ private:
 
         panel_->setAngle(angle_);
         constrainCropToBounds();
+        syncViewAnchor();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
@@ -1055,6 +1113,7 @@ private:
         rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
         panel_->setPerspV(perspV_);
         constrainCropToBounds();
+        syncViewAnchor();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
@@ -1066,6 +1125,7 @@ private:
         rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
         panel_->setPerspH(perspH_);
         constrainCropToBounds();
+        syncViewAnchor();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
@@ -1077,6 +1137,7 @@ private:
         rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
         panel_->setShear(shear_);
         constrainCropToBounds();
+        syncViewAnchor();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
@@ -1108,6 +1169,7 @@ private:
         panel_->setShear(0);
 
         constrainCropToBounds();
+        syncViewAnchor();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
@@ -1158,6 +1220,7 @@ private:
         panel_->setOrientation(isLandscape_);
 
         constrainCropToBounds();
+        syncViewAnchor();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
@@ -1597,5 +1660,6 @@ private:
         cropW_ = newW;
         cropH_ = newH;
         constrainCropToBounds();
+        syncViewAnchor();
     }
 };
