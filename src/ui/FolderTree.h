@@ -53,13 +53,26 @@ public:
         setClipping(true);
     }
 
+    void update() override {
+        bool hover = isMouseOver();
+        if (hover != prevHover_) {
+            prevHover_ = hover;
+            redraw();
+        }
+    }
+
     void draw() override {
         float w = getWidth();
         float h = getHeight();
+        bool hover = isMouseOver();
 
         if (isHeader) {
             if (selected) {
                 setColor(0.2f, 0.25f, 0.35f);
+                fill();
+                drawRect(0, 0, w, h);
+            } else if (hover) {
+                setColor(0.14f, 0.14f, 0.17f);
                 fill();
                 drawRect(0, 0, w, h);
             }
@@ -76,9 +89,13 @@ public:
 
         float indent = 16.0f * depth + 14.0f;
 
-        // Selection highlight
+        // Selection / hover highlight
         if (selected) {
             setColor(0.2f, 0.25f, 0.35f);
+            fill();
+            drawRect(0, 0, w, h);
+        } else if (hover) {
+            setColor(0.14f, 0.14f, 0.17f);
             fill();
             drawRect(0, 0, w, h);
         }
@@ -144,6 +161,9 @@ protected:
         if (onClick) onClick();
         return true;
     }
+
+private:
+    bool prevHover_ = false;
 };
 
 // ScrollContainer without default background/border (parent draws its own)

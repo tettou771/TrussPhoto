@@ -44,9 +44,18 @@ public:
         setClipping(true);
     }
 
+    void update() override {
+        bool hover = isMouseOver();
+        if (hover != prevHover_) {
+            prevHover_ = hover;
+            redraw();
+        }
+    }
+
     void draw() override {
         float w = getWidth();
         float h = getHeight();
+        bool hover = isMouseOver();
 
         // Drop target highlight
         if (dropHighlight) {
@@ -58,6 +67,10 @@ public:
         if (isHeader) {
             if (selected && !dropHighlight) {
                 setColor(0.2f, 0.25f, 0.35f);
+                fill();
+                drawRect(0, 0, w, h);
+            } else if (hover && !dropHighlight) {
+                setColor(0.14f, 0.14f, 0.17f);
                 fill();
                 drawRect(0, 0, w, h);
             }
@@ -74,9 +87,13 @@ public:
 
         float indent = 14.0f * depth + 10.0f;
 
-        // Selection highlight
+        // Selection / hover highlight
         if (selected && !dropHighlight) {
             setColor(0.2f, 0.25f, 0.35f);
+            fill();
+            drawRect(0, 0, w, h);
+        } else if (hover && !dropHighlight) {
+            setColor(0.14f, 0.14f, 0.17f);
             fill();
             drawRect(0, 0, w, h);
         }
@@ -158,6 +175,9 @@ protected:
         if (onClick) onClick();
         return true;
     }
+
+private:
+    bool prevHover_ = false;
 };
 
 // =============================================================================
