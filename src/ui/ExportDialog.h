@@ -29,26 +29,47 @@ public:
         }
     }
 
+    void setDisabled(bool d) {
+        if (disabled_ != d) {
+            disabled_ = d;
+            redraw();
+        }
+    }
+
+    bool isDisabled() const { return disabled_; }
+
     void setup() override { enableEvents(); }
 
     void draw() override {
         float w = getWidth(), h = getHeight();
 
-        // Background
-        if (selected_) setColor(0.3f, 0.5f, 0.85f);
-        else setColor(0.22f, 0.22f, 0.26f);
-        fill();
-        drawRect(0, 0, w, h);
+        if (disabled_) {
+            // Greyed out
+            setColor(0.16f, 0.16f, 0.18f);
+            fill();
+            drawRect(0, 0, w, h);
+            setColor(0.25f, 0.25f, 0.28f);
+            noFill();
+            drawRect(0, 0, w, h);
+            setColor(0.35f, 0.35f, 0.38f);
+        } else if (selected_) {
+            setColor(0.3f, 0.5f, 0.85f);
+            fill();
+            drawRect(0, 0, w, h);
+            setColor(0.4f, 0.6f, 0.95f);
+            noFill();
+            drawRect(0, 0, w, h);
+            setColor(1.0f, 1.0f, 1.0f);
+        } else {
+            setColor(0.22f, 0.22f, 0.26f);
+            fill();
+            drawRect(0, 0, w, h);
+            setColor(0.3f, 0.3f, 0.35f);
+            noFill();
+            drawRect(0, 0, w, h);
+            setColor(0.7f, 0.7f, 0.75f);
+        }
 
-        // Border
-        if (selected_) setColor(0.4f, 0.6f, 0.95f);
-        else setColor(0.3f, 0.3f, 0.35f);
-        noFill();
-        drawRect(0, 0, w, h);
-
-        // Label
-        setColor(selected_ ? 1.0f : 0.7f, selected_ ? 1.0f : 0.7f,
-                 selected_ ? 1.0f : 0.75f);
         pushStyle();
         setTextAlign(Direction::Center, Direction::Center);
         drawBitmapString(label_, w / 2, h / 2);
@@ -56,7 +77,7 @@ public:
     }
 
     bool onMousePress(Vec2, int button) override {
-        if (button == 0) clicked.notify(value_);
+        if (button == 0 && !disabled_) clicked.notify(value_);
         return true;
     }
 
@@ -64,6 +85,7 @@ private:
     int value_;
     string label_;
     bool selected_ = false;
+    bool disabled_ = false;
 };
 
 class QualitySlider : public RectNode {
@@ -289,10 +311,16 @@ public:
     }
 
     void show(const ExportSettings& initial, int sourceW, int sourceH) {
-        selectedMaxEdge_ = initial.maxEdge;
         quality_ = initial.quality;
         sourceW_ = sourceW;
         sourceH_ = sourceH;
+        // If previous selection is now too large, fall back to Full
+        int maxEdge = max(sourceW, sourceH);
+        if (initial.maxEdge > 0 && initial.maxEdge >= maxEdge) {
+            selectedMaxEdge_ = 0;  // Full
+        } else {
+            selectedMaxEdge_ = initial.maxEdge;
+        }
         needsSync_ = true;
         setActive(true);
     }
@@ -381,7 +409,11 @@ private:
 
     void updateSizeSelection() {
         const int presets[] = {0, 2560, 1920, 1280};
+        int maxEdge = max(sourceW_, sourceH_);
         for (int i = 0; i < 4; i++) {
+            // Disable presets that are >= native size (no upscale)
+            bool disabled = (presets[i] > 0 && presets[i] >= maxEdge);
+            sizeButtons_[i]->setDisabled(disabled);
             sizeButtons_[i]->setSelected(presets[i] == selectedMaxEdge_);
         }
     }

@@ -1,9 +1,8 @@
 #pragma once
 
 // =============================================================================
-// CropPanel.h - Right sidebar for crop controls (aspect ratio, preview, etc.)
-// All UI elements are RectNode children with LayoutMod auto-stacking.
-// CropPanel::draw() only renders background + left border (non-scrolling).
+// CropPanel.h - Right sidebar for crop controls
+// Layout: fixed preview (top) | scrollable controls (middle) | fixed buttons (bottom)
 // =============================================================================
 
 #include <TrussC.h>
@@ -11,6 +10,7 @@
 #include "CropWidgets.h"
 #include "CropPreview.h"
 #include "ui/FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
+#include "ui/Dropdown.h"
 
 using namespace std;
 using namespace tc;
@@ -36,6 +36,11 @@ public:
     CropPanel() {
         loadJapaneseFont(font_, 12);
 
+        // --- Fixed top: preview ---
+        preview_ = make_shared<CropPreview>();
+        preview_->setSize(0, 100);  // updated in setSize()
+
+        // --- Scrollable middle: controls ---
         scrollContainer_ = make_shared<PlainScrollContainer>();
         content_ = make_shared<RectNode>();
         scrollContainer_->setContent(content_);
@@ -43,23 +48,12 @@ public:
         scrollBar_ = make_shared<ScrollBar>(scrollContainer_.get(), ScrollBar::Vertical);
         scrollContainer_->addChild(scrollBar_);
 
-        // LayoutMod: vertical auto-stacking, children fill width
         contentLayout_ = content_->addMod<LayoutMod>(LayoutDirection::Vertical, 2);
         contentLayout_->setCrossAxis(AxisMode::Fill);
         contentLayout_->setMainAxis(AxisMode::Content);
-        contentLayout_->setPadding(9, 0, 12, 0);
+        contentLayout_->setPadding(6, 0, 12, 0);
 
-        // --- Create all child widgets ---
-
-        previewLabel_ = make_shared<TextLabel>("Preview", &font_);
-        previewLabel_->setSize(0, 16);
-
-        preview_ = make_shared<CropPreview>();
-        preview_->setSize(0, 100);  // updated in setSize()
-
-        separator1_ = make_shared<Separator>();
-        separator1_->setSize(0, 12);
-
+        // Create control widgets
         orientToggle_ = make_shared<OrientationToggle>();
         orientToggle_->setSize(0, 28);
         orientListener_ = orientToggle_->orientationChanged.listen([this](bool& landscape) {
@@ -69,14 +63,16 @@ public:
         aspectLabel_ = make_shared<TextLabel>("Aspect Ratio", &font_);
         aspectLabel_->setSize(0, 16);
 
-        for (int i = 0; i < kCropAspectCount; i++) {
-            aspectButtons_[i] = make_shared<AspectButton>((CropAspect)i, &font_);
-            aspectButtons_[i]->setSize(0, 26);
-            aspectListeners_[i] = aspectButtons_[i]->clicked.listen([this](CropAspect& a) {
-                selectAspect(a);
-            });
-        }
-        aspectButtons_[0]->selected = true;
+        aspectDropdown_ = make_shared<Dropdown>(&font_);
+        aspectDropdown_->setSize(0, 26);
+        vector<DropdownOption> opts;
+        for (int i = 0; i < kCropAspectCount; i++)
+            opts.push_back({i, cropAspectLabel((CropAspect)i)});
+        aspectDropdown_->setOptions(opts);
+        aspectDropdown_->setSelectedId(0);
+        aspectDropdownListener_ = aspectDropdown_->selectionChanged.listen([this](int& id) {
+            selectAspect((CropAspect)id);
+        });
 
         separator2_ = make_shared<Separator>();
         separator2_->setSize(0, 12);
@@ -149,8 +145,9 @@ public:
         outputSize_->xPad = 22;
         outputSize_->setSize(0, 16);
 
+        // --- Fixed bottom: action buttons ---
         buttonRow_ = make_shared<ButtonRow>(&font_);
-        buttonRow_->setSize(0, 30);
+        buttonRow_->setSize(0, kButtonRowH_);
 
         resetListener_ = buttonRow_->resetBtn->clicked.listen([this]() { resetEvent.notify(); });
         cancelListener_ = buttonRow_->cancelBtn->clicked.listen([this]() { cancelEvent.notify(); });
@@ -159,16 +156,17 @@ public:
 
     void setup() override {
         enableEvents();
-        addChild(scrollContainer_);
 
-        content_->addChild(previewLabel_);
-        content_->addChild(preview_);
-        content_->addChild(separator1_);
+        // Three zones as direct children of panel
+        addChild(preview_);
+        addChild(scrollContainer_);
+        addChild(buttonRow_);
+
+        // Scroll content: controls only
         content_->addChild(orientToggle_);
         content_->addChild(aspectLabel_);
-        for (int i = 0; i < kCropAspectCount; i++) {
-            content_->addChild(aspectButtons_[i]);
-        }
+        aspectDropdown_->setPopupParent(this);  // CropPanel is outside ScrollContainer
+        content_->addChild(aspectDropdown_);
         content_->addChild(separator2_);
         content_->addChild(rotationLabel_);
         content_->addChild(rotate90Row_);
@@ -185,7 +183,6 @@ public:
         content_->addChild(separator5_);
         content_->addChild(outputLabel_);
         content_->addChild(outputSize_);
-        content_->addChild(buttonRow_);
     }
 
     CropAspect aspect() const { return currentAspect_; }
@@ -221,14 +218,22 @@ public:
 
     void setSize(float w, float h) override {
         RectNode::setSize(w, h);
-        scrollContainer_->setRect(0, 0, w, h);
 
         float contentW = w - 12;  // scrollbar space
-        content_->setWidth(contentW);
 
-        // Square preview area so portrait/landscape fit at same size
+        // Zone 1: preview (square, fits panel width)
         float previewH = contentW;
-        preview_->setHeight(previewH);
+        preview_->setRect(0, 0, w, previewH);
+
+        // Zone 3: button row (fixed at bottom)
+        float btnY = h - kButtonRowH_ - kButtonPad_;
+        buttonRow_->setRect(kButtonPad_, btnY, w - kButtonPad_ * 2, kButtonRowH_);
+
+        // Zone 2: scroll area fills the gap
+        float scrollY = previewH;
+        float scrollH = btnY - kButtonPad_ - scrollY;
+        scrollContainer_->setRect(0, scrollY, w, max(scrollH, 0.0f));
+        content_->setWidth(contentW);
 
         contentLayout_->updateLayout();
     }
@@ -245,7 +250,7 @@ public:
         float w = getWidth();
         float h = getHeight();
 
-        // Background (non-scrolling)
+        // Background
         setColor(0.09f, 0.09f, 0.11f);
         fill();
         drawRect(0, 0, w, h);
@@ -267,24 +272,29 @@ private:
     CropAspect currentAspect_ = CropAspect::Original;
     LayoutMod* contentLayout_ = nullptr;
 
+    // Layout constants
+    static constexpr float kButtonRowH_ = 30.0f;
+    static constexpr float kButtonPad_ = 8.0f;
+
     // Child widget listeners
     EventListener orientListener_;
-    EventListener aspectListeners_[kCropAspectCount];
+    EventListener aspectDropdownListener_;
     EventListener angleListener_, rotate90Listener_;
     EventListener perspVListener_, perspHListener_, shearListener_;
     EventListener focalListener_, centerBtnListener_;
     EventListener resetListener_, cancelListener_, doneListener_;
 
+    // Zone 1: fixed preview
+    CropPreview::Ptr preview_;
+
+    // Zone 2: scrollable controls
     PlainScrollContainer::Ptr scrollContainer_;
     RectNode::Ptr content_;
     ScrollBar::Ptr scrollBar_;
 
-    TextLabel::Ptr previewLabel_;
-    CropPreview::Ptr preview_;
-    Separator::Ptr separator1_;
     OrientationToggle::Ptr orientToggle_;
     TextLabel::Ptr aspectLabel_;
-    AspectButton::Ptr aspectButtons_[kCropAspectCount];
+    Dropdown::Ptr aspectDropdown_;
     Separator::Ptr separator2_;
     TextLabel::Ptr rotationLabel_;
     Rotate90Row::Ptr rotate90Row_;
@@ -301,13 +311,13 @@ private:
     Separator::Ptr separator5_;
     TextLabel::Ptr outputLabel_;
     TextLabel::Ptr outputSize_;
+
+    // Zone 3: fixed button row
     ButtonRow::Ptr buttonRow_;
 
     void selectAspect(CropAspect a) {
         currentAspect_ = a;
-        for (int i = 0; i < kCropAspectCount; i++) {
-            aspectButtons_[i]->selected = (i == (int)a);
-        }
+        aspectDropdown_->setSelectedId((int)a);
         aspectChanged.notify(a);
         redraw();
     }

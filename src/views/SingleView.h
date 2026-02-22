@@ -787,8 +787,19 @@ public:
             exportDialog_->setActive(false);
         }
 
-        int srcW = developShader_.getFboWidth();
-        int srcH = developShader_.getFboHeight();
+        // Use crop output size (not full FBO) so presets > crop size get greyed out
+        int srcW, srcH;
+        string pid = currentPhotoId();
+        auto* entry = ctx_ ? ctx_->provider->getPhoto(pid) : nullptr;
+        if (entry && entry->hasCrop()) {
+            auto [cw, ch] = entry->getCropOutputSize(
+                developShader_.getFboWidth(), developShader_.getFboHeight());
+            srcW = cw;
+            srcH = ch;
+        } else {
+            srcW = developShader_.getFboWidth();
+            srcH = developShader_.getFboHeight();
+        }
         exportDialog_->setSize(getWidth(), getHeight());
         exportDialog_->show(lastExportSettings_, srcW, srcH);
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
