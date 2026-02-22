@@ -54,16 +54,56 @@ public:
             float px = (w - fitW) / 2;
             float py = (h - fitH) / 2;
 
+            // Tessellated grid for correct perspective (homography) preview.
+            // Bilinear UV interpolation from 4 corner UVs:
+            //   TL(uv_[0,1]) --- TR(uv_[2,3])
+            //    |                   |
+            //   BL(uv_[6,7]) --- BR(uv_[4,5])
+            constexpr int N = 8;
             setColor(1, 1, 1);
             sgl_enable_texture();
             sgl_texture(view_, sampler_);
             Color col = getDefaultContext().getColor();
-            sgl_begin_quads();
+            sgl_begin_triangles();
             sgl_c4f(col.r, col.g, col.b, col.a);
-            sgl_v2f_t2f(px, py, uv_[0], uv_[1]);
-            sgl_v2f_t2f(px + fitW, py, uv_[2], uv_[3]);
-            sgl_v2f_t2f(px + fitW, py + fitH, uv_[4], uv_[5]);
-            sgl_v2f_t2f(px, py + fitH, uv_[6], uv_[7]);
+
+            for (int j = 0; j < N; j++) {
+                for (int i = 0; i < N; i++) {
+                    float s0 = (float)i / N, s1 = (float)(i+1) / N;
+                    float t0 = (float)j / N, t1 = (float)(j+1) / N;
+
+                    auto uvAt = [&](float s, float t, float& u, float& v) {
+                        // Bilinear: lerp(lerp(TL,TR,s), lerp(BL,BR,s), t)
+                        float topU = uv_[0] + (uv_[2] - uv_[0]) * s;
+                        float topV = uv_[1] + (uv_[3] - uv_[1]) * s;
+                        float botU = uv_[6] + (uv_[4] - uv_[6]) * s;
+                        float botV = uv_[7] + (uv_[5] - uv_[7]) * s;
+                        u = topU + (botU - topU) * t;
+                        v = topV + (botV - topV) * t;
+                    };
+
+                    float u00, v00, u10, v10, u11, v11, u01, v01;
+                    uvAt(s0, t0, u00, v00);
+                    uvAt(s1, t0, u10, v10);
+                    uvAt(s1, t1, u11, v11);
+                    uvAt(s0, t1, u01, v01);
+
+                    float sx00 = px + s0 * fitW, sy00 = py + t0 * fitH;
+                    float sx10 = px + s1 * fitW, sy10 = py + t0 * fitH;
+                    float sx11 = px + s1 * fitW, sy11 = py + t1 * fitH;
+                    float sx01 = px + s0 * fitW, sy01 = py + t1 * fitH;
+
+                    // Triangle 1: TL, TR, BR
+                    sgl_v2f_t2f(sx00, sy00, u00, v00);
+                    sgl_v2f_t2f(sx10, sy10, u10, v10);
+                    sgl_v2f_t2f(sx11, sy11, u11, v11);
+                    // Triangle 2: TL, BR, BL
+                    sgl_v2f_t2f(sx00, sy00, u00, v00);
+                    sgl_v2f_t2f(sx11, sy11, u11, v11);
+                    sgl_v2f_t2f(sx01, sy01, u01, v01);
+                }
+            }
+
             sgl_end();
             sgl_disable_texture();
         } else {

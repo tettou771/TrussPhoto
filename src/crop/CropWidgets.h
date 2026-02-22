@@ -496,6 +496,150 @@ private:
 };
 
 // =============================================================================
+// FocalLengthRow - Focal length display / slider for perspective drag
+// Two modes: EXIF read-only text, or log-scale slider (12-600mm)
+// =============================================================================
+class FocalLengthRow : public RectNode {
+public:
+    using Ptr = shared_ptr<FocalLengthRow>;
+
+    Event<int> focalChanged;  // focal length in mm (0 = disabled)
+    int value = 0;            // current focal length mm
+    bool fromExif = false;    // true = read-only EXIF display
+
+    FocalLengthRow(Font* font) : font_(font) {
+        enableEvents();
+    }
+
+    void setFocalLength(int mm, bool exif) {
+        value = mm;
+        fromExif = exif;
+    }
+
+    void draw() override {
+        float w = getWidth();
+        float h = getHeight();
+        float pad = 12.0f;
+
+        if (fromExif) {
+            // Read-only EXIF display (grayed out)
+            if (font_) {
+                setColor(0.35f, 0.35f, 0.4f);
+                font_->drawString("Focal", pad, h / 2, Left, Center);
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%dmm (35mm eq)", value);
+                font_->drawString(buf, w - pad, h / 2, Right, Center);
+            }
+            return;
+        }
+
+        // Slider mode
+        float trackY = 24.0f;
+        float trackH = 4.0f;
+        float knobR = 6.0f;
+
+        // Label + value
+        if (font_) {
+            setColor(0.45f, 0.45f, 0.5f);
+            font_->drawString("Focal", pad, 12, Left, Center);
+            setColor(0.65f, 0.65f, 0.7f);
+            if (value > 0) {
+                char buf[16];
+                snprintf(buf, sizeof(buf), "%dmm", value);
+                font_->drawString(buf, w - pad, 12, Right, Center);
+            } else {
+                font_->drawString("---", w - pad, 12, Right, Center);
+            }
+        }
+
+        // Track
+        float trackLeft = pad;
+        float trackRight = w - pad;
+        float trackW = trackRight - trackLeft;
+
+        setColor(0.2f, 0.2f, 0.24f);
+        fill();
+        drawRect(trackLeft, trackY, trackW, trackH);
+
+        // Position: log scale 12-600mm
+        float pos = mmToPos(value);
+
+        // Fill from left
+        if (value > 0) {
+            setColor(0.4f, 0.6f, 0.9f);
+            drawRect(trackLeft, trackY, trackW * pos, trackH);
+        }
+
+        // Knob
+        float knobX = trackLeft + trackW * pos;
+        float knobY = trackY + trackH / 2;
+        setColor(0.8f, 0.85f, 0.9f);
+        drawCircle(knobX, knobY, knobR);
+    }
+
+protected:
+    bool onMousePress(Vec2 pos, int button) override {
+        if (button != 0 || fromExif) return false;
+        // Double-click: reset to 0
+        auto now = chrono::steady_clock::now();
+        auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - lastClick_).count();
+        lastClick_ = now;
+        if (elapsed < 350) {
+            value = 0;
+            focalChanged.notify(value);
+            return true;
+        }
+        dragging_ = true;
+        updateFromMouse(pos.x);
+        return true;
+    }
+
+    bool onMouseDrag(Vec2 pos, int button) override {
+        if (!dragging_ || button != 0) return false;
+        updateFromMouse(pos.x);
+        return true;
+    }
+
+    bool onMouseRelease(Vec2 pos, int button) override {
+        (void)pos;
+        if (button == 0) dragging_ = false;
+        return true;
+    }
+
+private:
+    Font* font_;
+    bool dragging_ = false;
+    chrono::steady_clock::time_point lastClick_;
+
+    static constexpr float kMinMM = 12.0f;
+    static constexpr float kMaxMM = 600.0f;
+
+    // Log-scale: pos 0-1 -> 12-600mm
+    static float posToMM(float pos) {
+        if (pos <= 0.001f) return 0;  // left edge = disabled
+        return kMinMM * exp(pos * log(kMaxMM / kMinMM));
+    }
+
+    static float mmToPos(int mm) {
+        if (mm <= 0) return 0;
+        float f = clamp((float)mm, kMinMM, kMaxMM);
+        return log(f / kMinMM) / log(kMaxMM / kMinMM);
+    }
+
+    void updateFromMouse(float mx) {
+        float pad = 12.0f;
+        float trackLeft = pad;
+        float trackRight = getWidth() - pad;
+        float trackW = trackRight - trackLeft;
+
+        float pos = clamp((mx - trackLeft) / trackW, 0.0f, 1.0f);
+        float mm = posToMM(pos);
+        value = (int)round(mm);
+        focalChanged.notify(value);
+    }
+};
+
+// =============================================================================
 // ButtonRow - Horizontal container for action buttons (Reset | Cancel | Done)
 // =============================================================================
 class ButtonRow : public RectNode {

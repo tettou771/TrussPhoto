@@ -27,6 +27,8 @@ public:
     Event<float> perspVChanged;
     Event<float> perspHChanged;
     Event<float> shearChanged;
+    Event<int> focalChanged;
+    Event<void> centerizeEvent;
     Event<void> resetEvent;
     Event<void> doneEvent;
     Event<void> cancelEvent;
@@ -118,8 +120,26 @@ public:
             shearChanged.notify(v);
         });
 
+        centerBtn_ = make_shared<PanelButton>("Center", false, &font_);
+        centerBtn_->setSize(0, 26);
+        centerBtnListener_ = centerBtn_->clicked.listen([this]() {
+            centerizeEvent.notify();
+        });
+
         separator4_ = make_shared<Separator>();
         separator4_->setSize(0, 12);
+
+        focalLabel_ = make_shared<TextLabel>("Focal Length", &font_);
+        focalLabel_->setSize(0, 16);
+
+        focalRow_ = make_shared<FocalLengthRow>(&font_);
+        focalRow_->setSize(0, 38);
+        focalListener_ = focalRow_->focalChanged.listen([this](int& mm) {
+            focalChanged.notify(mm);
+        });
+
+        separator5_ = make_shared<Separator>();
+        separator5_->setSize(0, 12);
 
         outputLabel_ = make_shared<TextLabel>("Output", &font_);
         outputLabel_->setSize(0, 16);
@@ -158,7 +178,11 @@ public:
         content_->addChild(perspVSlider_);
         content_->addChild(perspHSlider_);
         content_->addChild(shearSlider_);
+        content_->addChild(centerBtn_);
         content_->addChild(separator4_);
+        content_->addChild(focalLabel_);
+        content_->addChild(focalRow_);
+        content_->addChild(separator5_);
         content_->addChild(outputLabel_);
         content_->addChild(outputSize_);
         content_->addChild(buttonRow_);
@@ -175,6 +199,10 @@ public:
     void setPerspV(float v) { perspVSlider_->setValue(v); }
     void setPerspH(float v) { perspHSlider_->setValue(v); }
     void setShear(float v) { shearSlider_->setValue(v); }
+
+    void setFocalLength(int mm, bool fromExif) {
+        focalRow_->setFocalLength(mm, fromExif);
+    }
 
     // Per-vertex UV pairs: TL, TR, BR, BL (supports rotated crop)
     void setPreviewInfo(sg_view view, sg_sampler sampler,
@@ -244,6 +272,7 @@ private:
     EventListener aspectListeners_[kCropAspectCount];
     EventListener angleListener_, rotate90Listener_;
     EventListener perspVListener_, perspHListener_, shearListener_;
+    EventListener focalListener_, centerBtnListener_;
     EventListener resetListener_, cancelListener_, doneListener_;
 
     PlainScrollContainer::Ptr scrollContainer_;
@@ -265,7 +294,11 @@ private:
     PerspSlider::Ptr perspVSlider_;
     PerspSlider::Ptr perspHSlider_;
     PerspSlider::Ptr shearSlider_;
+    PanelButton::Ptr centerBtn_;
     Separator::Ptr separator4_;
+    TextLabel::Ptr focalLabel_;
+    FocalLengthRow::Ptr focalRow_;
+    Separator::Ptr separator5_;
     TextLabel::Ptr outputLabel_;
     TextLabel::Ptr outputSize_;
     ButtonRow::Ptr buttonRow_;

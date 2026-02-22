@@ -77,6 +77,13 @@ public:
         shearListener_ = panel_->shearChanged.listen([this](float& v) {
             setShear(v);
         });
+        focalListener_ = panel_->focalChanged.listen([this](int& mm) {
+            focalLength35mm_ = mm;
+            if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+        });
+        centerizeListener_ = panel_->centerizeEvent.listen([this]() {
+            centerize();
+        });
         resetListener_ = panel_->resetEvent.listen([this]() {
             pushUndo();
             cropX_ = 0; cropY_ = 0; cropW_ = 1; cropH_ = 1;
@@ -147,6 +154,13 @@ public:
             perspV_ = 0; perspH_ = 0; shear_ = 0;
         }
 
+        // Read focal length from entry
+        if (entry) {
+            focalLength35mm_ = entry->focalLength35mm;
+        } else {
+            focalLength35mm_ = 0;
+        }
+
         updateBoundingBox();
         constrainCropToBounds();
 
@@ -159,6 +173,7 @@ public:
         panel_->setPerspV(perspV_);
         panel_->setPerspH(perspH_);
         panel_->setShear(shear_);
+        panel_->setFocalLength(focalLength35mm_, focalLength35mm_ > 0);
 
         // Save initial state for cancel (after constraint)
         initialCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_,
@@ -240,9 +255,13 @@ public:
             setCursor(Cursor::ResizeNS);
         else if (hitTest(pos, cx, cy + ch/2, hs) || hitTest(pos, cx + cw, cy + ch/2, hs))
             setCursor(Cursor::ResizeEW);
-        else if (pos.x >= cx && pos.x <= cx + cw && pos.y >= cy && pos.y <= cy + ch)
-            setCursor(Cursor::ResizeAll);
-        else {
+        else if (pos.x >= cx && pos.x <= cx + cw && pos.y >= cy && pos.y <= cy + ch) {
+            bool shiftHeld = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
+            if (shiftHeld && focalLength35mm_ > 0)
+                setCursor(Cursor::Hand);
+            else
+                setCursor(Cursor::ResizeAll);
+        } else {
             float margin = 60;
             if (pos.x >= bbRect_.x - margin && pos.x <= bbRect_.x + bbRect_.w + margin &&
                 pos.y >= bbRect_.y - margin && pos.y <= bbRect_.y + bbRect_.h + margin)
@@ -588,6 +607,74 @@ protected:
         float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
 
         if (dragMode_ == DragMode::Move) {
+            bool shiftHeld = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
+            if (shiftHeld && focalLength35mm_ > 0) {
+                // Shift+drag: perspective tied to crop position.
+                // Move first (with boundary), then derive perspective from displacement.
+
+                // Temporarily restore start perspective for boundary computation
+                perspV_ = s.perspV;
+                perspH_ = s.perspH;
+                updateBoundingBox();
+
+                // Boundary-constrained move (same logic as normal Move)
+                float moveNX = s.x + dx;
+                float moveNY = s.y + dy;
+                float blockNX = 0, blockNY = 0;
+                float tMax = computeDragLimit(s, moveNX, moveNY, s.w, s.h, &blockNX, &blockNY);
+                moveNX = s.x + (moveNX - s.x) * tMax;
+                moveNY = s.y + (moveNY - s.y) * tMax;
+
+                // Edge sliding
+                if (tMax < 0.999f && (blockNX != 0 || blockNY != 0)) {
+                    float remainDx = dx * (1.0f - tMax);
+                    float remainDy = dy * (1.0f - tMax);
+                    float tanX = -blockNY, tanY = blockNX;
+                    float dot = remainDx * tanX + remainDy * tanY;
+                    float slideDx = dot * tanX;
+                    float slideDy = dot * tanY;
+                    if (abs(slideDx) > 0.0001f || abs(slideDy) > 0.0001f) {
+                        CropState cur = {moveNX, moveNY, s.w, s.h, s.angle, s.rot90,
+                                         s.perspV, s.perspH, s.shear};
+                        float tSlide = computeDragLimit(cur,
+                            moveNX + slideDx, moveNY + slideDy, s.w, s.h);
+                        moveNX += slideDx * tSlide;
+                        moveNY += slideDy * tSlide;
+                    }
+                }
+
+                // Derive perspective from actual crop displacement
+                float actualDX = moveNX - s.x;
+                float actualDY = moveNY - s.y;
+                float k = 40.0f / max((float)focalLength35mm_, 24.0f);
+                float newPV = clamp(s.perspV - actualDY * k, -1.0f, 1.0f);
+                float newPH = clamp(s.perspH - actualDX * k, -1.0f, 1.0f);
+
+                // BB is currently at start perspective; record it
+                float startBBW = bbW_, startBBH = bbH_;
+
+                // Apply new perspective
+                perspV_ = newPV;
+                perspH_ = newPH;
+                updateBoundingBox();
+
+                // Rescale from start BB to new BB
+                float scaleX = startBBW / max(1.0f, bbW_);
+                float scaleY = startBBH / max(1.0f, bbH_);
+                cropW_ = s.w * scaleX;
+                cropH_ = s.h * scaleY;
+
+                float cx = 0.5f + ((moveNX + s.w / 2) - 0.5f) * scaleX;
+                float cy = 0.5f + ((moveNY + s.h / 2) - 0.5f) * scaleY;
+                cropX_ = cx - cropW_ / 2;
+                cropY_ = cy - cropH_ / 2;
+
+                panel_->setPerspV(perspV_);
+                panel_->setPerspH(perspH_);
+                constrainCropToBounds();
+                if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+                return true;
+            }
             nx = s.x + dx;
             ny = s.y + dy;
         } else {
@@ -855,6 +942,7 @@ private:
     EventListener aspectListener_, orientListener_, resetListener_;
     EventListener angleListener_, rotate90Listener_;
     EventListener perspVListener_, perspHListener_, shearListener_;
+    EventListener focalListener_, centerizeListener_;
     EventListener panelDoneListener_, panelCancelListener_;
 
     // Borrowed FBO handles
@@ -881,6 +969,9 @@ private:
     float perspV_ = 0;
     float perspH_ = 0;
     float shear_ = 0;
+
+    // Focal length for perspective drag sensitivity
+    int focalLength35mm_ = 0;
 
     // Initial state for cancel
     CropState initialCrop_ = {0, 0, 1, 1, 0, 0, 0, 0, 0};
@@ -980,6 +1071,37 @@ private:
         updateBoundingBox();
         rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
         panel_->setShear(shear_);
+        constrainCropToBounds();
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+    }
+
+    // Center crop + reset all perspective (keep crop size/ratio)
+    void centerize() {
+        pushUndo();
+
+        // Preserve physical crop size (pixels)
+        float physW = cropW_ * bbW_;
+        float physH = cropH_ * bbH_;
+
+        // Reset perspective
+        perspV_ = 0;
+        perspH_ = 0;
+        shear_ = 0;
+        updateBoundingBox();
+
+        // Rescale crop to new BB
+        cropW_ = clamp(physW / max(1.0f, bbW_), 0.02f, 1.0f);
+        cropH_ = clamp(physH / max(1.0f, bbH_), 0.02f, 1.0f);
+
+        // Center
+        cropX_ = 0.5f - cropW_ / 2;
+        cropY_ = 0.5f - cropH_ / 2;
+
+        // Update panel
+        panel_->setPerspV(0);
+        panel_->setPerspH(0);
+        panel_->setShear(0);
+
         constrainCropToBounds();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
