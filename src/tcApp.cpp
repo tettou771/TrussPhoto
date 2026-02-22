@@ -1,5 +1,4 @@
 #include "tcApp.h"
-#include <mach/mach.h>
 
 void tcApp::setup() {
     // 0. Ensure OS bootstrap directory exists
@@ -107,6 +106,10 @@ void tcApp::setup() {
     }
 
     // === GUI mode setup (below) ===
+
+    // 4b. Create status bar (bottom bar — added early so it draws behind everything)
+    statusBar_ = make_shared<StatusBar>();
+    addChild(statusBar_);
 
     // 5. Create ViewManager (owns Grid, Single, Map, Related, People views)
     viewManager_ = make_shared<ViewManager>();
@@ -386,6 +389,14 @@ void tcApp::setup() {
         needsServerSync_ = true;
     }
 
+    // 7b. Initial status bar state
+    if (catalogSettings_.hasServer()) {
+        statusBar_->setServerStatus("Offline", Color(0.6f, 0.35f, 0.35f));
+    } else {
+        statusBar_->setServerStatus("Local", Color(0.5f, 0.5f, 0.55f));
+    }
+    statusBar_->setPhotoCount(provider_.getCount());
+
     // 8. MCP tools
     mcp::tool("load_folder", "Load a folder containing images")
         .arg<string>("path", "Path to folder")
@@ -590,6 +601,16 @@ void tcApp::update() {
         syncCompleted_ = false;
         enqueueLocalOnlyPhotos();
 
+        // Update status bar after sync
+        statusBar_->setPhotoCount(provider_.getCount());
+        if (catalogSettings_.hasServer()) {
+            if (provider_.isServerConnected()) {
+                statusBar_->setServerStatus("Server", Color(0.3f, 0.8f, 0.4f));
+            } else {
+                statusBar_->setServerStatus("Offline", Color(0.6f, 0.35f, 0.35f));
+            }
+        }
+
         auto g = grid();
         if (provider_.getCount() > 0 && g->getItemCount() != provider_.getCount()) {
             g->populate(provider_);
@@ -600,9 +621,15 @@ void tcApp::update() {
 
     // Process background file copies
     provider_.processCopyResults();
+    statusBar_->setPhotoCount(provider_.getCount());
 
     // Process smart preview generation results
     provider_.processSPResults();
+    if (provider_.isSPGenerationRunning()) {
+        statusBar_->setTaskProgress("SP", provider_.getSPCompletedCount(), provider_.getSPTotalCount());
+    } else {
+        statusBar_->clearTask("SP");
+    }
 
     // Auto-queue SP generation on startup (one-shot)
     if (!spQueued_) {
@@ -618,6 +645,12 @@ void tcApp::update() {
 
     // Process embedding generation results
     provider_.processEmbeddingResults();
+    if (provider_.isEmbeddingRunning()) {
+        statusBar_->setTaskProgress("Embedding",
+            provider_.getEmbeddingCompletedCount(), provider_.getEmbeddingTotalCount());
+    } else {
+        statusBar_->clearTask("Embedding");
+    }
 
     // When embedder becomes ready, load cache and queue missing embeddings
     if (provider_.isEmbedderReady() && !embeddingsQueued_) {
@@ -639,6 +672,12 @@ void tcApp::update() {
 
     // Face detection pipeline: process results + auto re-queue
     provider_.processFaceDetectionResults();
+    if (provider_.isFaceDetectionRunning()) {
+        statusBar_->setTaskProgress("Faces",
+            provider_.getFaceDetectionCompletedCount(), provider_.getFaceDetectionTotalCount());
+    } else {
+        statusBar_->clearTask("Faces");
+    }
 
     if (provider_.isFaceModelsReady() && !provider_.isFaceDetectionRunning()) {
         int queued = provider_.queueAllMissingFaceDetections();
@@ -647,14 +686,22 @@ void tcApp::update() {
         }
     }
 
-    // Redraw during background tasks
+    // Redraw during background tasks + update FPS/RAM
     if (provider_.isEmbedderInitializing() || provider_.isSPGenerationRunning() ||
         provider_.isEmbeddingRunning() || provider_.isFaceDetectionRunning()) {
+        statusBar_->setFps(getFrameRate());
+        statusBar_->setRamGiB(StatusBar::measureRamGiB());
         redraw();
     }
 
     // Process consolidation results
     provider_.processConsolidateResults();
+    if (provider_.isConsolidateRunning()) {
+        statusBar_->setTaskProgress("Consolidate",
+            provider_.getConsolidateProgress(), provider_.getConsolidateTotal());
+    } else {
+        statusBar_->clearTask("Consolidate");
+    }
 
     // Process background RAW load / video update
     if (viewMode() == ViewMode::Single || viewMode() == ViewMode::Crop) {
@@ -672,6 +719,7 @@ void tcApp::update() {
             : SyncState::LocalOnly;
         provider_.setSyncState(uploadResult.photoId, newState);
     }
+    statusBar_->setUploadPending(uploadQueue_.getPendingCount());
 
     // Process geo search results (Nominatim)
     {
@@ -746,72 +794,9 @@ void tcApp::draw() {
         popStyle();
     }
 
-    // Status bar background
-    float barHeight = 24;
-    float barY = getWindowHeight() - barHeight;
-    setColor(0.1f, 0.1f, 0.12f);
-    fill();
-    drawRect(0, barY, getWindowWidth(), barHeight);
-
-    // Server status indicator
-    float textX = 10;
-    float textY = barY + barHeight / 2;
-    string serverLabel;
-
-    if (catalogSettings_.hasServer()) {
-        fill();
-        if (provider_.isServerConnected()) {
-            setColor(0.3f, 0.8f, 0.4f);
-            serverLabel = "Server";
-        } else {
-            setColor(0.6f, 0.35f, 0.35f);
-            serverLabel = "Offline";
-        }
-        drawCircle(textX + 4, textY, 4);
-        textX += 14;
-    } else {
-        serverLabel = "Local";
-    }
-
-    // Status text
-    setColor(0.55f, 0.55f, 0.6f);
-    size_t pending = uploadQueue_.getPendingCount();
-    string uploadStatus = pending > 0 ? format("  Upload: {}", pending) : "";
-    string consolidateStatus;
-    if (provider_.isConsolidateRunning()) {
-        consolidateStatus = format("  Consolidate: {}/{}",
-            provider_.getConsolidateProgress(), provider_.getConsolidateTotal());
-    }
-    string spStatus;
-    if (provider_.isSPGenerationRunning()) {
-        spStatus = format("  SP: {}/{}",
-            provider_.getSPCompletedCount(), provider_.getSPTotalCount());
-    }
-    string embeddingStatus;
-    if (provider_.isEmbeddingRunning()) {
-        embeddingStatus = format("  Embedding: {}/{}",
-            provider_.getEmbeddingCompletedCount(),
-            provider_.getEmbeddingTotalCount());
-    }
-    string faceStatus;
-    if (provider_.isFaceDetectionRunning()) {
-        faceStatus = format("  Faces: {}/{}",
-            provider_.getFaceDetectionCompletedCount(),
-            provider_.getFaceDetectionTotalCount());
-    }
-    // Get process resident memory (macOS)
-    double ramGiB = 0;
-    mach_task_basic_info_data_t taskInfo;
-    mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-            (task_info_t)&taskInfo, &infoCount) == KERN_SUCCESS) {
-        ramGiB = taskInfo.resident_size / (1024.0 * 1024.0 * 1024.0);
-    }
-
-    fontSmall_.drawString(format("{}  Photos: {}{}{}{}{}{}  FPS: {:.0f}  RAM: {:.1f}GiB",
-        serverLabel, provider_.getCount(), uploadStatus, consolidateStatus,
-        spStatus, embeddingStatus, faceStatus, getFrameRate(), ramGiB),
-        textX, textY, Direction::Left, Direction::Center);
+    // Status bar draws itself via Node tree (addChild in setup)
+    statusBar_->setFps(getFrameRate());
+    statusBar_->setRamGiB(StatusBar::measureRamGiB());
 }
 
 void tcApp::keyPressed(int key) {
@@ -1529,6 +1514,11 @@ void tcApp::deleteSelectedPhotos() {
 void tcApp::updateLayout() {
     float w = getWindowWidth();
     float h = getWindowHeight() - statusBarHeight_;
+
+    // Status bar at bottom
+    if (statusBar_) {
+        statusBar_->setRect(0, h, w, statusBarHeight_);
+    }
 
     // SearchBar — only in grid mode
     bool inGrid = viewMode() == ViewMode::Grid;
