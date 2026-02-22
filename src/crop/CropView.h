@@ -36,6 +36,7 @@ public:
         float x, y, w, h;
         float angle;
         int rot90;
+        float perspV, perspH, shear;
     };
 
     void beginView(ViewContext& ctx) override {
@@ -70,14 +71,27 @@ public:
         rotate90Listener_ = panel_->rotate90Event.listen([this](int& dir) {
             rotate90(dir);
         });
+        perspVListener_ = panel_->perspVChanged.listen([this](float& v) {
+            setPerspV(v);
+        });
+        perspHListener_ = panel_->perspHChanged.listen([this](float& v) {
+            setPerspH(v);
+        });
+        shearListener_ = panel_->shearChanged.listen([this](float& v) {
+            setShear(v);
+        });
         resetListener_ = panel_->resetEvent.listen([this]() {
             pushUndo();
             cropX_ = 0; cropY_ = 0; cropW_ = 1; cropH_ = 1;
             angle_ = 0; rotation90_ = 0;
+            perspV_ = 0; perspH_ = 0; shear_ = 0;
             updateBoundingBox();
             isLandscape_ = (originalAspect_ >= 1.0f);
             panel_->setOrientation(isLandscape_);
             panel_->setAngle(0);
+            panel_->setPerspV(0);
+            panel_->setPerspH(0);
+            panel_->setShear(0);
             if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         });
         panelDoneListener_ = panel_->doneEvent.listen([this]() {
@@ -116,7 +130,7 @@ public:
         }
         originalAspect_ = (float)fboW_ / max(1, fboH_);
 
-        // Load current crop + rotation from entry
+        // Load current crop + rotation + perspective from entry
         string pid = singleView_->currentPhotoId();
         auto* entry = ctx_->provider->getPhoto(pid);
         if (entry) {
@@ -126,9 +140,13 @@ public:
             cropH_ = entry->userCropH;
             angle_ = entry->userAngle;
             rotation90_ = entry->userRotation90;
+            perspV_ = entry->userPerspV;
+            perspH_ = entry->userPerspH;
+            shear_ = entry->userShear;
         } else {
             cropX_ = 0; cropY_ = 0; cropW_ = 1; cropH_ = 1;
             angle_ = 0; rotation90_ = 0;
+            perspV_ = 0; perspH_ = 0; shear_ = 0;
         }
 
         updateBoundingBox();
@@ -140,19 +158,24 @@ public:
         isLandscape_ = (pixelCropW >= pixelCropH);
         panel_->setOrientation(isLandscape_);
         panel_->setAngle(angle_);
+        panel_->setPerspV(perspV_);
+        panel_->setPerspH(perspH_);
+        panel_->setShear(shear_);
 
         // Save initial state for cancel (after constraint)
-        initialCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_ };
+        initialCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_,
+                         perspV_, perspH_, shear_ };
         undoStack_.clear();
     }
 
-    // Save crop + rotation to DB (Done / Enter)
+    // Save crop + rotation + perspective to DB (Done / Enter)
     void commitCrop() {
         if (!ctx_ || !singleView_) return;
         string pid = singleView_->currentPhotoId();
         if (!pid.empty()) {
             ctx_->provider->setUserCrop(pid, cropX_, cropY_, cropW_, cropH_);
             ctx_->provider->setUserRotation(pid, angle_, rotation90_);
+            ctx_->provider->setUserPerspective(pid, perspV_, perspH_, shear_);
         }
     }
 
@@ -164,6 +187,9 @@ public:
         cropH_ = initialCrop_.h;
         angle_ = initialCrop_.angle;
         rotation90_ = initialCrop_.rot90;
+        perspV_ = initialCrop_.perspV;
+        perspH_ = initialCrop_.perspH;
+        shear_ = initialCrop_.shear;
         updateBoundingBox();
         // Also save reverted state to DB
         commitCrop();
@@ -173,7 +199,9 @@ public:
     bool hasChanges() const {
         return cropX_ != initialCrop_.x || cropY_ != initialCrop_.y ||
                cropW_ != initialCrop_.w || cropH_ != initialCrop_.h ||
-               angle_ != initialCrop_.angle || rotation90_ != initialCrop_.rot90;
+               angle_ != initialCrop_.angle || rotation90_ != initialCrop_.rot90 ||
+               perspV_ != initialCrop_.perspV || perspH_ != initialCrop_.perspH ||
+               shear_ != initialCrop_.shear;
     }
 
     // Undo last drag operation (Cmd+Z)
@@ -184,8 +212,12 @@ public:
         cropX_ = s.x; cropY_ = s.y;
         cropW_ = s.w; cropH_ = s.h;
         angle_ = s.angle; rotation90_ = s.rot90;
+        perspV_ = s.perspV; perspH_ = s.perspH; shear_ = s.shear;
         updateBoundingBox();
         panel_->setAngle(angle_);
+        panel_->setPerspV(perspV_);
+        panel_->setPerspH(perspH_);
+        panel_->setShear(shear_);
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
@@ -221,6 +253,7 @@ public:
 
         float totalRot = rotation90_ * TAU / 4 + angle_;
         updateBoundingBox();
+        bool hasPersp = (perspV_ != 0 || perspH_ != 0 || shear_ != 0);
 
         // Fit bounding box to available area
         float fitScale = min(availW / bbW_, availH / bbH_);
@@ -240,28 +273,79 @@ public:
         bbRect_ = { bbDrawX, bbDrawY, bbDrawW, bbDrawH };
 
         // --- Step 1: Draw rotated image (dimmed) ---
-        pushMatrix();
-        translate(centerX, centerY);
-        rotate(totalRot);
-        translate(-centerX, -centerY);
+        // Build a temporary PhotoEntry to reuse forwardWarp/inverseWarp
+        PhotoEntry tmpEntry;
+        tmpEntry.userPerspV = perspV_;
+        tmpEntry.userPerspH = perspH_;
+        tmpEntry.userShear = shear_;
 
-        float imgX = centerX - imgDrawW / 2;
-        float imgY = centerY - imgDrawH / 2;
+        if (!hasPersp) {
+            // Simple rotation: draw as rotated quad
+            pushMatrix();
+            translate(centerX, centerY);
+            rotate(totalRot);
+            translate(-centerX, -centerY);
 
-        setColor(0.3f, 0.3f, 0.3f);
-        sgl_enable_texture();
-        sgl_texture(fboView_, fboSampler_);
-        Color col = getDefaultContext().getColor();
-        sgl_begin_quads();
-        sgl_c4f(col.r, col.g, col.b, col.a);
-        sgl_v2f_t2f(imgX, imgY, 0, 0);
-        sgl_v2f_t2f(imgX + imgDrawW, imgY, 1, 0);
-        sgl_v2f_t2f(imgX + imgDrawW, imgY + imgDrawH, 1, 1);
-        sgl_v2f_t2f(imgX, imgY + imgDrawH, 0, 1);
-        sgl_end();
-        sgl_disable_texture();
+            float imgX = centerX - imgDrawW / 2;
+            float imgY = centerY - imgDrawH / 2;
 
-        popMatrix();
+            setColor(0.3f, 0.3f, 0.3f);
+            sgl_enable_texture();
+            sgl_texture(fboView_, fboSampler_);
+            Color col = getDefaultContext().getColor();
+            sgl_begin_quads();
+            sgl_c4f(col.r, col.g, col.b, col.a);
+            sgl_v2f_t2f(imgX, imgY, 0, 0);
+            sgl_v2f_t2f(imgX + imgDrawW, imgY, 1, 0);
+            sgl_v2f_t2f(imgX + imgDrawW, imgY + imgDrawH, 1, 1);
+            sgl_v2f_t2f(imgX, imgY + imgDrawH, 0, 1);
+            sgl_end();
+            sgl_disable_texture();
+
+            popMatrix();
+        } else {
+            // Perspective: tessellated grid for dimmed background
+            int gridN = 16;
+            float cosR = cos(totalRot), sinR = sin(totalRot);
+            setColor(0.3f, 0.3f, 0.3f);
+            sgl_enable_texture();
+            sgl_texture(fboView_, fboSampler_);
+            Color col = getDefaultContext().getColor();
+
+            auto srcToScreen = [&](float u, float v) -> pair<float,float> {
+                auto [wu, wv] = tmpEntry.forwardWarp(u, v);
+                float px = (wu - 0.5f) * fboW_;
+                float py = (wv - 0.5f) * fboH_;
+                float rx = px * cosR - py * sinR;
+                float ry = px * sinR + py * cosR;
+                return {centerX + rx * fitScale, centerY + ry * fitScale};
+            };
+
+            sgl_begin_triangles();
+            sgl_c4f(col.r, col.g, col.b, col.a);
+            for (int j = 0; j < gridN; j++) {
+                for (int i = 0; i < gridN; i++) {
+                    float u0 = (float)i / gridN, u1 = (float)(i+1) / gridN;
+                    float v0 = (float)j / gridN, v1 = (float)(j+1) / gridN;
+
+                    auto [sx00, sy00] = srcToScreen(u0, v0);
+                    auto [sx10, sy10] = srcToScreen(u1, v0);
+                    auto [sx11, sy11] = srcToScreen(u1, v1);
+                    auto [sx01, sy01] = srcToScreen(u0, v1);
+
+                    // Triangle 1: TL, TR, BR
+                    sgl_v2f_t2f(sx00, sy00, u0, v0);
+                    sgl_v2f_t2f(sx10, sy10, u1, v0);
+                    sgl_v2f_t2f(sx11, sy11, u1, v1);
+                    // Triangle 2: TL, BR, BL
+                    sgl_v2f_t2f(sx00, sy00, u0, v0);
+                    sgl_v2f_t2f(sx11, sy11, u1, v1);
+                    sgl_v2f_t2f(sx01, sy01, u0, v1);
+                }
+            }
+            sgl_end();
+            sgl_disable_texture();
+        }
 
         // --- Step 2: Crop rect in screen coords (relative to BB) ---
         float cx = bbDrawX + cropX_ * bbDrawW;
@@ -269,36 +353,80 @@ public:
         float cw = cropW_ * bbDrawW;
         float ch = cropH_ * bbDrawH;
 
-        // UV mapping: screen point -> texture UV via inverse rotation
+        // UV mapping: screen point -> texture UV via inverse rotation + inverse perspective
         auto screenToUV = [&](float sx, float sy) -> pair<float,float> {
             float dx = sx - centerX;
             float dy = sy - centerY;
             float cosR = cos(-totalRot), sinR = sin(-totalRot);
-            float rx = dx * cosR - dy * sinR;
-            float ry = dx * sinR + dy * cosR;
-            float u = rx / imgDrawW + 0.5f;
-            float v = ry / imgDrawH + 0.5f;
-            return {u, v};
+            float rx = dx / fitScale;
+            float ry = dy / fitScale;
+            float ix = rx * cosR - ry * sinR;
+            float iy = rx * sinR + ry * cosR;
+            float wu = ix / fboW_ + 0.5f;
+            float wv = iy / fboH_ + 0.5f;
+            if (hasPersp) {
+                return tmpEntry.inverseWarp(wu, wv);
+            }
+            return {wu, wv};
         };
 
-        // --- Step 3: Draw bright crop area with rotated UV ---
-        auto [u_tl_x, u_tl_y] = screenToUV(cx, cy);
-        auto [u_tr_x, u_tr_y] = screenToUV(cx + cw, cy);
-        auto [u_br_x, u_br_y] = screenToUV(cx + cw, cy + ch);
-        auto [u_bl_x, u_bl_y] = screenToUV(cx, cy + ch);
+        // --- Step 3: Draw bright crop area ---
+        if (!hasPersp) {
+            // Simple rotation: 4-corner quad
+            auto [u_tl_x, u_tl_y] = screenToUV(cx, cy);
+            auto [u_tr_x, u_tr_y] = screenToUV(cx + cw, cy);
+            auto [u_br_x, u_br_y] = screenToUV(cx + cw, cy + ch);
+            auto [u_bl_x, u_bl_y] = screenToUV(cx, cy + ch);
 
-        setColor(1, 1, 1);
-        sgl_enable_texture();
-        sgl_texture(fboView_, fboSampler_);
-        col = getDefaultContext().getColor();
-        sgl_begin_quads();
-        sgl_c4f(col.r, col.g, col.b, col.a);
-        sgl_v2f_t2f(cx, cy, u_tl_x, u_tl_y);
-        sgl_v2f_t2f(cx + cw, cy, u_tr_x, u_tr_y);
-        sgl_v2f_t2f(cx + cw, cy + ch, u_br_x, u_br_y);
-        sgl_v2f_t2f(cx, cy + ch, u_bl_x, u_bl_y);
-        sgl_end();
-        sgl_disable_texture();
+            setColor(1, 1, 1);
+            sgl_enable_texture();
+            sgl_texture(fboView_, fboSampler_);
+            Color col = getDefaultContext().getColor();
+            sgl_begin_quads();
+            sgl_c4f(col.r, col.g, col.b, col.a);
+            sgl_v2f_t2f(cx, cy, u_tl_x, u_tl_y);
+            sgl_v2f_t2f(cx + cw, cy, u_tr_x, u_tr_y);
+            sgl_v2f_t2f(cx + cw, cy + ch, u_br_x, u_br_y);
+            sgl_v2f_t2f(cx, cy + ch, u_bl_x, u_bl_y);
+            sgl_end();
+            sgl_disable_texture();
+        } else {
+            // Perspective: tessellated crop area for correct UV mapping
+            int tessN = 16;
+            setColor(1, 1, 1);
+            sgl_enable_texture();
+            sgl_texture(fboView_, fboSampler_);
+            Color col = getDefaultContext().getColor();
+
+            sgl_begin_triangles();
+            sgl_c4f(col.r, col.g, col.b, col.a);
+            for (int j = 0; j < tessN; j++) {
+                for (int i = 0; i < tessN; i++) {
+                    float tx0 = (float)i / tessN, tx1 = (float)(i+1) / tessN;
+                    float ty0 = (float)j / tessN, ty1 = (float)(j+1) / tessN;
+
+                    float sx00 = cx + tx0 * cw, sy00 = cy + ty0 * ch;
+                    float sx10 = cx + tx1 * cw, sy10 = cy + ty0 * ch;
+                    float sx11 = cx + tx1 * cw, sy11 = cy + ty1 * ch;
+                    float sx01 = cx + tx0 * cw, sy01 = cy + ty1 * ch;
+
+                    auto [u00, v00] = screenToUV(sx00, sy00);
+                    auto [u10, v10] = screenToUV(sx10, sy10);
+                    auto [u11, v11] = screenToUV(sx11, sy11);
+                    auto [u01, v01] = screenToUV(sx01, sy01);
+
+                    sgl_v2f_t2f(sx00, sy00, u00, v00);
+                    sgl_v2f_t2f(sx10, sy10, u10, v10);
+                    sgl_v2f_t2f(sx11, sy11, u11, v11);
+
+                    sgl_v2f_t2f(sx00, sy00, u00, v00);
+                    sgl_v2f_t2f(sx11, sy11, u11, v11);
+                    sgl_v2f_t2f(sx01, sy01, u01, v01);
+                }
+            }
+            sgl_end();
+            sgl_disable_texture();
+        }
 
         // --- Step 4: Rule of thirds grid ---
         setColor(1, 1, 1, 0.25f);
@@ -330,7 +458,11 @@ public:
         drawRect(cx - hs, cy + ch / 2 - hs, hs * 2, hs * 2);
         drawRect(cx + cw - hs, cy + ch / 2 - hs, hs * 2, hs * 2);
 
-        // Update panel preview (pass per-vertex UVs)
+        // Update panel preview (pass per-vertex UVs for rotation-only preview)
+        auto [u_tl_x, u_tl_y] = screenToUV(cx, cy);
+        auto [u_tr_x, u_tr_y] = screenToUV(cx + cw, cy);
+        auto [u_br_x, u_br_y] = screenToUV(cx + cw, cy + ch);
+        auto [u_bl_x, u_bl_y] = screenToUV(cx, cy + ch);
         int outputW = (int)round(bbW_ * cropW_);
         int outputH = (int)round(bbH_ * cropH_);
         panel_->setPreviewInfo(fboView_, fboSampler_,
@@ -379,7 +511,8 @@ protected:
         if (dragMode_ != DragMode::None) {
             pushUndo();
             dragStart_ = pos;
-            dragStartCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_ };
+            dragStartCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_,
+                               perspV_, perspH_, shear_ };
 
             if (dragMode_ == DragMode::Rotate) {
                 float imgCenterX = bbRect_.x + bbRect_.w / 2;
@@ -469,59 +602,96 @@ protected:
                 cropW_ = nw; cropH_ = nh;
             } else {
                 // Corner drag
-                float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
+                bool shiftHeld = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
 
-                bool moveLeft = (dragMode_ == DragMode::TL || dragMode_ == DragMode::BL);
-                bool moveRight = (dragMode_ == DragMode::TR || dragMode_ == DragMode::BR);
-                bool moveTop = (dragMode_ == DragMode::TL || dragMode_ == DragMode::TR);
-                bool moveBottom = (dragMode_ == DragMode::BL || dragMode_ == DragMode::BR);
+                if (shiftHeld) {
+                    // Shift+corner: uniform scale from center
+                    float centerNX = s.x + s.w / 2;
+                    float centerNY = s.y + s.h / 2;
+                    float centerSX = bbRect_.x + centerNX * bbRect_.w;
+                    float centerSY = bbRect_.y + centerNY * bbRect_.h;
 
-                if (moveLeft)   { nx = s.x + dx; nw = s.w - dx; }
-                if (moveRight)  { nw = s.w + dx; }
-                if (moveTop)    { ny = s.y + dy; nh = s.h - dy; }
-                if (moveBottom) { nh = s.h + dy; }
+                    // Scale by max mouse distance from center vs original half-size
+                    float distX = abs(pos.x - centerSX) / max(bbRect_.w, 1.0f);
+                    float distY = abs(pos.y - centerSY) / max(bbRect_.h, 1.0f);
+                    float origHW = s.w / 2, origHH = s.h / 2;
+                    float scaleX = distX / max(origHW, 0.001f);
+                    float scaleY = distY / max(origHH, 0.001f);
+                    float scale = max(scaleX, scaleY);
+                    scale = max(scale, minSize / max(s.w, s.h));
 
-                if (nw < minSize) { if (moveLeft) nx = s.x + s.w - minSize; nw = minSize; }
-                if (nh < minSize) { if (moveTop) ny = s.y + s.h - minSize; nh = minSize; }
+                    float nw = s.w * scale;
+                    float nh = s.h * scale;
 
-                // Auto-flip orientation during corner drag
-                if (locked && panel_->aspect() != CropAspect::A1_1) {
-                    float anchorNX = moveLeft ? (s.x + s.w) : s.x;
-                    float anchorNY = moveTop  ? (s.y + s.h) : s.y;
-                    float anchorSX = bbRect_.x + anchorNX * bbRect_.w;
-                    float anchorSY = bbRect_.y + anchorNY * bbRect_.h;
-
-                    float adx = abs(pos.x - anchorSX) / bbRect_.w;
-                    float ady = abs(pos.y - anchorSY) / bbRect_.h;
-                    float a = isLandscape_ ? atan2(ady, adx) : atan2(adx, ady);
-                    bool shouldFlip = (a > TAU / 8 * kFlipThreshold);
-
-                    if (shouldFlip) {
-                        isLandscape_ = !isLandscape_;
-                        panel_->setOrientation(isLandscape_);
-                    }
-                }
-
-                if (locked) {
-                    float targetAR = getTargetAspectNorm();
-                    if (targetAR > 0) {
-                        if (nw / nh > targetAR) {
-                            nw = nh * targetAR;
-                        } else {
-                            nh = nw / targetAR;
+                    if (locked) {
+                        float targetAR = getTargetAspectNorm();
+                        if (targetAR > 0) {
+                            if (nw / nh > targetAR) nw = nh * targetAR;
+                            else nh = nw / targetAR;
                         }
-                        if (moveTop && !moveBottom) ny = s.y + s.h - nh;
-                        if (moveLeft && !moveRight) nx = s.x + s.w - nw;
                     }
+
+                    nw = max(nw, minSize);
+                    nh = max(nh, minSize);
+                    cropW_ = nw; cropH_ = nh;
+                    cropX_ = centerNX - nw / 2;
+                    cropY_ = centerNY - nh / 2;
+                } else {
+                    // Normal corner drag (one corner moves, opposite stays)
+                    float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
+
+                    bool moveLeft = (dragMode_ == DragMode::TL || dragMode_ == DragMode::BL);
+                    bool moveRight = (dragMode_ == DragMode::TR || dragMode_ == DragMode::BR);
+                    bool moveTop = (dragMode_ == DragMode::TL || dragMode_ == DragMode::TR);
+                    bool moveBottom = (dragMode_ == DragMode::BL || dragMode_ == DragMode::BR);
+
+                    if (moveLeft)   { nx = s.x + dx; nw = s.w - dx; }
+                    if (moveRight)  { nw = s.w + dx; }
+                    if (moveTop)    { ny = s.y + dy; nh = s.h - dy; }
+                    if (moveBottom) { nh = s.h + dy; }
+
+                    if (nw < minSize) { if (moveLeft) nx = s.x + s.w - minSize; nw = minSize; }
+                    if (nh < minSize) { if (moveTop) ny = s.y + s.h - minSize; nh = minSize; }
+
+                    // Auto-flip orientation during corner drag
+                    if (locked && panel_->aspect() != CropAspect::A1_1) {
+                        float anchorNX = moveLeft ? (s.x + s.w) : s.x;
+                        float anchorNY = moveTop  ? (s.y + s.h) : s.y;
+                        float anchorSX = bbRect_.x + anchorNX * bbRect_.w;
+                        float anchorSY = bbRect_.y + anchorNY * bbRect_.h;
+
+                        float adx = abs(pos.x - anchorSX) / bbRect_.w;
+                        float ady = abs(pos.y - anchorSY) / bbRect_.h;
+                        float a = isLandscape_ ? atan2(ady, adx) : atan2(adx, ady);
+                        bool shouldFlip = (a > TAU / 8 * kFlipThreshold);
+
+                        if (shouldFlip) {
+                            isLandscape_ = !isLandscape_;
+                            panel_->setOrientation(isLandscape_);
+                        }
+                    }
+
+                    if (locked) {
+                        float targetAR = getTargetAspectNorm();
+                        if (targetAR > 0) {
+                            if (nw / nh > targetAR) {
+                                nw = nh * targetAR;
+                            } else {
+                                nh = nw / targetAR;
+                            }
+                            if (moveTop && !moveBottom) ny = s.y + s.h - nh;
+                            if (moveLeft && !moveRight) nx = s.x + s.w - nw;
+                        }
+                    }
+
+                    nx = clamp(nx, 0.0f, 1.0f - minSize);
+                    ny = clamp(ny, 0.0f, 1.0f - minSize);
+                    nw = clamp(nw, minSize, 1.0f - nx);
+                    nh = clamp(nh, minSize, 1.0f - ny);
+
+                    cropX_ = nx; cropY_ = ny;
+                    cropW_ = nw; cropH_ = nh;
                 }
-
-                nx = clamp(nx, 0.0f, 1.0f - minSize);
-                ny = clamp(ny, 0.0f, 1.0f - minSize);
-                nw = clamp(nw, minSize, 1.0f - nx);
-                nh = clamp(nh, minSize, 1.0f - ny);
-
-                cropX_ = nx; cropY_ = ny;
-                cropW_ = nw; cropH_ = nh;
             }
         }
 
@@ -558,11 +728,17 @@ protected:
 
         float centerX = cropX_ + cropW_ / 2;
         float centerY = cropY_ + cropH_ / 2;
+
+        // Max half-size that keeps center fixed within [0,1]
+        float maxHW = min(centerX, 1.0f - centerX);
+        float maxHH = min(centerY, 1.0f - centerY);
+
         float nw = cropW_ * factor;
         float nh = cropH_ * factor;
 
-        nw = clamp(nw, minSize, 1.0f);
-        nh = clamp(nh, minSize, 1.0f);
+        // Clamp to fit within center-preserving budget
+        nw = clamp(nw, minSize, maxHW * 2);
+        nh = clamp(nh, minSize, maxHH * 2);
 
         if (locked) {
             float targetAR = getTargetAspectNorm();
@@ -572,19 +748,16 @@ protected:
                 } else {
                     nh = nw / targetAR;
                 }
+                // Re-check budget after AR constraint
+                if (nw > maxHW * 2) { nw = maxHW * 2; nh = nw / targetAR; }
+                if (nh > maxHH * 2) { nh = maxHH * 2; nw = nh * targetAR; }
             }
         }
 
-        float nx = centerX - nw / 2;
-        float ny = centerY - nh / 2;
-
-        nx = clamp(nx, 0.0f, 1.0f - nw);
-        ny = clamp(ny, 0.0f, 1.0f - nh);
-        nw = min(nw, 1.0f - nx);
-        nh = min(nh, 1.0f - ny);
-
-        cropX_ = nx; cropY_ = ny;
-        cropW_ = nw; cropH_ = nh;
+        cropX_ = centerX - nw / 2;
+        cropY_ = centerY - nh / 2;
+        cropW_ = nw;
+        cropH_ = nh;
 
         constrainCropToBounds();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
@@ -599,6 +772,7 @@ private:
     // Panel event listeners
     EventListener aspectListener_, orientListener_, resetListener_;
     EventListener angleListener_, rotate90Listener_;
+    EventListener perspVListener_, perspHListener_, shearListener_;
     EventListener panelDoneListener_, panelCancelListener_;
 
     // Borrowed FBO handles
@@ -621,8 +795,13 @@ private:
     float angle_ = 0;       // fine rotation (radians, +/-TAU/8)
     int rotation90_ = 0;    // 90 degree steps (0-3)
 
+    // Perspective / shear state
+    float perspV_ = 0;
+    float perspH_ = 0;
+    float shear_ = 0;
+
     // Initial state for cancel
-    CropState initialCrop_ = {0, 0, 1, 1, 0, 0};
+    CropState initialCrop_ = {0, 0, 1, 1, 0, 0, 0, 0, 0};
 
     // Undo stack
     vector<CropState> undoStack_;
@@ -630,7 +809,7 @@ private:
     // Drag state
     DragMode dragMode_ = DragMode::None;
     Vec2 dragStart_;
-    CropState dragStartCrop_ = {0, 0, 1, 1, 0, 0};
+    CropState dragStartCrop_ = {0, 0, 1, 1, 0, 0, 0, 0, 0};
     float dragStartMouseAngle_ = 0;
 
     // Cached BB draw rect (screen coords)
@@ -642,11 +821,16 @@ private:
     // --- Bounding box computation ---
 
     void updateBoundingBox() {
-        float totalRot = rotation90_ * TAU / 4 + angle_;
-        float cosA = abs(cos(totalRot));
-        float sinA = abs(sin(totalRot));
-        bbW_ = (float)fboW_ * cosA + (float)fboH_ * sinA;
-        bbH_ = (float)fboW_ * sinA + (float)fboH_ * cosA;
+        // Use PhotoEntry::computeBB for perspective-aware BB
+        PhotoEntry tmpEntry;
+        tmpEntry.userAngle = angle_;
+        tmpEntry.userRotation90 = rotation90_;
+        tmpEntry.userPerspV = perspV_;
+        tmpEntry.userPerspH = perspH_;
+        tmpEntry.userShear = shear_;
+        auto [w, h] = tmpEntry.computeBB(fboW_, fboH_);
+        bbW_ = w;
+        bbH_ = h;
         bbAspect_ = bbW_ / max(1.0f, bbH_);
     }
 
@@ -679,6 +863,41 @@ private:
         rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
 
         panel_->setAngle(angle_);
+        constrainCropToBounds();
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+    }
+
+    // --- Perspective/shear helpers ---
+
+    void setPerspV(float v) {
+        pushUndo();
+        float oldBBW = bbW_, oldBBH = bbH_;
+        perspV_ = clamp(v, -1.0f, 1.0f);
+        updateBoundingBox();
+        rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
+        panel_->setPerspV(perspV_);
+        constrainCropToBounds();
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+    }
+
+    void setPerspH(float v) {
+        pushUndo();
+        float oldBBW = bbW_, oldBBH = bbH_;
+        perspH_ = clamp(v, -1.0f, 1.0f);
+        updateBoundingBox();
+        rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
+        panel_->setPerspH(perspH_);
+        constrainCropToBounds();
+        if (ctx_ && ctx_->redraw) ctx_->redraw(1);
+    }
+
+    void setShear(float v) {
+        pushUndo();
+        float oldBBW = bbW_, oldBBH = bbH_;
+        shear_ = clamp(v, -1.0f, 1.0f);
+        updateBoundingBox();
+        rescaleCropForBBChange(oldBBW, oldBBH, bbW_, bbH_);
+        panel_->setShear(shear_);
         constrainCropToBounds();
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
@@ -733,20 +952,88 @@ private:
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
     }
 
-    // Constrain crop so all 4 corners stay inside the rotated image.
-    // When fine rotation is 0 (pure 0/90/180/270), BB = image, simple clamp.
-    // Otherwise, compute inscribed rect budget analytically.
+    // Constrain crop so all 4 corners stay inside the source image.
+    // For rotation-only: analytic inscribed rect budget.
+    // For perspective: check inverse-warped corners are in [0,1]² and shrink if needed.
     void constrainCropToBounds() {
         cropW_ = clamp(cropW_, 0.02f, 1.0f);
         cropH_ = clamp(cropH_, 0.02f, 1.0f);
 
-        // No fine tilt → BB matches image exactly, simple clamp
-        if (abs(angle_) < 0.0001f) {
+        bool hasPersp = (perspV_ != 0 || perspH_ != 0 || shear_ != 0);
+
+        // No fine tilt and no perspective → BB matches image exactly, simple clamp
+        if (abs(angle_) < 0.0001f && !hasPersp) {
             cropX_ = clamp(cropX_, 0.0f, 1.0f - cropW_);
             cropY_ = clamp(cropY_, 0.0f, 1.0f - cropH_);
             return;
         }
 
+        if (hasPersp) {
+            // Perspective mode: check crop corners via inverse warp
+            // If any corner maps outside [0,1]², shrink crop uniformly around center
+            PhotoEntry tmpEntry;
+            tmpEntry.userAngle = angle_;
+            tmpEntry.userRotation90 = rotation90_;
+            tmpEntry.userPerspV = perspV_;
+            tmpEntry.userPerspH = perspH_;
+            tmpEntry.userShear = shear_;
+
+            auto checkCorners = [&]() -> float {
+                // Returns max overshoot (>0 means out of bounds)
+                float maxOver = 0;
+                float corners[4][2] = {
+                    {cropX_, cropY_},
+                    {cropX_ + cropW_, cropY_},
+                    {cropX_ + cropW_, cropY_ + cropH_},
+                    {cropX_, cropY_ + cropH_}
+                };
+                for (auto& c : corners) {
+                    auto [u, v] = tmpEntry.getCropUV(
+                        (c[0] - cropX_) / cropW_,
+                        (c[1] - cropY_) / cropH_,
+                        fboW_, fboH_);
+                    maxOver = max(maxOver, -u);
+                    maxOver = max(maxOver, u - 1.0f);
+                    maxOver = max(maxOver, -v);
+                    maxOver = max(maxOver, v - 1.0f);
+                }
+                return maxOver;
+            };
+
+            float over = checkCorners();
+            if (over > 0) {
+                // Binary search for maximum crop scale that fits
+                float lo = 0.02f, hi = 1.0f;
+                float cx = cropX_ + cropW_ / 2;
+                float cy = cropY_ + cropH_ / 2;
+                float origW = cropW_, origH = cropH_;
+
+                for (int iter = 0; iter < 16; iter++) {
+                    float mid = (lo + hi) / 2;
+                    cropW_ = origW * mid;
+                    cropH_ = origH * mid;
+                    cropX_ = cx - cropW_ / 2;
+                    cropY_ = cy - cropH_ / 2;
+                    cropX_ = clamp(cropX_, 0.0f, 1.0f - cropW_);
+                    cropY_ = clamp(cropY_, 0.0f, 1.0f - cropH_);
+                    if (checkCorners() > 0.001f) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                cropW_ = origW * lo;
+                cropH_ = origH * lo;
+                cropX_ = cx - cropW_ / 2;
+                cropY_ = cy - cropH_ / 2;
+            }
+
+            cropX_ = clamp(cropX_, 0.0f, 1.0f - cropW_);
+            cropY_ = clamp(cropY_, 0.0f, 1.0f - cropH_);
+            return;
+        }
+
+        // Rotation-only: analytic inscribed rect budget
         float totalRot = rotation90_ * TAU / 4 + angle_;
         float cosR = cos(totalRot), sinR = sin(totalRot);
         float absC = abs(cosR), absS = abs(sinR);
@@ -754,15 +1041,12 @@ private:
 
         float hw = cropW_ / 2, hh = cropH_ / 2;
 
-        // Max corner offset from crop center in image space
         float max_off_ix = hw * bbW_ * absC + hh * bbH_ * absS;
         float max_off_iy = hw * bbW_ * absS + hh * bbH_ * absC;
 
-        // Budget: how far the center can be from image center
         float budget_x = W2 - max_off_ix;
         float budget_y = H2 - max_off_iy;
 
-        // If budget negative, crop is too large → shrink to fit centered
         if (budget_x < 0 || budget_y < 0) {
             float sx = W2 / max(max_off_ix, 0.01f);
             float sy = H2 / max(max_off_iy, 0.01f);
@@ -783,7 +1067,6 @@ private:
         budget_x = max(budget_x, 0.0f);
         budget_y = max(budget_y, 0.0f);
 
-        // Crop center in image space (inverse rotation)
         float cx = cropX_ + cropW_ / 2;
         float cy = cropY_ + cropH_ / 2;
         float cx_px = (cx - 0.5f) * bbW_;
@@ -791,11 +1074,9 @@ private:
         float ci_x = cx_px * cosR + cy_px * sinR;
         float ci_y = -cx_px * sinR + cy_px * cosR;
 
-        // Clamp center to budget
         ci_x = clamp(ci_x, -budget_x, budget_x);
         ci_y = clamp(ci_y, -budget_y, budget_y);
 
-        // Reconstruct BB-norm position (forward rotation: image → BB)
         cx_px = ci_x * cosR - ci_y * sinR;
         cy_px = ci_x * sinR + ci_y * cosR;
         cx = cx_px / bbW_ + 0.5f;
@@ -804,13 +1085,13 @@ private:
         cropX_ = cx - cropW_ / 2;
         cropY_ = cy - cropH_ / 2;
 
-        // Final safety clamp
         cropX_ = clamp(cropX_, 0.0f, 1.0f - cropW_);
         cropY_ = clamp(cropY_, 0.0f, 1.0f - cropH_);
     }
 
     void pushUndo() {
-        undoStack_.push_back({cropX_, cropY_, cropW_, cropH_, angle_, rotation90_});
+        undoStack_.push_back({cropX_, cropY_, cropW_, cropH_, angle_, rotation90_,
+                              perspV_, perspH_, shear_});
         if (undoStack_.size() > 50) {
             undoStack_.erase(undoStack_.begin());
         }

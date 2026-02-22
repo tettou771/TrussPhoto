@@ -15,7 +15,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 14;
+    static constexpr int SCHEMA_VERSION = 15;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -95,7 +95,10 @@ public:
                 "  user_crop_w         REAL NOT NULL DEFAULT 1.0,"
                 "  user_crop_h         REAL NOT NULL DEFAULT 1.0,"
                 "  user_angle          REAL NOT NULL DEFAULT 0.0,"
-                "  user_rotation90     INTEGER NOT NULL DEFAULT 0"
+                "  user_rotation90     INTEGER NOT NULL DEFAULT 0,"
+                "  user_persp_v        REAL NOT NULL DEFAULT 0.0,"
+                "  user_persp_h        REAL NOT NULL DEFAULT 0.0,"
+                "  user_shear          REAL NOT NULL DEFAULT 0.0"
                 ")"
             );
             if (!ok) return false;
@@ -325,8 +328,26 @@ public:
                     return false;
                 }
             }
+            version = 14;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v13 -> v14";
+        }
+
+        // v14 -> v15: add perspective + shear columns
+        if (version == 14) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN user_persp_v REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN user_persp_h REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN user_shear REAL NOT NULL DEFAULT 0.0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v14->v15 failed: " << sql;
+                    return false;
+                }
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v13 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v14 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -494,6 +515,18 @@ public:
         return stmt.execute();
     }
 
+    bool updateUserPerspective(const string& id, float perspV, float perspH, float shear) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "UPDATE photos SET user_persp_v=?1, user_persp_h=?2, user_shear=?3 WHERE id=?4");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, (double)perspV);
+        stmt.bind(2, (double)perspH);
+        stmt.bind(3, (double)shear);
+        stmt.bind(4, id);
+        return stmt.execute();
+    }
+
     bool updateFaceScanned(const string& id, bool scanned) {
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare("UPDATE photos SET face_scanned=?1 WHERE id=?2");
@@ -629,7 +662,8 @@ public:
             "stack_id, stack_primary, "
             "dev_exposure, dev_wb_temp, dev_wb_tint, "
             "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
-            "user_angle, user_rotation90 "
+            "user_angle, user_rotation90, "
+            "user_persp_v, user_persp_h, user_shear "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -697,6 +731,9 @@ public:
             e.userCropH          = (float)stmt.getDouble(58);
             e.userAngle          = (float)stmt.getDouble(59);
             e.userRotation90     = stmt.getInt(60);
+            e.userPerspV         = (float)stmt.getDouble(61);
+            e.userPerspH         = (float)stmt.getDouble(62);
+            e.userShear          = (float)stmt.getDouble(63);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -1283,11 +1320,12 @@ private:
             "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
             "stack_id, stack_primary, dev_exposure, dev_wb_temp, dev_wb_tint, "
             "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
-            "user_angle, user_rotation90) "
+            "user_angle, user_rotation90, "
+            "user_persp_v, user_persp_h, user_shear) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
             "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,"
-            "?56,?57,?58,?59,?60,?61)";
+            "?56,?57,?58,?59,?60,?61,?62,?63,?64)";
     }
 
     static void bindEntry(Database::Statement& stmt, const PhotoEntry& e) {
@@ -1352,5 +1390,8 @@ private:
         stmt.bind(59, (double)e.userCropH);
         stmt.bind(60, (double)e.userAngle);
         stmt.bind(61, e.userRotation90);
+        stmt.bind(62, (double)e.userPerspV);
+        stmt.bind(63, (double)e.userPerspH);
+        stmt.bind(64, (double)e.userShear);
     }
 };

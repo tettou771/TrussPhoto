@@ -331,6 +331,119 @@ private:
 };
 
 // =============================================================================
+// PerspSlider - Center-zero slider for perspective/shear values (±1)
+// =============================================================================
+class PerspSlider : public RectNode {
+public:
+    using Ptr = shared_ptr<PerspSlider>;
+
+    Event<float> valueChanged;
+    float value = 0;         // -1 to +1
+    string label = "V";
+
+    PerspSlider(const string& lbl, Font* font) : label(lbl), font_(font) {
+        enableEvents();
+    }
+
+    void setValue(float v) { value = v; }
+
+    void draw() override {
+        float w = getWidth();
+        float h = getHeight();
+        float pad = 12.0f;
+        float trackY = 24.0f;
+        float trackH = 4.0f;
+        float knobR = 6.0f;
+
+        // Label + value
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%+.0f%%", value * 100.0f);
+        if (font_) {
+            setColor(0.45f, 0.45f, 0.5f);
+            font_->drawString(label, pad, 12, Left, Center);
+            setColor(0.65f, 0.65f, 0.7f);
+            font_->drawString(buf, w - pad, 12, Right, Center);
+        }
+
+        // Track background
+        float trackLeft = pad;
+        float trackRight = w - pad;
+        float trackW = trackRight - trackLeft;
+        float centerX = trackLeft + trackW / 2;
+
+        setColor(0.2f, 0.2f, 0.24f);
+        fill();
+        drawRect(trackLeft, trackY, trackW, trackH);
+
+        // Center mark
+        setColor(0.35f, 0.35f, 0.4f);
+        drawRect(centerX - 0.5f, trackY - 2, 1, trackH + 4);
+
+        // Fill from center
+        float t = clamp(value, -1.0f, 1.0f);
+        float fillStart = centerX;
+        float fillEnd = centerX + (trackW / 2) * t;
+        if (fillEnd < fillStart) swap(fillStart, fillEnd);
+        setColor(0.4f, 0.6f, 0.9f);
+        drawRect(fillStart, trackY, fillEnd - fillStart, trackH);
+
+        // Knob
+        float knobX = centerX + (trackW / 2) * t;
+        float knobY = trackY + trackH / 2;
+        setColor(0.8f, 0.85f, 0.9f);
+        drawCircle(knobX, knobY, knobR);
+    }
+
+protected:
+    bool onMousePress(Vec2 pos, int button) override {
+        if (button != 0) return false;
+        // Double-click: reset to 0
+        auto now = chrono::steady_clock::now();
+        auto elapsed = chrono::duration_cast<chrono::milliseconds>(now - lastClick_).count();
+        lastClick_ = now;
+        if (elapsed < 350) {
+            value = 0;
+            valueChanged.notify(value);
+            return true;
+        }
+        dragging_ = true;
+        updateFromMouse(pos.x);
+        return true;
+    }
+
+    bool onMouseDrag(Vec2 pos, int button) override {
+        if (!dragging_ || button != 0) return false;
+        updateFromMouse(pos.x);
+        return true;
+    }
+
+    bool onMouseRelease(Vec2 pos, int button) override {
+        (void)pos;
+        if (button == 0) dragging_ = false;
+        return true;
+    }
+
+private:
+    Font* font_;
+    bool dragging_ = false;
+    chrono::steady_clock::time_point lastClick_;
+
+    void updateFromMouse(float mx) {
+        float pad = 12.0f;
+        float trackLeft = pad;
+        float trackRight = getWidth() - pad;
+        float trackW = trackRight - trackLeft;
+        float centerX = trackLeft + trackW / 2;
+
+        float t = (mx - centerX) / (trackW / 2);
+        t = clamp(t, -1.0f, 1.0f);
+
+        value = t;
+        valueChanged.notify(value);
+    }
+};
+
+// =============================================================================
 // Rotate90Row - Two 90° rotation buttons side by side (↺ | ↻)
 // =============================================================================
 class Rotate90Row : public RectNode {

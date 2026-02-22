@@ -24,6 +24,9 @@ public:
     Event<bool> orientationChanged;
     Event<float> angleChanged;    // fine angle (radians)
     Event<int> rotate90Event;     // +1 or -1
+    Event<float> perspVChanged;
+    Event<float> perspHChanged;
+    Event<float> shearChanged;
     Event<void> resetEvent;
     Event<void> doneEvent;
     Event<void> cancelEvent;
@@ -94,6 +97,30 @@ public:
         separator3_ = make_shared<Separator>();
         separator3_->setSize(0, 12);
 
+        perspLabel_ = make_shared<TextLabel>("Perspective", &font_);
+        perspLabel_->setSize(0, 16);
+
+        perspVSlider_ = make_shared<PerspSlider>("V", &font_);
+        perspVSlider_->setSize(0, 38);
+        perspVListener_ = perspVSlider_->valueChanged.listen([this](float& v) {
+            perspVChanged.notify(v);
+        });
+
+        perspHSlider_ = make_shared<PerspSlider>("H", &font_);
+        perspHSlider_->setSize(0, 38);
+        perspHListener_ = perspHSlider_->valueChanged.listen([this](float& v) {
+            perspHChanged.notify(v);
+        });
+
+        shearSlider_ = make_shared<PerspSlider>("Shear", &font_);
+        shearSlider_->setSize(0, 38);
+        shearListener_ = shearSlider_->valueChanged.listen([this](float& v) {
+            shearChanged.notify(v);
+        });
+
+        separator4_ = make_shared<Separator>();
+        separator4_->setSize(0, 12);
+
         outputLabel_ = make_shared<TextLabel>("Output", &font_);
         outputLabel_->setSize(0, 16);
 
@@ -127,6 +154,11 @@ public:
         content_->addChild(rotate90Row_);
         content_->addChild(angleSlider_);
         content_->addChild(separator3_);
+        content_->addChild(perspLabel_);
+        content_->addChild(perspVSlider_);
+        content_->addChild(perspHSlider_);
+        content_->addChild(shearSlider_);
+        content_->addChild(separator4_);
         content_->addChild(outputLabel_);
         content_->addChild(outputSize_);
         content_->addChild(buttonRow_);
@@ -139,6 +171,10 @@ public:
     void setAngle(float radians) {
         angleSlider_->setAngle(radians);
     }
+
+    void setPerspV(float v) { perspVSlider_->setValue(v); }
+    void setPerspH(float v) { perspHSlider_->setValue(v); }
+    void setShear(float v) { shearSlider_->setValue(v); }
 
     // Per-vertex UV pairs: TL, TR, BR, BL (supports rotated crop)
     void setPreviewInfo(sg_view view, sg_sampler sampler,
@@ -207,6 +243,7 @@ private:
     EventListener orientListener_;
     EventListener aspectListeners_[kCropAspectCount];
     EventListener angleListener_, rotate90Listener_;
+    EventListener perspVListener_, perspHListener_, shearListener_;
     EventListener resetListener_, cancelListener_, doneListener_;
 
     PlainScrollContainer::Ptr scrollContainer_;
@@ -224,6 +261,11 @@ private:
     Rotate90Row::Ptr rotate90Row_;
     AngleSlider::Ptr angleSlider_;
     Separator::Ptr separator3_;
+    TextLabel::Ptr perspLabel_;
+    PerspSlider::Ptr perspVSlider_;
+    PerspSlider::Ptr perspHSlider_;
+    PerspSlider::Ptr shearSlider_;
+    Separator::Ptr separator4_;
     TextLabel::Ptr outputLabel_;
     TextLabel::Ptr outputSize_;
     ButtonRow::Ptr buttonRow_;

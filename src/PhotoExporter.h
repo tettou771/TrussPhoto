@@ -9,6 +9,7 @@
 
 #include <TrussC.h>
 #include "DevelopShader.h"
+#include "PhotoEntry.h"
 
 using namespace std;
 using namespace tc;
@@ -150,6 +151,58 @@ inline void transformU8(const Pixels& src, Pixels& dst,
     }
 }
 
+// Per-pixel UV transform for perspective export.
+// Uses PhotoEntry::getCropUV() for each output pixel with adaptive supersampling.
+inline void transformPerspU8(const Pixels& src, Pixels& dst,
+                              const PhotoEntry& entry, int outW, int outH) {
+    int srcW = src.getWidth(), srcH = src.getHeight();
+    int channels = src.getChannels();
+    dst.allocate(outW, outH, channels);
+    auto* srcData = src.getData();
+    auto* dstData = dst.getData();
+
+    // Estimate supersampling from perspective magnitude
+    float maxPersp = max({fabs(entry.userPerspV), fabs(entry.userPerspH), fabs(entry.userShear)});
+    int ss = clamp((int)ceil(2.0f + maxPersp * 4.0f), 2, 6);
+    float invSS2 = 1.0f / (ss * ss);
+
+    for (int y = 0; y < outH; y++) {
+        for (int x = 0; x < outW; x++) {
+            float sum[4] = {0, 0, 0, 0};
+
+            for (int sj = 0; sj < ss; sj++) {
+                for (int si = 0; si < ss; si++) {
+                    float tx = (x + (si + 0.5f) / ss) / outW;
+                    float ty = (y + (sj + 0.5f) / ss) / outH;
+                    auto [u, v] = entry.getCropUV(tx, ty, srcW, srcH);
+
+                    float sx = u * srcW - 0.5f;
+                    float sy = v * srcH - 0.5f;
+                    int ix = (int)floor(sx), iy = (int)floor(sy);
+                    float fx = sx - ix, fy = sy - iy;
+
+                    for (int c = 0; c < channels; c++) {
+                        auto sample = [&](int px, int py) -> float {
+                            px = clamp(px, 0, srcW - 1);
+                            py = clamp(py, 0, srcH - 1);
+                            return srcData[(py * srcW + px) * channels + c];
+                        };
+                        sum[c] += sample(ix,iy)*(1-fx)*(1-fy)
+                                + sample(ix+1,iy)*fx*(1-fy)
+                                + sample(ix,iy+1)*(1-fx)*fy
+                                + sample(ix+1,iy+1)*fx*fy;
+                    }
+                }
+            }
+
+            int outIdx = (y * outW + x) * channels;
+            for (int c = 0; c < channels; c++) {
+                dstData[outIdx + c] = (unsigned char)clamp(sum[c] * invSS2, 0.f, 255.f);
+            }
+        }
+    }
+}
+
 // Full export pipeline (4-corner UV quad for crop+rotation)
 inline bool exportJpeg(const DevelopShader& shader,
                        const string& outPath,
@@ -199,6 +252,81 @@ inline bool exportJpeg(const DevelopShader& shader,
     int ch = outPtr->getChannels();
     if (ch == 4) {
         // Strip alpha: RGBA -> RGB for JPEG
+        vector<unsigned char> rgb(w * h * 3);
+        auto* src = outPtr->getData();
+        for (int i = 0; i < w * h; i++) {
+            rgb[i*3+0] = src[i*4+0];
+            rgb[i*3+1] = src[i*4+1];
+            rgb[i*3+2] = src[i*4+2];
+        }
+        return stbi_write_jpg(outPath.c_str(), w, h, 3,
+                              rgb.data(), settings.quality) != 0;
+    }
+    return stbi_write_jpg(outPath.c_str(), w, h, ch,
+                          outPtr->getData(), settings.quality) != 0;
+}
+
+// Full export pipeline with perspective support via PhotoEntry
+inline bool exportJpeg(const DevelopShader& shader,
+                       const string& outPath,
+                       const ExportSettings& settings,
+                       const PhotoEntry& entry) {
+    if (!shader.isFboReady()) return false;
+
+    int srcW = shader.getFboWidth();
+    int srcH = shader.getFboHeight();
+    auto [outW, outH] = entry.getCropOutputSize(srcW, srcH);
+
+    // 1. Read FBO
+    Pixels pixels;
+    if (!readFboPixels(shader.getFboImage(), srcW, srcH, pixels))
+        return false;
+
+    // 1b. Choose transform path
+    Pixels transformed;
+    Pixels* srcPtr = &pixels;
+
+    bool hasCropOrRot = entry.hasCrop() || entry.hasRotation();
+    if (entry.hasPerspective()) {
+        // Per-pixel UV for perspective
+        transformPerspU8(pixels, transformed, entry, outW, outH);
+        srcPtr = &transformed;
+    } else if (hasCropOrRot) {
+        // 4-corner bilinear for rotation only
+        auto quad = entry.getCropQuad(srcW, srcH);
+        bool isIdentity = (outW == srcW && outH == srcH &&
+                           quad[0] == 0 && quad[1] == 0 &&
+                           quad[2] == 1 && quad[3] == 0 &&
+                           quad[4] == 1 && quad[5] == 1 &&
+                           quad[6] == 0 && quad[7] == 1);
+        if (!isIdentity) {
+            transformU8(pixels, transformed, quad.data(), outW, outH);
+            srcPtr = &transformed;
+        }
+    }
+
+    // 2. Resize if needed
+    Pixels* outPtr = srcPtr;
+    Pixels resized;
+    if (settings.maxEdge > 0) {
+        int w = outPtr->getWidth(), h = outPtr->getHeight();
+        int longEdge = max(w, h);
+        if (longEdge > settings.maxEdge) {
+            float scale = (float)settings.maxEdge / longEdge;
+            int newW = max(1, (int)round(w * scale));
+            int newH = max(1, (int)round(h * scale));
+            resizeU8(*outPtr, resized, newW, newH);
+            outPtr = &resized;
+        }
+    }
+
+    // 3. Create output directory
+    fs::create_directories(fs::path(outPath).parent_path());
+
+    // 4. Save JPEG (RGB, drop alpha)
+    int w = outPtr->getWidth(), h = outPtr->getHeight();
+    int ch = outPtr->getChannels();
+    if (ch == 4) {
         vector<unsigned char> rgb(w * h * 3);
         auto* src = outPtr->getData();
         for (int i = 0; i < w * h; i++) {

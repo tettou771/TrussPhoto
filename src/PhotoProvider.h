@@ -716,6 +716,16 @@ public:
         return true;
     }
 
+    bool setUserPerspective(const string& id, float perspV, float perspH, float shear) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        it->second.userPerspV = perspV;
+        it->second.userPerspH = perspH;
+        it->second.userShear = shear;
+        db_.updateUserPerspective(id, perspV, perspH, shear);
+        return true;
+    }
+
     bool setColorLabel(const string& id, const string& label) {
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;

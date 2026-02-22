@@ -310,10 +310,11 @@ public:
         bool hasImage = hasFbo || hasPreviewRaw || fullImage_.isAllocated();
         if (!hasImage) return;
 
-        // Get user crop + rotation from entry (if available)
+        // Get user crop + rotation + perspective from entry (if available)
         float ucX = 0, ucY = 0, ucW = 1, ucH = 1;
         float ucAngle = 0;
         int ucRot90 = 0;
+        float ucPerspV = 0, ucPerspH = 0, ucShear = 0;
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
             const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
             auto* entry = ctx_->provider->getPhoto(pid);
@@ -326,6 +327,11 @@ public:
             if (entry && entry->hasRotation()) {
                 ucAngle = entry->userAngle;
                 ucRot90 = entry->userRotation90;
+            }
+            if (entry && entry->hasPerspective()) {
+                ucPerspV = entry->userPerspV;
+                ucPerspH = entry->userPerspH;
+                ucShear = entry->userShear;
             }
         }
 
@@ -344,14 +350,18 @@ public:
 
         float totalRot = ucRot90 * TAU / 4 + ucAngle;
         bool hasRotation = (totalRot != 0);
+        bool hasPersp = (ucPerspV != 0 || ucPerspH != 0 || ucShear != 0);
 
-        // Compute bounding box of rotated source image
-        float bbW = srcW, bbH = srcH;
-        if (hasRotation) {
-            float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
-            bbW = srcW * cosA + srcH * sinA;
-            bbH = srcW * sinA + srcH * cosA;
-        }
+        // Build temporary entry for perspective-aware BB calculation
+        PhotoEntry tmpEntry;
+        tmpEntry.userAngle = ucAngle;
+        tmpEntry.userRotation90 = ucRot90;
+        tmpEntry.userPerspV = ucPerspV;
+        tmpEntry.userPerspH = ucPerspH;
+        tmpEntry.userShear = ucShear;
+
+        // Compute bounding box (perspective-aware)
+        auto [bbW, bbH] = tmpEntry.computeBB((int)srcW, (int)srcH);
 
         // Crop area in BB pixels (the output dimensions)
         float cropPxW = ucW * bbW;
@@ -359,47 +369,86 @@ public:
 
         auto [x, y, drawW, drawH] = calcDrawRect(cropPxW, cropPxH);
 
-        if (hasRotation && hasFbo) {
-            // Per-vertex UV mapping for rotated + cropped display
+        if ((hasRotation || hasPersp) && hasFbo) {
             float drawCX = x + drawW / 2;
             float drawCY = y + drawH / 2;
 
-            // Crop center offset from BB center (in BB pixels)
             float cropCenterBBX = (ucX + ucW / 2 - 0.5f) * bbW;
             float cropCenterBBY = (ucY + ucH / 2 - 0.5f) * bbH;
 
-            // Screen pixels per BB pixel
             float scale = drawW / cropPxW;
 
-            // Screen point -> texture UV via inverse rotation
+            // Screen point -> texture UV via inverse rotation + inverse perspective
             auto screenToUV = [&](float sx, float sy) -> pair<float,float> {
                 float bbx = (sx - drawCX) / scale + cropCenterBBX;
                 float bby = (sy - drawCY) / scale + cropCenterBBY;
                 float cosR = cos(-totalRot), sinR = sin(-totalRot);
                 float ix = bbx * cosR - bby * sinR;
                 float iy = bbx * sinR + bby * cosR;
-                float u = ix / srcW + 0.5f;
-                float v = iy / srcH + 0.5f;
-                return {u, v};
+                float wu = ix / srcW + 0.5f;
+                float wv = iy / srcH + 0.5f;
+                if (hasPersp) {
+                    return tmpEntry.inverseWarp(wu, wv);
+                }
+                return {wu, wv};
             };
 
-            auto [u0, v0] = screenToUV(x, y);
-            auto [u1, v1] = screenToUV(x + drawW, y);
-            auto [u2, v2] = screenToUV(x + drawW, y + drawH);
-            auto [u3, v3] = screenToUV(x, y + drawH);
+            if (!hasPersp) {
+                // Rotation only: simple 4-corner quad
+                auto [u0, v0] = screenToUV(x, y);
+                auto [u1, v1] = screenToUV(x + drawW, y);
+                auto [u2, v2] = screenToUV(x + drawW, y + drawH);
+                auto [u3, v3] = screenToUV(x, y + drawH);
 
-            setColor(1.0f, 1.0f, 1.0f);
-            sgl_enable_texture();
-            sgl_texture(developShader_.getFboView(), developShader_.getFboSampler());
-            Color col = getDefaultContext().getColor();
-            sgl_begin_quads();
-            sgl_c4f(col.r, col.g, col.b, col.a);
-            sgl_v2f_t2f(x, y, u0, v0);
-            sgl_v2f_t2f(x + drawW, y, u1, v1);
-            sgl_v2f_t2f(x + drawW, y + drawH, u2, v2);
-            sgl_v2f_t2f(x, y + drawH, u3, v3);
-            sgl_end();
-            sgl_disable_texture();
+                setColor(1.0f, 1.0f, 1.0f);
+                sgl_enable_texture();
+                sgl_texture(developShader_.getFboView(), developShader_.getFboSampler());
+                Color col = getDefaultContext().getColor();
+                sgl_begin_quads();
+                sgl_c4f(col.r, col.g, col.b, col.a);
+                sgl_v2f_t2f(x, y, u0, v0);
+                sgl_v2f_t2f(x + drawW, y, u1, v1);
+                sgl_v2f_t2f(x + drawW, y + drawH, u2, v2);
+                sgl_v2f_t2f(x, y + drawH, u3, v3);
+                sgl_end();
+                sgl_disable_texture();
+            } else {
+                // Perspective: tessellated grid for correct UV mapping
+                int tessN = 16;
+                setColor(1.0f, 1.0f, 1.0f);
+                sgl_enable_texture();
+                sgl_texture(developShader_.getFboView(), developShader_.getFboSampler());
+                Color col = getDefaultContext().getColor();
+
+                sgl_begin_triangles();
+                sgl_c4f(col.r, col.g, col.b, col.a);
+                for (int j = 0; j < tessN; j++) {
+                    for (int i = 0; i < tessN; i++) {
+                        float tx0 = (float)i / tessN, tx1 = (float)(i+1) / tessN;
+                        float ty0 = (float)j / tessN, ty1 = (float)(j+1) / tessN;
+
+                        float sx00 = x + tx0 * drawW, sy00 = y + ty0 * drawH;
+                        float sx10 = x + tx1 * drawW, sy10 = y + ty0 * drawH;
+                        float sx11 = x + tx1 * drawW, sy11 = y + ty1 * drawH;
+                        float sx01 = x + tx0 * drawW, sy01 = y + ty1 * drawH;
+
+                        auto [u00, v00] = screenToUV(sx00, sy00);
+                        auto [u10, v10] = screenToUV(sx10, sy10);
+                        auto [u11, v11] = screenToUV(sx11, sy11);
+                        auto [u01, v01] = screenToUV(sx01, sy01);
+
+                        sgl_v2f_t2f(sx00, sy00, u00, v00);
+                        sgl_v2f_t2f(sx10, sy10, u10, v10);
+                        sgl_v2f_t2f(sx11, sy11, u11, v11);
+
+                        sgl_v2f_t2f(sx00, sy00, u00, v00);
+                        sgl_v2f_t2f(sx11, sy11, u11, v11);
+                        sgl_v2f_t2f(sx01, sy01, u01, v01);
+                    }
+                }
+                sgl_end();
+                sgl_disable_texture();
+            }
         } else {
             // No rotation: simple axis-aligned draw
             setColor(1.0f, 1.0f, 1.0f);
@@ -746,13 +795,7 @@ private:
         string outPath = PhotoExporter::makeExportPath(
             ctx_->provider->getCatalogDir(), entry->filename);
 
-        int srcW = developShader_.getFboWidth();
-        int srcH = developShader_.getFboHeight();
-        auto quad = entry->getCropQuad(srcW, srcH);
-        auto [outW, outH] = entry->getCropOutputSize(srcW, srcH);
-
-        if (PhotoExporter::exportJpeg(developShader_, outPath, settings,
-                quad.data(), outW, outH)) {
+        if (PhotoExporter::exportJpeg(developShader_, outPath, settings, *entry)) {
             logNotice() << "[Export] " << outPath;
             revealInFinder(outPath);
         } else {
