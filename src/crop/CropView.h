@@ -676,11 +676,31 @@ protected:
 
         // --- Boundary constraint (mode-specific) ---
         if (dragMode_ == DragMode::Move) {
-            // Per-axis constraint: allows sliding along boundaries
-            float tX = computeDragLimit(s, nx, s.y, s.w, s.h);
-            float tY = computeDragLimit(s, s.x, ny, s.w, s.h);
-            nx = s.x + (nx - s.x) * tX;
-            ny = s.y + (ny - s.y) * tY;
+            // Pass 1: constrain the combined (dx, dy) movement
+            float blockNX = 0, blockNY = 0;
+            float tMax = computeDragLimit(s, nx, ny, nw, nh, &blockNX, &blockNY);
+            nx = s.x + (nx - s.x) * tMax;
+            ny = s.y + (ny - s.y) * tMax;
+
+            // Pass 2: project remaining movement onto boundary tangent
+            if (tMax < 0.999f && (blockNX != 0 || blockNY != 0)) {
+                float remainDx = dx * (1.0f - tMax);
+                float remainDy = dy * (1.0f - tMax);
+                // Tangent = perpendicular to blocking edge's inward normal
+                float tanX = -blockNY, tanY = blockNX;
+                float dot = remainDx * tanX + remainDy * tanY;
+                float slideDx = dot * tanX;
+                float slideDy = dot * tanY;
+
+                if (abs(slideDx) > 0.0001f || abs(slideDy) > 0.0001f) {
+                    CropState cur = {nx, ny, nw, nh, s.angle, s.rot90,
+                                     s.perspV, s.perspH, s.shear};
+                    float tSlide = computeDragLimit(cur,
+                        nx + slideDx, ny + slideDy, nw, nh);
+                    nx += slideDx * tSlide;
+                    ny += slideDy * tSlide;
+                }
+            }
         } else {
             float tMax = computeDragLimit(s, nx, ny, nw, nh);
             if (tMax < 0.999f) {
@@ -1148,8 +1168,11 @@ private:
     // Forward-warps 8 source boundary points (corners + edge midpoints) to form
     // an 8-sided polygon, then checks each crop corner's linear path against
     // each polygon edge halfplane.  O(32) dot products, no iteration.
+    // blockNormal: if non-null, receives the inward normal of the blocking edge
     float computeDragLimit(const CropState& start,
-                           float nx, float ny, float nw, float nh) {
+                           float nx, float ny, float nw, float nh,
+                           float* blockNormalX = nullptr,
+                           float* blockNormalY = nullptr) {
         PhotoEntry tmpEntry;
         tmpEntry.userAngle = angle_;
         tmpEntry.userRotation90 = rotation90_;
@@ -1203,6 +1226,7 @@ private:
         };
 
         float tMax = 1.0f;
+        float bestNX = 0, bestNY = 0;  // normal of the tightest constraint
 
         // Check each polygon edge
         for (int e = 0; e < N; e++) {
@@ -1229,16 +1253,17 @@ private:
                 float d1 = (P1[c][0] - Q[e][0]) * inx + (P1[c][1] - Q[e][1]) * iny;
 
                 if (d0 > eps && d1 < 0) {
-                    // Clearly inside → crossing → compute parameter
-                    tMax = min(tMax, d0 / (d0 - d1));
+                    float t = d0 / (d0 - d1);
+                    if (t < tMax) { tMax = t; bestNX = inx; bestNY = iny; }
                 } else if (d0 <= eps && d1 < -eps) {
-                    // On boundary or past, heading clearly outward → block
-                    tMax = 0;
+                    if (0.0f < tMax) { tMax = 0; bestNX = inx; bestNY = iny; }
                 }
                 // d0 <= eps && d1 >= -eps: on boundary, ~parallel → allow
             }
         }
 
+        if (blockNormalX) *blockNormalX = bestNX;
+        if (blockNormalY) *blockNormalY = bestNY;
         return max(tMax, 0.0f);
     }
 
