@@ -203,6 +203,15 @@ public:
         lensEnabled_ = false;
     }
 
+    bool hasSource() const { return srcView_.id != 0; }
+
+    void clearSource() {
+        srcView_ = {};
+        srcSmp_ = {};
+        srcW_ = 0;
+        srcH_ = 0;
+    }
+
     // -------------------------------------------------------------------------
     // Offscreen rendering (RGB10A2 FBO)
     // -------------------------------------------------------------------------

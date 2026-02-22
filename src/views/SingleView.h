@@ -177,6 +177,7 @@ public:
                 if (fullImage_.load(entry->localPath)) {
                     previewTexture_.clear();
                     isRawImage_ = false;
+                    setupIntermediateFromImage();
                     loaded = true;
                 }
             }
@@ -311,7 +312,7 @@ public:
     // Uses suspend/resumeSwapchainPass internally; safe to call mid-frame.
     void renderDevelopFbo() {
         if (isVideo_) return;
-        if (!isRawImage_ || !intermediateTexture_.isAllocated()) return;
+        if (!developShader_.hasSource()) return;
         if (!needsFboRender_) return;
 
         developShader_.renderOffscreen(displayW_, displayH_);
@@ -331,7 +332,7 @@ public:
             return;
         }
 
-        bool hasFbo = isRawImage_ && developShader_.isFboReady();
+        bool hasFbo = developShader_.isFboReady();
         bool hasPreviewRaw = isRawImage_ && previewTexture_.isAllocated();
         bool hasImage = hasFbo || hasPreviewRaw || fullImage_.isAllocated();
         if (!hasImage) return;
@@ -935,6 +936,9 @@ private:
         rawLoadInProgress_ = false;
         rawLoadCompleted_ = false;
 
+        // Clear shader source before destroying textures (prevent dangling refs)
+        developShader_.clearSource();
+
         if (isRawImage_) {
             rawPixels_.clear();
             nrPixels_.clear();
@@ -954,6 +958,19 @@ private:
         currentProfilePath_.clear();
         developShader_.clearLut();
         developShader_.clearLensData();
+    }
+
+    // Route JPEG/HEIF through DevelopShader FBO (no intermediate texture needed)
+    void setupIntermediateFromImage() {
+        auto& tex = fullImage_.getTexture();
+        developShader_.setSourceTexture(tex);
+        developShader_.clearLensData();
+        setupDevelopShaderParams(tex.getWidth(), tex.getHeight());
+        if (hasProfileLut_) {
+            developShader_.setLut(profileLut_);
+            developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+        }
+        needsFboRender_ = true;
     }
 
     // Apply NR to rawPixels_, upload as intermediate texture, setup develop shader
@@ -1017,9 +1034,16 @@ private:
     }
 
     void updateDisplayDimensions() {
-        if (!intermediateTexture_.isAllocated()) return;
-        int srcW = intermediateTexture_.getWidth();
-        int srcH = intermediateTexture_.getHeight();
+        int srcW, srcH;
+        if (intermediateTexture_.isAllocated()) {
+            srcW = intermediateTexture_.getWidth();
+            srcH = intermediateTexture_.getHeight();
+        } else if (fullImage_.isAllocated()) {
+            srcW = fullImage_.getWidth();
+            srcH = fullImage_.getHeight();
+        } else {
+            return;
+        }
 
         if (lensEnabled_ && lensCorrector_.hasDefaultCrop()) {
             float cropRect[4];
