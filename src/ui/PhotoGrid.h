@@ -7,7 +7,7 @@
 #include <TrussC.h>
 #include "PhotoProvider.h"
 #include "PhotoItem.h"
-#include "AsyncImageLoader.h"
+#include "pipeline/AsyncImageLoader.h"
 #include "RecyclerGrid.h"
 #include "ContextMenu.h"
 #include "FolderTree.h"  // for loadJapaneseFont

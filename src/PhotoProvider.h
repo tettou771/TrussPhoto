@@ -28,12 +28,12 @@ namespace fs = std::filesystem;
 
 #include "PhotoEntry.h"
 #include "PhotoDatabase.h"
-#include "SmartPreview.h"
-#include "ClipEmbedder.h"
-#include "ClipTextEncoder.h"
-#include "FaceDetector.h"
-#include "FaceRecognizer.h"
-#include "LrcatImporter.h"
+#include "pipeline/SmartPreview.h"
+#include "ai/ClipEmbedder.h"
+#include "ai/ClipTextEncoder.h"
+#include "ai/FaceDetector.h"
+#include "ai/FaceRecognizer.h"
+#include "pipeline/LrcatImporter.h"
 
 // Photo provider - manages local + server photos
 class PhotoProvider {

@@ -7,7 +7,7 @@
 #include <TrussC.h>
 #include "PhotoItem.h"   // for ThumbnailNode
 #include "PhotoProvider.h"
-#include "AsyncImageLoader.h"
+#include "pipeline/AsyncImageLoader.h"
 #include "FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
 #include "Constants.h"   // for SELECTION_COLOR
 #include <set>

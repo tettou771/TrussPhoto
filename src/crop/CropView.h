@@ -10,8 +10,8 @@
 // =============================================================================
 
 #include <TrussC.h>
-#include "ViewContainer.h"
-#include "SingleView.h"
+#include "views/ViewContainer.h"
+#include "views/SingleView.h"
 #include "CropPanel.h"
 #include "CropTypes.h"
 

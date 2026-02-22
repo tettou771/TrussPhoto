@@ -9,9 +9,9 @@
 #include <tcxIME.h>
 #include "PhotoEntry.h"
 #include "ViewContainer.h"
-#include "PhotoStrip.h"
+#include "ui/PhotoStrip.h"
 #include "Constants.h"   // for SEL_R/G/B
-#include "FolderTree.h"  // for loadJapaneseFont
+#include "ui/FolderTree.h"  // for loadJapaneseFont
 #include <deque>
 #include <thread>
 #include <mutex>

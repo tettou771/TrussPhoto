@@ -10,7 +10,7 @@
 #include "CropTypes.h"
 #include "CropWidgets.h"
 #include "CropPreview.h"
-#include "FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
+#include "ui/FolderTree.h"  // for PlainScrollContainer, loadJapaneseFont
 
 using namespace std;
 using namespace tc;

@@ -8,7 +8,7 @@
 // =============================================================================
 
 #include <TrussC.h>
-#include "PhotoExporter.h"
+#include "pipeline/PhotoExporter.h"
 
 using namespace std;
 using namespace tc;

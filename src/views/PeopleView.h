@@ -11,10 +11,10 @@
 #include <tcxIME.h>
 #include <optional>
 #include "PhotoProvider.h"
-#include "RecyclerGrid.h"
+#include "ui/RecyclerGrid.h"
 #include "ViewContainer.h"
-#include "MetadataPanel.h"  // for OverlayRect
-#include "FolderTree.h"  // for loadJapaneseFont
+#include "ui/MetadataPanel.h"  // for OverlayRect
+#include "ui/FolderTree.h"  // for loadJapaneseFont
 
 using namespace std;
 using namespace tc;

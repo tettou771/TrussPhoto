@@ -10,17 +10,18 @@
 #include "AppPaths.h"
 #include "CatalogSettings.h"
 #include "PhotoProvider.h"
-#include "FolderTree.h"
-#include "MetadataPanel.h"
-#include "DevelopPanel.h"
-#include "PaneToggle.h"
-#include "SearchBar.h"
-#include "ContextMenu.h"
-#include "ViewManager.h"
+#include "ui/FolderTree.h"
+#include "ui/MetadataPanel.h"
+#include "ui/DevelopPanel.h"
+#include "ui/PaneToggle.h"
+#include "ui/SearchBar.h"
+#include "ui/ContextMenu.h"
+#include "ui/StatusBar.h"
+#include "views/ViewManager.h"
 #include "UploadQueue.h"
 #include "ServerConfig.h"
 #include "PhotoServer.h"
-#include "LrcatImporter.h"
+#include "pipeline/LrcatImporter.h"
 using namespace std;
 using namespace tc;
 
@@ -54,6 +55,7 @@ private:
     ViewContext viewCtx_;
 
     // UI
+    StatusBar::Ptr statusBar_;
     FolderTree::Ptr folderTree_;
     MetadataPanel::Ptr metadataPanel_;
     DevelopPanel::Ptr developPanel_;
