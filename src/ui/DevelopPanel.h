@@ -80,6 +80,12 @@ public:
         redraw();
     }
 
+    void setNrEnabled(bool en) {
+        chromaSlider_->enabled = en;
+        lumaSlider_->enabled = en;
+        redraw();
+    }
+
     void setSize(float w, float h) override {
         RectNode::setSize(w, h);
         scrollContainer_->setRect(0, 0, w, h);

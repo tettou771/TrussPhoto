@@ -540,6 +540,7 @@ void tcApp::setup() {
                                                             float chroma, float luma) {
         if (developPanel_ && showDevelop_) {
             developPanel_->setValues(exp, temp, tint, chroma, luma);
+            developPanel_->setNrEnabled(viewManager_->singleView()->isRawImage());
         }
     };
 
@@ -880,6 +881,7 @@ void tcApp::keyPressed(int key) {
                 // Show develop panel, hide metadata panel
                 if (developPanel_) {
                     developPanel_->setActive(true);
+                    developPanel_->setNrEnabled(singleView->isRawImage());
                     // Restore slider values from current photo
                     string photoId = singleView->currentPhotoId();
                     auto* entry = provider_.getPhoto(photoId);

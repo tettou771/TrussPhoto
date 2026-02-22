@@ -20,6 +20,7 @@ public:
     float minVal = 0;
     float maxVal = 1;
     float defaultVal = 0;
+    bool enabled = true;
     function<void(float)> onChange;
 
     DevelopSlider() = default;
@@ -40,15 +41,16 @@ public:
         float trackY = 28.0f;
         float trackH = 4.0f;
         float knobR = 6.0f;
+        float dim = enabled ? 1.0f : 0.35f;
 
         // Label
-        setColor(0.6f, 0.6f, 0.65f);
+        setColor(0.6f * dim, 0.6f * dim, 0.65f * dim);
         drawBitmapString(label, pad, 14);
 
         // Value text
         char buf[16];
         snprintf(buf, sizeof(buf), "%.2f", value);
-        setColor(0.75f, 0.75f, 0.8f);
+        setColor(0.75f * dim, 0.75f * dim, 0.8f * dim);
         float tw = getBitmapStringWidth(buf);
         drawBitmapString(buf, w - pad - tw, 14);
 
@@ -57,24 +59,25 @@ public:
         float trackRight = w - pad;
         float trackW = trackRight - trackLeft;
 
-        setColor(0.2f, 0.2f, 0.24f);
+        setColor(0.2f * dim, 0.2f * dim, 0.24f * dim);
         fill();
         drawRect(trackLeft, trackY, trackW, trackH);
 
         // Fill
         float t = (value - minVal) / (maxVal - minVal);
         t = clamp(t, 0.0f, 1.0f);
-        setColor(0.4f, 0.6f, 0.9f);
+        setColor(0.4f * dim, 0.6f * dim, 0.9f * dim);
         drawRect(trackLeft, trackY, trackW * t, trackH);
 
         // Knob
         float knobX = trackLeft + trackW * t;
         float knobY = trackY + trackH * 0.5f;
-        setColor(0.8f, 0.85f, 0.9f);
+        setColor(0.8f * dim, 0.85f * dim, 0.9f * dim);
         drawCircle(knobX, knobY, knobR);
     }
 
     bool onMousePress(Vec2 pos, int button) override {
+        if (!enabled) return false;
         if (button == 0) {
             // Double-click detection: reset to default
             auto now = chrono::steady_clock::now();
