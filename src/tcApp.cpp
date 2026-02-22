@@ -1094,6 +1094,14 @@ void tcApp::keyPressed(int key) {
     }
     // Map/Related: no mode-specific keys (just G to go back, handled below)
 
+    // Track modifier key state (must run before any early return)
+    if (key == SAPP_KEYCODE_LEFT_SUPER || key == SAPP_KEYCODE_RIGHT_SUPER) {
+        cmdDown_ = true;
+    }
+    if (key == SAPP_KEYCODE_LEFT_SHIFT || key == SAPP_KEYCODE_RIGHT_SHIFT) {
+        shiftDown_ = true;
+    }
+
     // Mode-independent keys (skip in Crop mode — it handles its own keys)
     if (viewMode() == ViewMode::Crop) {
         redraw();
@@ -1197,14 +1205,6 @@ void tcApp::keyPressed(int key) {
         leftTween_.from(from).to(to).duration(0.2f).ease(EaseType::Cubic, EaseMode::Out).start();
     }
 
-    // Track modifier key state
-    if (key == SAPP_KEYCODE_LEFT_SUPER || key == SAPP_KEYCODE_RIGHT_SUPER) {
-        cmdDown_ = true;
-    }
-    if (key == SAPP_KEYCODE_LEFT_SHIFT || key == SAPP_KEYCODE_RIGHT_SHIFT) {
-        shiftDown_ = true;
-    }
-
     redraw();
 }
 
@@ -1215,6 +1215,7 @@ void tcApp::keyReleased(int key) {
     if (key == SAPP_KEYCODE_LEFT_SHIFT || key == SAPP_KEYCODE_RIGHT_SHIFT) {
         shiftDown_ = false;
     }
+    redraw();
 }
 
 void tcApp::mousePressed(Vec2 pos, int button) {
@@ -1266,7 +1267,9 @@ void tcApp::mouseReleased(Vec2 pos, int button) {
 }
 
 void tcApp::mouseMoved(Vec2 pos) {
-    (void)pos;
+    if (viewMode() == ViewMode::Crop) {
+        viewManager_->cropView()->updateHoverCursor(pos);
+    }
 }
 
 void tcApp::mouseDragged(Vec2 pos, int button) {

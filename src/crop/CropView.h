@@ -168,6 +168,7 @@ public:
     // Save crop + rotation + perspective to DB (Done / Enter)
     void commitCrop() {
         if (!ctx_ || !singleView_) return;
+        setCursor(Cursor::Default);
         string pid = singleView_->currentPhotoId();
         if (!pid.empty()) {
             ctx_->provider->setUserCrop(pid, cropX_, cropY_, cropW_, cropH_);
@@ -219,6 +220,36 @@ public:
     }
 
     Event<void> doneEvent;
+
+    // Update cursor based on mouse hover position
+    void updateHoverCursor(Vec2 pos) {
+        if (dragMode_ != DragMode::None) return;  // dragging overrides
+
+        float cx = bbRect_.x + cropX_ * bbRect_.w;
+        float cy = bbRect_.y + cropY_ * bbRect_.h;
+        float cw = cropW_ * bbRect_.w;
+        float ch = cropH_ * bbRect_.h;
+        float hs = handleSize_ * 1.5f;
+
+        if (hitTest(pos, cx, cy, hs) || hitTest(pos, cx + cw, cy + ch, hs))
+            setCursor(Cursor::ResizeNWSE);
+        else if (hitTest(pos, cx + cw, cy, hs) || hitTest(pos, cx, cy + ch, hs))
+            setCursor(Cursor::ResizeNESW);
+        else if (hitTest(pos, cx + cw/2, cy, hs) || hitTest(pos, cx + cw/2, cy + ch, hs))
+            setCursor(Cursor::ResizeNS);
+        else if (hitTest(pos, cx, cy + ch/2, hs) || hitTest(pos, cx + cw, cy + ch/2, hs))
+            setCursor(Cursor::ResizeEW);
+        else if (pos.x >= cx && pos.x <= cx + cw && pos.y >= cy && pos.y <= cy + ch)
+            setCursor(Cursor::ResizeAll);
+        else {
+            float margin = 60;
+            if (pos.x >= bbRect_.x - margin && pos.x <= bbRect_.x + bbRect_.w + margin &&
+                pos.y >= bbRect_.y - margin && pos.y <= bbRect_.y + bbRect_.h + margin)
+                setCursor(Cursor::Crosshair);
+            else
+                setCursor(Cursor::Default);
+        }
+    }
 
     // Handle key input (Cmd+Z is handled by tcApp)
     bool handleKey(int key) {
@@ -435,14 +466,21 @@ public:
             drawLine(cx, gy, cx + cw, gy);
         }
 
-        // Crop border
-        setColor(1, 1, 1, 0.8f);
+        // Crop border (yellow when Shift held = perspective drag mode)
+        bool shiftHeld = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
+        if (shiftHeld)
+            setColor(1.0f, 0.9f, 0.2f, 0.9f);
+        else
+            setColor(1, 1, 1, 0.8f);
         noFill();
         drawRect(cx, cy, cw, ch);
 
         // 8 handles
         float hs = handleSize_;
-        setColor(1, 1, 1, 0.9f);
+        if (shiftHeld)
+            setColor(1.0f, 0.9f, 0.2f, 0.95f);
+        else
+            setColor(1, 1, 1, 0.9f);
         fill();
         // Corners
         drawRect(cx - hs, cy - hs, hs * 2, hs * 2);
@@ -510,6 +548,7 @@ protected:
             dragStart_ = pos;
             dragStartCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_,
                                perspV_, perspH_, shear_ };
+            updateCursorForDrag();
 
             if (dragMode_ == DragMode::Rotate) {
                 float imgCenterX = bbRect_.x + bbRect_.w / 2;
@@ -748,6 +787,7 @@ protected:
         (void)pos;
         if (button == 0) {
             dragMode_ = DragMode::None;
+            setCursor(Cursor::Default);
             return true;
         }
         return false;
@@ -1277,6 +1317,22 @@ private:
 
     bool hitTest(Vec2 pos, float cx, float cy, float radius) {
         return abs(pos.x - cx) <= radius && abs(pos.y - cy) <= radius;
+    }
+
+    void updateCursorForDrag() {
+        switch (dragMode_) {
+            case DragMode::Move:   setCursor(Cursor::ResizeAll); break;
+            case DragMode::Rotate: setCursor(Cursor::Crosshair); break;
+            case DragMode::TL:     setCursor(Cursor::ResizeNWSE); break;
+            case DragMode::BR:     setCursor(Cursor::ResizeNWSE); break;
+            case DragMode::TR:     setCursor(Cursor::ResizeNESW); break;
+            case DragMode::BL:     setCursor(Cursor::ResizeNESW); break;
+            case DragMode::T:      setCursor(Cursor::ResizeNS); break;
+            case DragMode::B:      setCursor(Cursor::ResizeNS); break;
+            case DragMode::L:      setCursor(Cursor::ResizeEW); break;
+            case DragMode::R:      setCursor(Cursor::ResizeEW); break;
+            default:               setCursor(Cursor::Default); break;
+        }
     }
 
     // Get target aspect ratio in BB-normalized space (crop w/h in 0-1 coords)
