@@ -885,11 +885,42 @@ protected:
             float screenDx = pos.x - dragStart_.x;
             float screenDy = pos.y - dragStart_.y;
             auto& sb = dragStartBBRect_;
-            // Drag right → photo moves right → crop shifts left in BB-norm
-            cropX_ = s.x - screenDx / sb.w;
-            cropY_ = s.y - screenDy / sb.h;
+
+            // Desired crop position (photo moves in drag direction → crop opposite)
+            float desiredX = s.x - screenDx / sb.w;
+            float desiredY = s.y - screenDy / sb.h;
+
+            // Pass 1: constrain to keep all crop corners inside source image
+            float blockNX = 0, blockNY = 0;
+            float tMax = computeDragLimit(s, desiredX, desiredY, s.w, s.h,
+                                          &blockNX, &blockNY);
+            float nx = s.x + (desiredX - s.x) * tMax;
+            float ny = s.y + (desiredY - s.y) * tMax;
+
+            // Pass 2: slide remaining movement along blocking edge
+            if (tMax < 0.999f && (blockNX != 0 || blockNY != 0)) {
+                float cropDx = (desiredX - s.x) * (1.0f - tMax);
+                float cropDy = (desiredY - s.y) * (1.0f - tMax);
+                float tanX = -blockNY, tanY = blockNX;
+                float dot = cropDx * tanX + cropDy * tanY;
+                float slideDx = dot * tanX;
+                float slideDy = dot * tanY;
+
+                if (fabs(slideDx) > 0.0001f || fabs(slideDy) > 0.0001f) {
+                    CropState cur = {nx, ny, s.w, s.h, s.angle, s.rot90,
+                                     s.perspV, s.perspH, s.shear};
+                    float tSlide = computeDragLimit(cur,
+                        nx + slideDx, ny + slideDy, s.w, s.h);
+                    nx += slideDx * tSlide;
+                    ny += slideDy * tSlide;
+                }
+            }
+
+            cropX_ = nx;
+            cropY_ = ny;
             cropW_ = s.w;
             cropH_ = s.h;
+
             // Track crop movement so image shifts, crop stays on screen
             float startMidX = s.x + s.w / 2;
             float startMidY = s.y + s.h / 2;
