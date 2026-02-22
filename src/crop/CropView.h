@@ -18,9 +18,6 @@
 using namespace std;
 using namespace tc;
 
-// Flip threshold: TAU/8 * this value (~47°). Slightly above 45° for hysteresis.
-static constexpr float kFlipThreshold = 1.05f;
-
 class CropView : public ViewContainer {
 public:
     using Ptr = shared_ptr<CropView>;
@@ -529,12 +526,10 @@ protected:
         if (button != 0 || dragMode_ == DragMode::None) return false;
 
         if (dragMode_ == DragMode::Rotate) {
-            // Rotation drag: use screen coords relative to BB center
             float imgCenterX = bbRect_.x + bbRect_.w / 2;
             float imgCenterY = bbRect_.y + bbRect_.h / 2;
             float mouseAngle = atan2(pos.y - imgCenterY, pos.x - imgCenterX);
             float delta = mouseAngle - dragStartMouseAngle_;
-            // Wrap delta to [-TAU/2, TAU/2]
             while (delta > TAU / 2) delta -= TAU;
             while (delta < -TAU / 2) delta += TAU;
             float newAngle = clamp(dragStartCrop_.angle + delta, -TAU / 8, TAU / 8);
@@ -543,23 +538,23 @@ protected:
             return true;
         }
 
-        // For crop operations, use screen coords converted to BB-normalized
         float dx = (pos.x - dragStart_.x) / bbRect_.w;
         float dy = (pos.y - dragStart_.y) / bbRect_.h;
 
         auto& s = dragStartCrop_;
         bool locked = panel_->aspect() != CropAspect::Free;
+        constexpr float minSize = 0.02f;
+
+        float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
 
         if (dragMode_ == DragMode::Move) {
-            cropX_ = clamp(s.x + dx, 0.0f, 1.0f - cropW_);
-            cropY_ = clamp(s.y + dy, 0.0f, 1.0f - cropH_);
+            nx = s.x + dx;
+            ny = s.y + dy;
         } else {
-            constexpr float minSize = 0.02f;
             bool isEdge = (dragMode_ == DragMode::T || dragMode_ == DragMode::B ||
                            dragMode_ == DragMode::L || dragMode_ == DragMode::R);
 
             if (isEdge) {
-                float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
                 bool isHoriz = (dragMode_ == DragMode::L || dragMode_ == DragMode::R);
 
                 if (dragMode_ == DragMode::L) { nx = s.x + dx; nw = s.w - dx; }
@@ -578,31 +573,23 @@ protected:
                         if (isHoriz) {
                             float cy = s.y + s.h / 2;
                             nh = nw / targetAR;
-                            float maxH = min(cy, 1.0f - cy) * 2;
-                            if (nh > maxH) { nh = maxH; nw = nh * targetAR; }
                             ny = cy - nh / 2;
                             if (dragMode_ == DragMode::L) nx = s.x + s.w - nw;
                         } else {
-                            float ccx = s.x + s.w / 2;
+                            float cx = s.x + s.w / 2;
                             nw = nh * targetAR;
-                            float maxW = min(ccx, 1.0f - ccx) * 2;
-                            if (nw > maxW) { nw = maxW; nh = nw / targetAR; }
-                            nx = ccx - nw / 2;
+                            nx = cx - nw / 2;
                             if (dragMode_ == DragMode::T) ny = s.y + s.h - nh;
                         }
                     }
                 }
-
-                nx = clamp(nx, 0.0f, 1.0f - minSize);
-                ny = clamp(ny, 0.0f, 1.0f - minSize);
-                nw = clamp(nw, minSize, 1.0f - nx);
-                nh = clamp(nh, minSize, 1.0f - ny);
-
-                cropX_ = nx; cropY_ = ny;
-                cropW_ = nw; cropH_ = nh;
             } else {
                 // Corner drag
                 bool shiftHeld = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
+                bool moveLeft = (dragMode_ == DragMode::TL || dragMode_ == DragMode::BL);
+                bool moveTop = (dragMode_ == DragMode::TL || dragMode_ == DragMode::TR);
+                float anchorNX = moveLeft ? (s.x + s.w) : s.x;
+                float anchorNY = moveTop  ? (s.y + s.h) : s.y;
 
                 if (shiftHeld) {
                     // Shift+corner: uniform scale from center
@@ -611,7 +598,6 @@ protected:
                     float centerSX = bbRect_.x + centerNX * bbRect_.w;
                     float centerSY = bbRect_.y + centerNY * bbRect_.h;
 
-                    // Scale by max mouse distance from center vs original half-size
                     float distX = abs(pos.x - centerSX) / max(bbRect_.w, 1.0f);
                     float distY = abs(pos.y - centerSY) / max(bbRect_.h, 1.0f);
                     float origHW = s.w / 2, origHH = s.h / 2;
@@ -620,8 +606,8 @@ protected:
                     float scale = max(scaleX, scaleY);
                     scale = max(scale, minSize / max(s.w, s.h));
 
-                    float nw = s.w * scale;
-                    float nh = s.h * scale;
+                    nw = s.w * scale;
+                    nh = s.h * scale;
 
                     if (locked) {
                         float targetAR = getTargetAspectNorm();
@@ -633,69 +619,107 @@ protected:
 
                     nw = max(nw, minSize);
                     nh = max(nh, minSize);
-                    cropW_ = nw; cropH_ = nh;
-                    cropX_ = centerNX - nw / 2;
-                    cropY_ = centerNY - nh / 2;
-                } else {
-                    // Normal corner drag (one corner moves, opposite stays)
-                    float nx = s.x, ny = s.y, nw = s.w, nh = s.h;
+                    nx = centerNX - nw / 2;
+                    ny = centerNY - nh / 2;
+                } else if (locked) {
+                    // AR-locked: compute from anchor-to-mouse distance directly.
+                    // Uniform algorithm — orientation flip is seamless because
+                    // the crop is always derived from the same anchor-to-mouse vector.
+                    float anchorSX = bbRect_.x + anchorNX * bbRect_.w;
+                    float anchorSY = bbRect_.y + anchorNY * bbRect_.h;
+                    float physDx = abs(pos.x - anchorSX);
+                    float physDy = abs(pos.y - anchorSY);
 
-                    bool moveLeft = (dragMode_ == DragMode::TL || dragMode_ == DragMode::BL);
-                    bool moveRight = (dragMode_ == DragMode::TR || dragMode_ == DragMode::BR);
-                    bool moveTop = (dragMode_ == DragMode::TL || dragMode_ == DragMode::TR);
-                    bool moveBottom = (dragMode_ == DragMode::BL || dragMode_ == DragMode::BR);
-
-                    if (moveLeft)   { nx = s.x + dx; nw = s.w - dx; }
-                    if (moveRight)  { nw = s.w + dx; }
-                    if (moveTop)    { ny = s.y + dy; nh = s.h - dy; }
-                    if (moveBottom) { nh = s.h + dy; }
-
-                    if (nw < minSize) { if (moveLeft) nx = s.x + s.w - minSize; nw = minSize; }
-                    if (nh < minSize) { if (moveTop) ny = s.y + s.h - minSize; nh = minSize; }
-
-                    // Auto-flip orientation during corner drag
-                    if (locked && panel_->aspect() != CropAspect::A1_1) {
-                        float anchorNX = moveLeft ? (s.x + s.w) : s.x;
-                        float anchorNY = moveTop  ? (s.y + s.h) : s.y;
-                        float anchorSX = bbRect_.x + anchorNX * bbRect_.w;
-                        float anchorSY = bbRect_.y + anchorNY * bbRect_.h;
-
-                        float adx = abs(pos.x - anchorSX) / bbRect_.w;
-                        float ady = abs(pos.y - anchorSY) / bbRect_.h;
-                        float a = isLandscape_ ? atan2(ady, adx) : atan2(adx, ady);
-                        bool shouldFlip = (a > TAU / 8 * kFlipThreshold);
-
-                        if (shouldFlip) {
-                            isLandscape_ = !isLandscape_;
+                    // Auto-flip orientation (physical pixels, symmetric hysteresis)
+                    if (panel_->aspect() != CropAspect::A1_1) {
+                        constexpr float flipK = 0.92f;
+                        if (isLandscape_ && physDx < physDy * flipK) {
+                            isLandscape_ = false;
+                            panel_->setOrientation(isLandscape_);
+                        } else if (!isLandscape_ && physDy < physDx * flipK) {
+                            isLandscape_ = true;
                             panel_->setOrientation(isLandscape_);
                         }
                     }
 
-                    if (locked) {
-                        float targetAR = getTargetAspectNorm();
-                        if (targetAR > 0) {
-                            if (nw / nh > targetAR) {
-                                nw = nh * targetAR;
-                            } else {
-                                nh = nw / targetAR;
-                            }
-                            if (moveTop && !moveBottom) ny = s.y + s.h - nh;
-                            if (moveLeft && !moveRight) nx = s.x + s.w - nw;
-                        }
+                    float targetAR = getTargetAspectNorm();
+                    float normDx = physDx / max(bbRect_.w, 1.0f);
+                    float normDy = physDy / max(bbRect_.h, 1.0f);
+
+                    // Project onto AR constraint
+                    if (targetAR > 0 && normDx > normDy * targetAR) {
+                        nw = normDy * targetAR;
+                        nh = normDy;
+                    } else if (targetAR > 0) {
+                        nw = normDx;
+                        nh = normDx / targetAR;
+                    } else {
+                        nw = normDx; nh = normDy;
                     }
 
-                    nx = clamp(nx, 0.0f, 1.0f - minSize);
-                    ny = clamp(ny, 0.0f, 1.0f - minSize);
-                    nw = clamp(nw, minSize, 1.0f - nx);
-                    nh = clamp(nh, minSize, 1.0f - ny);
+                    nw = max(nw, minSize);
+                    nh = max(nh, minSize);
+                    nx = moveLeft ? (anchorNX - nw) : anchorNX;
+                    ny = moveTop ? (anchorNY - nh) : anchorNY;
+                } else {
+                    // Free aspect: delta-based
+                    if (moveLeft) { nx = s.x + dx; nw = s.w - dx; }
+                    else          { nw = s.w + dx; }
+                    if (moveTop)  { ny = s.y + dy; nh = s.h - dy; }
+                    else          { nh = s.h + dy; }
 
-                    cropX_ = nx; cropY_ = ny;
-                    cropW_ = nw; cropH_ = nh;
+                    if (nw < minSize) { if (moveLeft) nx = anchorNX - minSize; nw = minSize; }
+                    if (nh < minSize) { if (moveTop) ny = anchorNY - minSize; nh = minSize; }
                 }
             }
         }
 
-        constrainCropToBounds();
+        // --- Boundary constraint (mode-specific) ---
+        if (dragMode_ == DragMode::Move) {
+            // Per-axis constraint: allows sliding along boundaries
+            float tX = computeDragLimit(s, nx, s.y, s.w, s.h);
+            float tY = computeDragLimit(s, s.x, ny, s.w, s.h);
+            nx = s.x + (nx - s.x) * tX;
+            ny = s.y + (ny - s.y) * tY;
+        } else {
+            float tMax = computeDragLimit(s, nx, ny, nw, nh);
+            if (tMax < 0.999f) {
+                nx = s.x + (nx - s.x) * tMax;
+                ny = s.y + (ny - s.y) * tMax;
+                nw = s.w + (nw - s.w) * tMax;
+                nh = s.h + (nh - s.h) * tMax;
+
+                // AR re-projection: tMax interpolation can break AR lock
+                // (e.g. after orientation flip, start and desired have different ARs).
+                // Shrinking to restore AR is always safe (moves away from boundary).
+                if (locked) {
+                    float targetAR = getTargetAspectNorm();
+                    if (targetAR > 0 && abs(nw / nh - targetAR) > 0.001f) {
+                        bool isCorner = (dragMode_ >= DragMode::TL);
+                        bool isShift = ctx_ && ctx_->shiftDown && *ctx_->shiftDown;
+                        if (nw / nh > targetAR) nw = nh * targetAR;
+                        else nh = nw / targetAR;
+
+                        if (isCorner && !isShift) {
+                            // Anchor = opposite corner
+                            bool ml = (dragMode_ == DragMode::TL || dragMode_ == DragMode::BL);
+                            bool mt = (dragMode_ == DragMode::TL || dragMode_ == DragMode::TR);
+                            if (ml) nx = (s.x + s.w) - nw;
+                            if (mt) ny = (s.y + s.h) - nh;
+                        } else if (isCorner && isShift) {
+                            // Anchor = center of start crop
+                            nx = (s.x + s.w / 2) - nw / 2;
+                            ny = (s.y + s.h / 2) - nh / 2;
+                        }
+                        // Edge drag: center of orthogonal axis (already correct)
+                    }
+                }
+            }
+        }
+
+        cropX_ = nx; cropY_ = ny;
+        cropW_ = nw; cropH_ = nh;
+
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         return true;
     }
@@ -729,37 +753,34 @@ protected:
         float centerX = cropX_ + cropW_ / 2;
         float centerY = cropY_ + cropH_ / 2;
 
-        // Max half-size that keeps center fixed within [0,1]
-        float maxHW = min(centerX, 1.0f - centerX);
-        float maxHH = min(centerY, 1.0f - centerY);
-
-        float nw = cropW_ * factor;
-        float nh = cropH_ * factor;
-
-        // Clamp to fit within center-preserving budget
-        nw = clamp(nw, minSize, maxHW * 2);
-        nh = clamp(nh, minSize, maxHH * 2);
+        float nw = max(cropW_ * factor, minSize);
+        float nh = max(cropH_ * factor, minSize);
 
         if (locked) {
             float targetAR = getTargetAspectNorm();
             if (targetAR > 0) {
-                if (nw / nh > targetAR) {
-                    nw = nh * targetAR;
-                } else {
-                    nh = nw / targetAR;
-                }
-                // Re-check budget after AR constraint
-                if (nw > maxHW * 2) { nw = maxHW * 2; nh = nw / targetAR; }
-                if (nh > maxHH * 2) { nh = maxHH * 2; nw = nh * targetAR; }
+                if (nw / nh > targetAR) nw = nh * targetAR;
+                else nh = nw / targetAR;
             }
         }
 
-        cropX_ = centerX - nw / 2;
-        cropY_ = centerY - nh / 2;
-        cropW_ = nw;
-        cropH_ = nh;
+        float dnx = centerX - nw / 2;
+        float dny = centerY - nh / 2;
 
-        constrainCropToBounds();
+        // Use analytical constraint (center-preserving zoom)
+        CropState start = {cropX_, cropY_, cropW_, cropH_, angle_, rotation90_,
+                           perspV_, perspH_, shear_};
+        float tMax = computeDragLimit(start, dnx, dny, nw, nh);
+        if (tMax < 0.999f) {
+            dnx = cropX_ + (dnx - cropX_) * tMax;
+            dny = cropY_ + (dny - cropY_) * tMax;
+            nw = cropW_ + (nw - cropW_) * tMax;
+            nh = cropH_ + (nh - cropH_) * tMax;
+        }
+
+        cropX_ = dnx; cropY_ = dny;
+        cropW_ = nw; cropH_ = nh;
+
         if (ctx_ && ctx_->redraw) ctx_->redraw(1);
         return true;
     }
@@ -1120,6 +1141,105 @@ private:
 
         cropX_ = clamp(cropX_, 0.0f, 1.0f - cropW_);
         cropY_ = clamp(cropY_, 0.0f, 1.0f - cropH_);
+    }
+
+    // Analytical drag constraint: find max t ∈ [0,1] where all crop corners
+    // stay inside the forward-warped source image boundary (in BB-norm space).
+    // Forward-warps 8 source boundary points (corners + edge midpoints) to form
+    // an 8-sided polygon, then checks each crop corner's linear path against
+    // each polygon edge halfplane.  O(32) dot products, no iteration.
+    float computeDragLimit(const CropState& start,
+                           float nx, float ny, float nw, float nh) {
+        PhotoEntry tmpEntry;
+        tmpEntry.userAngle = angle_;
+        tmpEntry.userRotation90 = rotation90_;
+        tmpEntry.userPerspV = perspV_;
+        tmpEntry.userPerspH = perspH_;
+        tmpEntry.userShear = shear_;
+
+        auto [bbW, bbH] = tmpEntry.computeBB(fboW_, fboH_);
+        float totalRot = tmpEntry.totalRotation();
+        float cosR = cos(totalRot), sinR = sin(totalRot);
+
+        // Forward warp source UV → BB-norm
+        auto srcToBBNorm = [&](float u, float v) -> pair<float,float> {
+            auto [wu, wv] = tmpEntry.forwardWarp(u, v);
+            float px = (wu - 0.5f) * fboW_;
+            float py = (wv - 0.5f) * fboH_;
+            float rx = px * cosR - py * sinR;
+            float ry = px * sinR + py * cosR;
+            return {rx / bbW + 0.5f, ry / bbH + 0.5f};
+        };
+
+        // 8-point boundary: corners + edge midpoints (handles perspective curvature)
+        constexpr int N = 8;
+        float Q[N][2];
+        auto set = [&](int i, float u, float v) {
+            auto [x, y] = srcToBBNorm(u, v);
+            Q[i][0] = x; Q[i][1] = y;
+        };
+        set(0, 0,0);     set(1, 0.5f,0);   // TL, T-mid
+        set(2, 1,0);     set(3, 1,0.5f);   // TR, R-mid
+        set(4, 1,1);     set(5, 0.5f,1);   // BR, B-mid
+        set(6, 0,1);     set(7, 0,0.5f);   // BL, L-mid
+
+        // Polygon centroid for inward normal orientation
+        float qcx = 0, qcy = 0;
+        for (int i = 0; i < N; i++) { qcx += Q[i][0]; qcy += Q[i][1]; }
+        qcx /= N; qcy /= N;
+
+        // Crop corners at t=0 (start) and t=1 (desired)
+        float P0[4][2] = {
+            {start.x,           start.y},
+            {start.x + start.w, start.y},
+            {start.x + start.w, start.y + start.h},
+            {start.x,           start.y + start.h}
+        };
+        float P1[4][2] = {
+            {nx,      ny},
+            {nx + nw, ny},
+            {nx + nw, ny + nh},
+            {nx,      ny + nh}
+        };
+
+        float tMax = 1.0f;
+
+        // Check each polygon edge
+        for (int e = 0; e < N; e++) {
+            int e1 = (e + 1) % N;
+            float edgeX = Q[e1][0] - Q[e][0];
+            float edgeY = Q[e1][1] - Q[e][1];
+
+            // Inward normal (perpendicular, oriented toward centroid, normalized)
+            float inx = -edgeY, iny = edgeX;
+            if (inx * (qcx - Q[e][0]) + iny * (qcy - Q[e][1]) < 0) {
+                inx = -inx; iny = -iny;
+            }
+            float nlen = sqrt(inx * inx + iny * iny);
+            if (nlen < 1e-8f) continue;  // degenerate edge
+            inx /= nlen; iny /= nlen;
+
+            // Check each crop corner against this edge.
+            // eps on d0: treats "on boundary" as inside (prevents stuck-on-release).
+            // No eps on d1: prevents accumulated penetration during edge-sliding.
+            constexpr float eps = 0.0005f;
+
+            for (int c = 0; c < 4; c++) {
+                float d0 = (P0[c][0] - Q[e][0]) * inx + (P0[c][1] - Q[e][1]) * iny;
+                float d1 = (P1[c][0] - Q[e][0]) * inx + (P1[c][1] - Q[e][1]) * iny;
+
+                if (d0 > eps && d1 < 0) {
+                    // Clearly inside → crossing → compute parameter
+                    tMax = min(tMax, d0 / (d0 - d1));
+                } else if (d0 <= eps && d1 < -eps) {
+                    // On boundary or past, heading clearly outward → block
+                    tMax = 0;
+                }
+                // d0 <= eps && d1 >= -eps: on boundary, ~parallel → allow
+            }
+        }
+
+        return max(tMax, 0.0f);
     }
 
     void pushUndo() {
