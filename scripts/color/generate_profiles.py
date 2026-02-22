@@ -155,23 +155,30 @@ def load_pair_pixels(raw_path: Path, jpg_path: Path | None) -> tuple | None:
         print(f"    ERROR loading {raw_path.name}: {e}")
         return None
 
-    # Match dimensions
-    h = min(raw_img.shape[0], jpg_img.shape[0])
-    w = min(raw_img.shape[1], jpg_img.shape[1])
-    raw_c = raw_img[(raw_img.shape[0]-h)//2:(raw_img.shape[0]-h)//2+h,
-                    (raw_img.shape[1]-w)//2:(raw_img.shape[1]-w)//2+w]
-    jpg_c = jpg_img[(jpg_img.shape[0]-h)//2:(jpg_img.shape[0]-h)//2+h,
-                    (jpg_img.shape[1]-w)//2:(jpg_img.shape[1]-w)//2+w]
+    # Match dimensions: when embedded preview is much smaller than RAW,
+    # resize RAW down to preview size (they cover the same field of view).
+    # For same-size JPG pairs, use the original center-crop approach.
+    raw_h, raw_w = raw_img.shape[:2]
+    jpg_h, jpg_w = jpg_img.shape[:2]
 
-    # Resize if needed
-    if raw_c.shape[:2] != jpg_c.shape[:2]:
-        jpg_c = np.array(Image.fromarray(jpg_c).resize(
-            (raw_c.shape[1], raw_c.shape[0]), Image.LANCZOS))
+    if source == "embedded" and (raw_h > jpg_h * 1.5 or raw_w > jpg_w * 1.5):
+        # Embedded preview covers full frame — resize RAW to match
+        raw_resized = np.array(Image.fromarray(raw_img).resize(
+            (jpg_w, jpg_h), Image.LANCZOS))
+        h = jpg_h
+    else:
+        # Same-size pair: center-crop to smaller dimensions
+        h = min(raw_h, jpg_h)
+        w = min(raw_w, jpg_w)
+        raw_resized = raw_img[(raw_h-h)//2:(raw_h-h)//2+h,
+                              (raw_w-w)//2:(raw_w-w)//2+w]
+        jpg_img = jpg_img[(jpg_h-h)//2:(jpg_h-h)//2+h,
+                          (jpg_w-w)//2:(jpg_w-w)//2+w]
 
     # Center crop to h/2 square
     crop_size = h // 2
-    raw_sq = center_crop_square(raw_c, crop_size).astype(np.float32) / 255.0
-    jpg_sq = center_crop_square(jpg_c, crop_size).astype(np.float32) / 255.0
+    raw_sq = center_crop_square(raw_resized, crop_size).astype(np.float32) / 255.0
+    jpg_sq = center_crop_square(jpg_img, crop_size).astype(np.float32) / 255.0
 
     # Flatten and filter black background
     src_flat = raw_sq.reshape(-1, 3)
@@ -440,27 +447,46 @@ def analyze_coverage(src_pixels: np.ndarray) -> list[str]:
 
 # --- Main ---
 
-def scan_and_group(dir_path: Path) -> dict:
+def scan_and_group(dir_path: Path, ignore_extensions: set = None,
+                   camera_filter: str = None) -> dict:
     """Scan directory, read EXIF, group by (model, style).
-    Returns {(model, style): [(raw_path, jpg_path|None), ...]}"""
+    Returns {(model, style): [(raw_path, jpg_path|None), ...]}
+    ignore_extensions: set of lowercase extensions to skip (e.g. {'.dng'})
+    camera_filter: if set, only include files matching this camera model (case-insensitive)"""
 
     groups = defaultdict(list)
+    skip_exts = ignore_extensions or set()
 
     raw_files = []
     for ext in RAW_EXTENSIONS:
+        if ext in skip_exts:
+            continue
         raw_files.extend(dir_path.rglob(f"*{ext}"))
         raw_files.extend(dir_path.rglob(f"*{ext.upper()}"))
 
     raw_files = sorted(set(raw_files))
     if not raw_files:
         print(f"No RAW files found in {dir_path}")
+        if skip_exts:
+            print(f"  (ignoring: {', '.join(skip_exts)})")
         return groups
 
-    print(f"Found {len(raw_files)} RAW files\n")
+    print(f"Found {len(raw_files)} RAW files")
+    if skip_exts:
+        print(f"  (ignoring: {', '.join(skip_exts)})")
+    if camera_filter:
+        print(f"  (camera filter: {camera_filter})")
+    print()
 
+    skipped_camera = 0
     for raw_path in raw_files:
         exif = read_exif_fields(raw_path)
         model = detect_camera_model(exif)
+
+        if camera_filter and model.lower() != camera_filter.lower():
+            skipped_camera += 1
+            continue
+
         style = detect_color_style(exif)
         jpg_path = find_jpg_for_raw(raw_path)
 
@@ -468,6 +494,9 @@ def scan_and_group(dir_path: Path) -> dict:
         print(f"  {raw_path.name} → {model} / {style}  [{source}]")
 
         groups[(model, style)].append((raw_path, jpg_path))
+
+    if skipped_camera:
+        print(f"\n  ({skipped_camera} files skipped by camera filter)")
 
     return groups
 
@@ -489,6 +518,10 @@ def main():
                         help='Number of sigma clipping iterations (default: 3)')
     parser.add_argument('--min-survivors', type=float, default=10.0,
                         help='Minimum survivor percentage floor (default: 10)')
+    parser.add_argument('--ignore-dng', action='store_true',
+                        help='Skip DNG files (useful when DNG previews are Lightroom-generated)')
+    parser.add_argument('--camera', default=None,
+                        help='Only process files from this camera model (case-insensitive)')
 
     args = parser.parse_args()
     dir_path = Path(args.dir)
@@ -499,8 +532,14 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else \
                  Path.home() / '.trussc' / 'profiles'
 
+    # Build ignore set
+    ignore_exts = set()
+    if args.ignore_dng:
+        ignore_exts.add('.dng')
+
     # Scan and group
-    groups = scan_and_group(dir_path)
+    groups = scan_and_group(dir_path, ignore_extensions=ignore_exts,
+                            camera_filter=args.camera)
     if not groups:
         sys.exit(1)
 
