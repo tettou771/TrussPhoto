@@ -838,7 +838,7 @@ protected:
         cropX_ = nx; cropY_ = ny;
         cropW_ = nw; cropH_ = nh;
 
-        // Shift+Move: perspective correction
+        // Shift+Move: perspective correction with boundary constraint
         if (shiftPerspDrag) {
             float screenDx = pos.x - dragStart_.x;
             float screenDy = pos.y - dragStart_.y;
@@ -856,19 +856,47 @@ protected:
             float fy = focal / 24.0f;
             constexpr float kRad2Deg = 180.0f / 3.14159265f;
 
-            perspH_ = clamp(s.perspH + atanf(du / fx) * kRad2Deg, -45.0f, 45.0f);
-            perspV_ = clamp(s.perspV - atanf(dv / fy) * kRad2Deg, -45.0f, 45.0f);
-            updateBoundingBox();
+            float desiredPH = clamp(s.perspH + atanf(du / fx) * kRad2Deg, -45.0f, 45.0f);
+            float desiredPV = clamp(s.perspV - atanf(dv / fy) * kRad2Deg, -45.0f, 45.0f);
 
-            // Keep crop at its original screen position
-            auto newBB = predictBBRect();
+            // Apply perspective and reposition crop to maintain screen position
             auto& sb = dragStartBBRect_;
             float startScreenX = sb.x + s.x * sb.w;
             float startScreenY = sb.y + s.y * sb.h;
-            cropX_ = (startScreenX - newBB.x) / newBB.w;
-            cropY_ = (startScreenY - newBB.y) / newBB.h;
-            cropW_ = (s.w * sb.w) / newBB.w;
-            cropH_ = (s.h * sb.h) / newBB.h;
+
+            auto applyPersp = [&](float pH, float pV) {
+                perspH_ = pH;
+                perspV_ = pV;
+                updateBoundingBox();
+                auto newBB = predictBBRect();
+                cropX_ = (startScreenX - newBB.x) / newBB.w;
+                cropY_ = (startScreenY - newBB.y) / newBB.h;
+                cropW_ = (s.w * sb.w) / newBB.w;
+                cropH_ = (s.h * sb.h) / newBB.h;
+            };
+
+            // Apply full desired perspective
+            applyPersp(desiredPH, desiredPV);
+
+            // Boundary constraint: binary search if crop exits source image
+            if (!isCropInBounds()) {
+                float lo = 0.0f, hi = 1.0f;
+                for (int iter = 0; iter < 12; iter++) {
+                    float mid = (lo + hi) / 2;
+                    float pH = s.perspH + (desiredPH - s.perspH) * mid;
+                    float pV = s.perspV + (desiredPV - s.perspV) * mid;
+                    applyPersp(pH, pV);
+                    if (isCropInBounds()) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                // Apply conservative bound
+                float pH = s.perspH + (desiredPH - s.perspH) * lo;
+                float pV = s.perspV + (desiredPV - s.perspV) * lo;
+                applyPersp(pH, pV);
+            }
 
             // Track crop movement so image shifts, crop stays on screen
             float startMidX = s.x + s.w / 2;
@@ -1058,6 +1086,37 @@ private:
     void syncViewAnchor() {
         viewAnchorX_ = cropX_ + cropW_ / 2;
         viewAnchorY_ = cropY_ + cropH_ / 2;
+    }
+
+    // Check if all 4 crop corners map to valid source UV via inverse warp.
+    // Requires bbW_/bbH_ and perspV_/perspH_ to be current.
+    bool isCropInBounds(float tolerance = 0.001f) const {
+        auto tmpEntry = makeTmpEntry();
+        float totalRot = tmpEntry.totalRotation();
+        float cosR = cos(-totalRot), sinR = sin(-totalRot);
+
+        float corners[4][2] = {
+            {cropX_, cropY_},
+            {cropX_ + cropW_, cropY_},
+            {cropX_ + cropW_, cropY_ + cropH_},
+            {cropX_, cropY_ + cropH_}
+        };
+
+        for (auto& c : corners) {
+            float dx = (c[0] - 0.5f) * bbW_;
+            float dy = (c[1] - 0.5f) * bbH_;
+            float ix = dx * cosR - dy * sinR;
+            float iy = dx * sinR + dy * cosR;
+            float wu = ix / fboW_ + 0.5f;
+            float wv = iy / fboH_ + 0.5f;
+            auto [u, v] = tmpEntry.inverseWarp(wu, wv);
+
+            if (u < -tolerance || u > 1.0f + tolerance ||
+                v < -tolerance || v > 1.0f + tolerance) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // --- Bounding box computation ---
