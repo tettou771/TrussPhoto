@@ -255,9 +255,12 @@ def expand_poly_single(L, r, g, order: int = 3) -> np.ndarray:
 
 
 def build_lut(src_all: np.ndarray, tgt_all: np.ndarray,
-              lut_size: int = 64) -> tuple:
-    """Build 3D LUT using chromaticity-space polynomial fit.
-    Input RGB is converted to (L, r, g) for fitting, output is RGB.
+              lut_size: int = 64, sigma_clip: float = 1.5,
+              clip_rounds: int = 3, min_survivor_pct: float = 10.0) -> tuple:
+    """Build 3D LUT using chromaticity-space polynomial fit with sigma clipping.
+    Iteratively removes outliers (misaligned pixels from lens distortion correction
+    differences between RAW and camera JPEG) before final fit.
+    min_survivor_pct guarantees at least N% of best-fitting pixels survive.
     Returns (lut, fit_info_dict)."""
 
     # Subsample to ~1M points
@@ -265,26 +268,77 @@ def build_lut(src_all: np.ndarray, tgt_all: np.ndarray,
     step = max(1, n // 1000000)
     src_sub = src_all[::step]
     tgt_sub = tgt_all[::step]
-    print(f"  Fitting samples: {len(src_sub):,} (step={step})")
+    n_initial = len(src_sub)
+    min_survivors = max(100, int(n_initial * min_survivor_pct / 100.0))
+    print(f"  Fitting samples: {n_initial:,} (step={step}), "
+          f"min survivors: {min_survivors:,} ({min_survivor_pct:.0f}%)")
 
     # Convert to chromaticity space (L, r, g)
     src_lrg = rgb_to_lrg(src_sub)
 
     # 4th-order polynomial fit in chromaticity space
     use_order = 4
-    X = expand_poly(src_lrg, use_order)
+
+    # Iterative sigma clipping: fit → remove outliers → refit
+    mask = np.ones(len(src_sub), dtype=bool)
+    for clip_iter in range(clip_rounds):
+        X = expand_poly(src_lrg[mask], use_order)
+        M, _, _, _ = np.linalg.lstsq(X, tgt_sub[mask], rcond=None)
+
+        # Compute residuals on ALL remaining points
+        X_all = expand_poly(src_lrg[mask], use_order)
+        pred = X_all @ M
+        residuals = np.sqrt(np.sum((pred - tgt_sub[mask]) ** 2, axis=1))
+
+        sigma = np.std(residuals)
+        threshold = sigma_clip * sigma
+        inlier_local = residuals <= threshold
+        n_before = mask.sum()
+
+        # Check if clipping would drop below minimum
+        n_would_remain = inlier_local.sum()
+        if n_would_remain < min_survivors:
+            # Keep top min_survivors by residual instead
+            indices = np.where(mask)[0]
+            sorted_idx = np.argsort(residuals)
+            keep = sorted_idx[:min_survivors]
+            new_mask = np.zeros(len(src_sub), dtype=bool)
+            new_mask[indices[keep]] = True
+            mask = new_mask
+            n_after = mask.sum()
+            removed_pct = (1 - n_after / n_initial) * 100
+            print(f"    Clip round {clip_iter+1}: σ={sigma:.4f}, "
+                  f"threshold={threshold:.4f}, "
+                  f"floor hit → kept best {n_after:,} ({removed_pct:.0f}% total removed)")
+            break
+
+        # Update global mask
+        indices = np.where(mask)[0]
+        mask[indices[~inlier_local]] = False
+        n_after = mask.sum()
+        removed_pct = (1 - n_after / n_initial) * 100
+
+        print(f"    Clip round {clip_iter+1}: σ={sigma:.4f}, "
+              f"threshold={threshold:.4f}, "
+              f"removed {n_before - n_after:,} → "
+              f"{n_after:,} remain ({removed_pct:.0f}% total removed)")
+
+    # Final fit on clean data
+    X = expand_poly(src_lrg[mask], use_order)
     n_terms = X.shape[1]
-    M, _, _, _ = np.linalg.lstsq(X, tgt_sub, rcond=None)
+    M, _, _, _ = np.linalg.lstsq(X, tgt_sub[mask], rcond=None)
 
     pred = X @ M
-    mae = np.mean(np.abs(pred - tgt_sub))
-    rmse = np.sqrt(np.mean((pred - tgt_sub) ** 2))
-    per_ch_mae = [np.mean(np.abs(pred[:, c] - tgt_sub[:, c])) for c in range(3)]
+    mae = np.mean(np.abs(pred - tgt_sub[mask]))
+    rmse = np.sqrt(np.mean((pred - tgt_sub[mask]) ** 2))
+    per_ch_mae = [np.mean(np.abs(pred[:, c] - tgt_sub[mask, c])) for c in range(3)]
 
     # Report bias (black point offset)
     bias = M[0]  # first row = constant term coefficients
     print(f"  Chromaticity polynomial: {n_terms} terms (order={use_order}, with bias)")
     print(f"  Black point offset: R={bias[0]:+.4f} G={bias[1]:+.4f} B={bias[2]:+.4f}")
+    print(f"  Survivors: {mask.sum():,} / {n_initial:,} "
+          f"({mask.sum()/n_initial*100:.0f}%)")
 
     # Build LUT (indexed by RGB, polynomial applied in chromaticity space)
     print(f"  Building {lut_size}^3 LUT...", end="", flush=True)
@@ -302,7 +356,9 @@ def build_lut(src_all: np.ndarray, tgt_all: np.ndarray,
     info = {
         'mae': mae, 'rmse': rmse,
         'per_ch_mae': per_ch_mae,
-        'n_samples': len(src_sub), 'n_total': n,
+        'n_samples': mask.sum(), 'n_total': n,
+        'n_initial_sub': n_initial,
+        'pct_removed': (1 - mask.sum() / n_initial) * 100,
     }
     return lut, info
 
@@ -427,6 +483,12 @@ def main():
                         help='Show grouping without generating LUTs')
     parser.add_argument('--force', action='store_true',
                         help='Overwrite existing .cube files')
+    parser.add_argument('--sigma-clip', type=float, default=1.5,
+                        help='Sigma clipping threshold (default: 1.5)')
+    parser.add_argument('--clip-rounds', type=int, default=3,
+                        help='Number of sigma clipping iterations (default: 3)')
+    parser.add_argument('--min-survivors', type=float, default=10.0,
+                        help='Minimum survivor percentage floor (default: 10)')
 
     args = parser.parse_args()
     dir_path = Path(args.dir)
@@ -486,7 +548,10 @@ def main():
         suggestions = analyze_coverage(src_combined)
 
         # Build LUT
-        lut, info = build_lut(src_combined, tgt_combined, args.size)
+        lut, info = build_lut(src_combined, tgt_combined, args.size,
+                              sigma_clip=args.sigma_clip,
+                              clip_rounds=args.clip_rounds,
+                              min_survivor_pct=args.min_survivors)
 
         print(f"  Fit: MAE={info['mae']:.4f}  RMSE={info['rmse']:.4f}"
               f"  (R={info['per_ch_mae'][0]:.4f} G={info['per_ch_mae'][1]:.4f}"
@@ -505,11 +570,12 @@ def main():
 
     # Final summary
     print(f"\n{'='*60}")
-    print(f"{'Model':<25} {'Style':<18} {'Files':>5} {'MAE':>7} {'Status'}")
-    print(f"{'-'*25} {'-'*18} {'-'*5} {'-'*7} {'-'*8}")
+    print(f"{'Model':<25} {'Style':<18} {'Files':>5} {'MAE':>7} {'Clip%':>6} {'Status'}")
+    print(f"{'-'*25} {'-'*18} {'-'*5} {'-'*7} {'-'*6} {'-'*8}")
     for model, style, n_files, status, info in results:
         mae_str = f"{info['mae']:.4f}" if info else '-'
-        print(f"{model:<25} {style:<18} {n_files:>5} {mae_str:>7} {status}")
+        clip_str = f"{info['pct_removed']:.0f}%" if info.get('pct_removed') is not None else '-'
+        print(f"{model:<25} {style:<18} {n_files:>5} {mae_str:>7} {clip_str:>6} {status}")
     print(f"{'='*60}")
 
 
