@@ -31,6 +31,8 @@ public:
         int faces = 0;
         int namedFaces = 0;
         int persons = 0;
+        int collections = 0;
+        int collectionImages = 0;
     };
 
     struct FaceEntry {
@@ -40,9 +42,25 @@ public:
         int lrClusterId = 0;
     };
 
+    struct CollectionEntry {
+        int64_t lrId = 0;          // AgLibraryCollection.id_local
+        string name;
+        int64_t lrParentId = 0;    // 0 = root
+        int type = 0;              // 0=Regular, 1=Smart, 2=Group
+        string rules;              // JSON-converted smart criteria
+    };
+
+    struct CollectionImageEntry {
+        int64_t lrCollectionId = 0;
+        string photoId;            // filename_filesize (mapped via imageIdMap)
+        int position = 0;
+    };
+
     struct Result {
         vector<PhotoEntry> entries;
         vector<FaceEntry> faces;
+        vector<CollectionEntry> collections;
+        vector<CollectionImageEntry> collectionImages;
         Stats stats;
     };
 
@@ -79,12 +97,21 @@ public:
                     << " (named: " << result.stats.namedFaces
                     << ", persons: " << result.stats.persons << ")";
 
+        // Step 4: Load collections
+        result.collections = loadCollections(db);
+        result.collectionImages = loadCollectionImages(db, imageIdMap);
+        result.stats.collections = (int)result.collections.size();
+        result.stats.collectionImages = (int)result.collectionImages.size();
+        logNotice() << "[LrcatImport] Collections: " << result.stats.collections
+                    << " (" << result.stats.collectionImages << " photo associations)";
+
         sqlite3_close(db);
 
         logNotice() << "[LrcatImport] Done: total=" << result.stats.totalImages
                     << " imported=" << result.stats.imported
                     << " missing=" << result.stats.missingFile
-                    << " faces=" << result.stats.faces;
+                    << " faces=" << result.stats.faces
+                    << " collections=" << result.stats.collections;
         return result;
     }
 
@@ -313,6 +340,124 @@ private:
         sqlite3_finalize(stmt);
         stats.persons = (int)personNames.size();
         return result;
+    }
+
+    // --- Collection loading ---
+
+    // Load collections from AgLibraryCollection
+    static vector<CollectionEntry> loadCollections(sqlite3* db) {
+        vector<CollectionEntry> result;
+
+        const char* sql =
+            "SELECT id_local, name, parent, creationId "
+            "FROM AgLibraryCollection "
+            "WHERE systemOnly != 1.0 OR systemOnly IS NULL";
+
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            logWarning() << "[LrcatImport] Collection query failed: " << sqlite3_errmsg(db);
+            return result;
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            CollectionEntry entry;
+            entry.lrId = sqlite3_column_int64(stmt, 0);
+            const char* name = (const char*)sqlite3_column_text(stmt, 1);
+            entry.name = name ? name : "";
+
+            // parent is the LR collection id_local of the parent (NULL for root)
+            if (sqlite3_column_type(stmt, 2) != SQLITE_NULL) {
+                entry.lrParentId = sqlite3_column_int64(stmt, 2);
+            }
+
+            // Determine type from creationId
+            const char* creationId = (const char*)sqlite3_column_text(stmt, 3);
+            if (creationId) {
+                string cid(creationId);
+                if (cid.find("smart_collection") != string::npos) {
+                    entry.type = 1; // Smart
+                } else if (cid.find("group") != string::npos ||
+                           cid.find("collection_set") != string::npos) {
+                    entry.type = 2; // Group
+                }
+                // default: 0 = Regular
+            }
+
+            result.push_back(std::move(entry));
+        }
+        sqlite3_finalize(stmt);
+
+        // Load smart collection rules
+        loadSmartRules(db, result);
+
+        return result;
+    }
+
+    // Load collection-image associations from AgLibraryCollectionImage
+    static vector<CollectionImageEntry> loadCollectionImages(
+        sqlite3* db, const unordered_map<int64_t, string>& imageIdMap) {
+        vector<CollectionImageEntry> result;
+
+        const char* sql =
+            "SELECT collection, image, positionInCollection "
+            "FROM AgLibraryCollectionImage "
+            "ORDER BY collection, positionInCollection";
+
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            logWarning() << "[LrcatImport] CollectionImage query failed: " << sqlite3_errmsg(db);
+            return result;
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t collId = sqlite3_column_int64(stmt, 0);
+            int64_t imageId = sqlite3_column_int64(stmt, 1);
+            int position = sqlite3_column_int(stmt, 2);
+
+            auto it = imageIdMap.find(imageId);
+            if (it == imageIdMap.end()) continue;
+
+            CollectionImageEntry entry;
+            entry.lrCollectionId = collId;
+            entry.photoId = it->second;
+            entry.position = position;
+            result.push_back(std::move(entry));
+        }
+        sqlite3_finalize(stmt);
+        return result;
+    }
+
+    // Load smart collection rules from AgLibraryCollectionContent
+    static void loadSmartRules(sqlite3* db, vector<CollectionEntry>& collections) {
+        const char* sql =
+            "SELECT id_local, content "
+            "FROM AgLibraryCollectionContent "
+            "WHERE owningModule = 'ag.library.smart_collection'";
+
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            return; // not critical
+        }
+
+        // Build collectionId -> entry pointer map
+        unordered_map<int64_t, CollectionEntry*> collMap;
+        for (auto& c : collections) {
+            collMap[c.lrId] = &c;
+        }
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            int64_t collId = sqlite3_column_int64(stmt, 0);
+            const char* content = (const char*)sqlite3_column_text(stmt, 1);
+            if (!content) continue;
+
+            auto it = collMap.find(collId);
+            if (it == collMap.end()) continue;
+
+            // Store the raw Lua-format rules as-is for now
+            // (converting to JSON is deferred to when we implement smart evaluation)
+            it->second->rules = content;
+        }
+        sqlite3_finalize(stmt);
     }
 
     // --- Helper functions ---

@@ -6,6 +6,7 @@
 
 #include "Database.h"
 #include "PhotoEntry.h"
+#include "Collection.h"
 #include <vector>
 #include <unordered_set>
 #include <fstream>
@@ -15,7 +16,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 15;
+    static constexpr int SCHEMA_VERSION = 16;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -108,6 +109,7 @@ public:
 
             if (!createEmbeddingsTable()) return false;
             if (!createFaceTables()) return false;
+            if (!createCollectionTables()) return false;
 
             db_.setSchemaVersion(SCHEMA_VERSION);
             logNotice() << "[PhotoDatabase] Schema v" << SCHEMA_VERSION << " created";
@@ -346,8 +348,19 @@ public:
                     return false;
                 }
             }
+            version = 15;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v14 -> v15";
+        }
+
+        // v15 -> v16: add collections + collection_photos tables
+        if (version == 15) {
+            if (!createCollectionTables()) {
+                logError() << "[PhotoDatabase] Migration v15->v16 failed";
+                return false;
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v14 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v15 -> v" << SCHEMA_VERSION;
         }
 
         return true;
@@ -1217,6 +1230,131 @@ public:
         return vector<string>(idSet.begin(), idSet.end());
     }
 
+    // --- Collections ---
+
+    int insertCollection(const string& name, int parentId, int type,
+                         const string& rules = "", const string& sortType = "",
+                         const string& sortDir = "", int64_t createdAt = 0) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "INSERT INTO collections (name, parent_id, type, rules, sort_type, sort_direction, created_at) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)");
+        if (!stmt.valid()) return 0;
+        stmt.bind(1, name);
+        stmt.bind(2, parentId);
+        stmt.bind(3, type);
+        stmt.bind(4, rules);
+        stmt.bind(5, sortType);
+        stmt.bind(6, sortDir);
+        stmt.bind(7, createdAt);
+        if (!stmt.execute()) return 0;
+        return (int)sqlite3_last_insert_rowid(db_.rawDb());
+    }
+
+    bool insertCollectionPhoto(int collectionId, const string& photoId, int position = 0) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "INSERT OR IGNORE INTO collection_photos (collection_id, photo_id, position) "
+            "VALUES (?1, ?2, ?3)");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, collectionId);
+        stmt.bind(2, photoId);
+        stmt.bind(3, position);
+        return stmt.execute();
+    }
+
+    bool insertCollectionPhotos(int collectionId, const vector<pair<string, int>>& photos) {
+        if (photos.empty()) return true;
+        lock_guard<mutex> lock(db_.writeMutex());
+        db_.beginTransaction();
+        auto stmt = db_.prepare(
+            "INSERT OR IGNORE INTO collection_photos (collection_id, photo_id, position) "
+            "VALUES (?1, ?2, ?3)");
+        if (!stmt.valid()) { db_.rollback(); return false; }
+        for (const auto& [photoId, pos] : photos) {
+            stmt.bind(1, collectionId);
+            stmt.bind(2, photoId);
+            stmt.bind(3, pos);
+            stmt.execute();
+            stmt.reset();
+        }
+        db_.commit();
+        return true;
+    }
+
+    vector<Collection> loadCollections() {
+        vector<Collection> result;
+        auto stmt = db_.prepare(
+            "SELECT c.id, c.name, c.parent_id, c.type, c.rules, "
+            "c.sort_type, c.sort_direction, c.created_at, "
+            "COALESCE(cnt.photo_count, 0) "
+            "FROM collections c "
+            "LEFT JOIN ("
+            "  SELECT collection_id, COUNT(*) AS photo_count "
+            "  FROM collection_photos GROUP BY collection_id"
+            ") cnt ON c.id = cnt.collection_id "
+            "ORDER BY c.parent_id, c.name");
+        if (!stmt.valid()) return result;
+        while (stmt.step()) {
+            Collection col;
+            col.id = stmt.getInt(0);
+            col.name = stmt.getText(1);
+            col.parentId = stmt.getInt(2);
+            col.type = static_cast<Collection::Type>(stmt.getInt(3));
+            col.rules = stmt.getText(4);
+            col.sortType = stmt.getText(5);
+            col.sortDirection = stmt.getText(6);
+            col.createdAt = stmt.getInt64(7);
+            col.photoCount = stmt.getInt(8);
+            result.push_back(std::move(col));
+        }
+        return result;
+    }
+
+    vector<string> getCollectionPhotoIds(int collectionId) {
+        vector<string> result;
+        auto stmt = db_.prepare(
+            "SELECT photo_id FROM collection_photos "
+            "WHERE collection_id=?1 ORDER BY position");
+        if (!stmt.valid()) return result;
+        stmt.bind(1, collectionId);
+        while (stmt.step()) {
+            result.push_back(stmt.getText(0));
+        }
+        return result;
+    }
+
+    bool deleteCollection(int collectionId) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        db_.beginTransaction();
+        auto del1 = db_.prepare("DELETE FROM collection_photos WHERE collection_id=?1");
+        if (del1.valid()) { del1.bind(1, collectionId); del1.execute(); }
+        auto del2 = db_.prepare("DELETE FROM collections WHERE id=?1");
+        if (del2.valid()) { del2.bind(1, collectionId); del2.execute(); }
+        db_.commit();
+        return true;
+    }
+
+    bool addToCollection(int collectionId, const string& photoId) {
+        return insertCollectionPhoto(collectionId, photoId);
+    }
+
+    bool removeFromCollection(int collectionId, const string& photoId) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "DELETE FROM collection_photos WHERE collection_id=?1 AND photo_id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, collectionId);
+        stmt.bind(2, photoId);
+        return stmt.execute();
+    }
+
+    void clearCollections() {
+        lock_guard<mutex> lock(db_.writeMutex());
+        db_.exec("DELETE FROM collection_photos");
+        db_.exec("DELETE FROM collections");
+    }
+
     // --- JSON migration ---
 
     bool migrateFromJson(const string& jsonPath) {
@@ -1303,6 +1441,36 @@ private:
         if (!ok) return false;
 
         ok = db_.exec("CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id)");
+        return ok;
+    }
+
+    bool createCollectionTables() {
+        bool ok = db_.exec(
+            "CREATE TABLE IF NOT EXISTS collections ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  name TEXT NOT NULL,"
+            "  parent_id INTEGER DEFAULT 0,"
+            "  type INTEGER NOT NULL DEFAULT 0,"
+            "  rules TEXT DEFAULT '',"
+            "  sort_type TEXT DEFAULT '',"
+            "  sort_direction TEXT DEFAULT '',"
+            "  created_at INTEGER DEFAULT 0"
+            ")");
+        if (!ok) return false;
+
+        ok = db_.exec("CREATE INDEX IF NOT EXISTS idx_collections_parent ON collections(parent_id)");
+        if (!ok) return false;
+
+        ok = db_.exec(
+            "CREATE TABLE IF NOT EXISTS collection_photos ("
+            "  collection_id INTEGER NOT NULL,"
+            "  photo_id TEXT NOT NULL,"
+            "  position INTEGER DEFAULT 0,"
+            "  PRIMARY KEY (collection_id, photo_id)"
+            ")");
+        if (!ok) return false;
+
+        ok = db_.exec("CREATE INDEX IF NOT EXISTS idx_collection_photos_photo ON collection_photos(photo_id)");
         return ok;
     }
 
