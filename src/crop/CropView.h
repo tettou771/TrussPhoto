@@ -303,8 +303,11 @@ public:
         updateBoundingBox();
         bool hasPersp = (perspV_ != 0 || perspH_ != 0 || shear_ != 0);
 
-        // Fit bounding box to available area
-        float fitScale = min(availW / bbW_, availH / bbH_);
+        // Fit using rotation-only BB (perspective doesn't shrink the view)
+        float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
+        float rotBBW = (float)fboW_ * cosA + (float)fboH_ * sinA;
+        float rotBBH = (float)fboW_ * sinA + (float)fboH_ * cosA;
+        float fitScale = min(availW / rotBBW, availH / rotBBH);
         float bbDrawW = bbW_ * fitScale;
         float bbDrawH = bbH_ * fitScale;
         float imgDrawW = (float)fboW_ * fitScale;
@@ -998,7 +1001,12 @@ private:
         float panelW = 220, padding = 40;
         float availW = getWidth() - panelW - padding * 2;
         float availH = getHeight() - padding * 2;
-        float fitScale = min(availW / bbW_, availH / bbH_);
+        // Use rotation-only BB for fitScale (matches draw())
+        float totalRot = rotation90_ * TAU / 4 + angle_;
+        float cosA = fabs(cos(totalRot)), sinA = fabs(sin(totalRot));
+        float rotBBW = (float)fboW_ * cosA + (float)fboH_ * sinA;
+        float rotBBH = (float)fboW_ * sinA + (float)fboH_ * cosA;
+        float fitScale = min(availW / rotBBW, availH / rotBBH);
         float bw = bbW_ * fitScale, bh = bbH_ * fitScale;
         float cx = padding + availW / 2, cy = padding + availH / 2;
         return {cx - bw / 2, cy - bh / 2, bw, bh};
