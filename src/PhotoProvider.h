@@ -868,6 +868,33 @@ public:
         return db_.getCollectionPhotoIds(collectionId);
     }
 
+    int createCollection(const string& name, int parentId = 0) {
+        int id = db_.insertCollection(name, parentId, Collection::Regular);
+        loadCollections();
+        return id;
+    }
+
+    bool renameCollection(int id, const string& newName) {
+        bool ok = db_.renameCollection(id, newName);
+        if (ok) loadCollections();
+        return ok;
+    }
+
+    bool deleteCollection(int id) {
+        bool ok = db_.deleteCollection(id);
+        if (ok) loadCollections();
+        return ok;
+    }
+
+    bool addToCollection(int collectionId, const vector<string>& photoIds) {
+        vector<pair<string, int>> photos;
+        for (int i = 0; i < (int)photoIds.size(); i++)
+            photos.push_back({photoIds[i], i});
+        bool ok = db_.insertCollectionPhotos(collectionId, photos);
+        if (ok) loadCollections();
+        return ok;
+    }
+
     // Import collections from LrcatImporter results into DB
     void importCollections(const vector<LrcatImporter::CollectionEntry>& entries,
                            const vector<LrcatImporter::CollectionImageEntry>& images) {

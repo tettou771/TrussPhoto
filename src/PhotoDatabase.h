@@ -1324,6 +1324,15 @@ public:
         return result;
     }
 
+    bool renameCollection(int id, const string& newName) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE collections SET name=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, newName);
+        stmt.bind(2, id);
+        return stmt.execute();
+    }
+
     bool deleteCollection(int collectionId) {
         lock_guard<mutex> lock(db_.writeMutex());
         db_.beginTransaction();

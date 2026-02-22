@@ -6,6 +6,7 @@
 
 #include <TrussC.h>
 #include "Collection.h"
+#include "ContextMenu.h"
 #include "FolderTree.h"  // for loadJapaneseFont, PlainScrollContainer
 using namespace std;
 using namespace tc;
@@ -25,6 +26,7 @@ public:
     bool hasChildren = false;
     bool isHeader = false;
     bool selected = false;
+    bool dropHighlight = false;
     Collection::Type collType = Collection::Regular;
 
     Font* font = nullptr;
@@ -32,6 +34,7 @@ public:
 
     function<void()> onClick;
     function<void()> onToggle;
+    function<void(int collectionId)> onRightClick;
 
     CollectionRow() {
         enableEvents();
@@ -45,27 +48,34 @@ public:
         float w = getWidth();
         float h = getHeight();
 
+        // Drop target highlight
+        if (dropHighlight) {
+            setColor(0.2f, 0.35f, 0.55f);
+            fill();
+            drawRect(0, 0, w, h);
+        }
+
         if (isHeader) {
-            if (selected) {
+            if (selected && !dropHighlight) {
                 setColor(0.2f, 0.25f, 0.35f);
                 fill();
                 drawRect(0, 0, w, h);
             }
             setColor(selected ? Color(0.9f, 0.9f, 0.95f) : Color(0.65f, 0.65f, 0.7f));
-            if (font) font->drawString("All Photos", 14, h * 0.5f, Direction::Left, Direction::Center);
+            if (font) font->drawString("All Photos", 10, h * 0.5f, Direction::Left, Direction::Center);
 
             if (fontSmall && photoCount > 0) {
                 setColor(0.45f, 0.45f, 0.5f);
                 string cnt = to_string(photoCount);
-                fontSmall->drawString(cnt, w - 16, h * 0.5f, Direction::Right, Direction::Center);
+                fontSmall->drawString(cnt, w - 12, h * 0.5f, Direction::Right, Direction::Center);
             }
             return;
         }
 
-        float indent = 16.0f * depth + 14.0f;
+        float indent = 14.0f * depth + 10.0f;
 
         // Selection highlight
-        if (selected) {
+        if (selected && !dropHighlight) {
             setColor(0.2f, 0.25f, 0.35f);
             fill();
             drawRect(0, 0, w, h);
@@ -75,19 +85,19 @@ public:
         if (hasChildren) {
             setColor(0.6f, 0.6f, 0.65f);
             fill();
-            float cx = indent - 8;
+            float cx = indent - 7;
             float cy = h * 0.5f;
             if (expanded) {
-                drawTriangle(cx - 3, cy - 1.5f, cx + 3, cy - 1.5f, cx, cy + 3);
+                drawTriangle(cx - 2.5f, cy - 1.5f, cx + 2.5f, cy - 1.5f, cx, cy + 2.5f);
             } else {
-                drawTriangle(cx - 1.5f, cy - 3, cx + 3, cy, cx - 1.5f, cy + 3);
+                drawTriangle(cx - 1.5f, cy - 2.5f, cx + 2.5f, cy, cx - 1.5f, cy + 2.5f);
             }
         }
 
         // Type icon indicator (small colored dot)
         float dotX = indent + 2;
         float dotY = h * 0.5f;
-        float dotR = 3.0f;
+        float dotR = 2.5f;
         fill();
         if (collType == Collection::Smart) {
             setColor(0.55f, 0.45f, 0.7f); // purple dot for smart
@@ -99,7 +109,7 @@ public:
         drawCircle(dotX, dotY, dotR);
 
         // Collection name
-        float nameX = indent + 12;
+        float nameX = indent + 10;
         if (selected) {
             setColor(0.9f, 0.9f, 0.95f);
         } else {
@@ -108,7 +118,7 @@ public:
 
         if (font) {
             string name = displayName;
-            float maxNameW = w - nameX - 50;
+            float maxNameW = w - nameX - 40;
             if (font->getWidth(name) > maxNameW && name.length() > 5) {
                 while (name.length() > 3 && font->getWidth(name + "...") > maxNameW) {
                     name.pop_back();
@@ -122,23 +132,24 @@ public:
         if (collType != Collection::Group && photoCount > 0 && fontSmall) {
             setColor(0.45f, 0.45f, 0.5f);
             string cnt = to_string(photoCount);
-            fontSmall->drawString(cnt, w - 16, h * 0.5f, Direction::Right, Direction::Center);
-        }
-
-        // Smart label
-        if (collType == Collection::Smart && fontSmall) {
-            setColor(0.5f, 0.4f, 0.6f);
+            fontSmall->drawString(cnt, w - 12, h * 0.5f, Direction::Right, Direction::Center);
         }
     }
 
 protected:
     bool onMousePress(Vec2 local, int button) override {
+        // Right-click: context menu
+        if (button == 1) {
+            if (onRightClick) onRightClick(collectionId);
+            return true;
+        }
+
         if (button != 0) return false;
 
         // Toggle expand/collapse for groups
         if (!isHeader && hasChildren) {
-            float indent = 16.0f * depth + 14.0f;
-            if (local.x >= indent - 16 && local.x < indent) {
+            float indent = 14.0f * depth + 10.0f;
+            if (local.x >= indent - 14 && local.x < indent) {
                 if (onToggle) onToggle();
                 return true;
             }
@@ -159,6 +170,18 @@ public:
     // Callback when a collection is selected (0 = show all)
     function<void(int collectionId)> onCollectionSelected;
 
+    // Right-click context menu request (tcApp handles display)
+    Event<ContextMenu::Ptr> contextMenuRequested;
+
+    // Callbacks for rename/create/delete/add photos (wired by tcApp)
+    function<void(int collectionId, const string& currentName)> onRenameRequested;
+    function<void(int parentId)> onCreateRequested;
+    function<void(int collectionId, const string& name)> onDeleteRequested;
+    function<void(int collectionId)> onAddSelectedPhotos;
+
+    // Query for whether grid has a selection (set by tcApp)
+    function<bool()> hasSelectedPhotos;
+
     CollectionTree() {
         scrollContainer_ = make_shared<PlainScrollContainer>();
         content_ = make_shared<RectNode>();
@@ -167,8 +190,8 @@ public:
         scrollBar_ = make_shared<ScrollBar>(scrollContainer_.get(), ScrollBar::Vertical);
         scrollContainer_->addChild(scrollBar_);
 
-        loadJapaneseFont(font_, 14);
-        loadJapaneseFont(fontSmall_, 12);
+        loadJapaneseFont(font_, 12);
+        loadJapaneseFont(fontSmall_, 10);
     }
 
     void setup() override {
@@ -228,6 +251,43 @@ public:
         scrollBar_->updateFromContainer();
     }
 
+    // --- Drop target support ---
+
+    // Returns the collection ID at the given local position (for drop target).
+    // Only returns Regular collections (not Smart/Group).
+    int getDropTargetId(Vec2 localPos) const {
+        float scrollY = scrollContainer_->getScrollY();
+        for (const auto& row : rows_) {
+            if (row->isHeader) continue;
+            if (row->collType != Collection::Regular) continue;
+            if (!row->getActive()) continue;
+
+            // Row Y is relative to content; adjust for scroll
+            float rowY = row->getY() + scrollY;
+            float rowH = row->getHeight();
+            if (localPos.y >= rowY && localPos.y < rowY + rowH) {
+                return row->collectionId;
+            }
+        }
+        return 0;
+    }
+
+    void setDropHighlight(int collectionId) {
+        bool changed = false;
+        for (auto& row : rows_) {
+            bool hl = (row->collectionId == collectionId && collectionId > 0 && !row->isHeader);
+            if (row->dropHighlight != hl) {
+                row->dropHighlight = hl;
+                changed = true;
+            }
+        }
+        if (changed) redraw();
+    }
+
+    void clearDropHighlight() {
+        setDropHighlight(0);
+    }
+
 private:
     struct CollectionNode {
         Collection collection;
@@ -251,8 +311,8 @@ private:
     int totalPhotoCount_ = 0;
     bool needsRebuildRows_ = false;
 
-    float rowHeight_ = 24.0f;
-    float headerHeight_ = 30.0f;
+    float rowHeight_ = 20.0f;
+    float headerHeight_ = 24.0f;
 
     bool isNodeVisible(const CollectionNode& node) const {
         const CollectionNode* p = node.parent;
@@ -322,53 +382,69 @@ private:
             if (onCollectionSelected) onCollectionSelected(0);
             updateSelection();
         };
+        header->onRightClick = [this](int) {
+            buildHeaderContextMenu();
+        };
         rows_.push_back(header);
         content_->addChild(header);
         y += headerHeight_;
 
-        // Collection rows
-        for (auto& node : nodes_) {
-            if (!isNodeVisible(node)) continue;
-
-            auto row = make_shared<CollectionRow>();
-            row->collectionId = node.collection.id;
-            row->displayName = node.collection.name;
-            row->photoCount = node.collection.photoCount;
-            row->depth = node.depth;
-            row->expanded = node.expanded;
-            row->hasChildren = !node.children.empty();
-            row->selected = (selectedId_ == node.collection.id);
-            row->collType = node.collection.type;
-            row->font = &font_;
-            row->fontSmall = &fontSmall_;
-            row->setRect(0, y, w, rowHeight_);
-
-            CollectionNode* nodePtr = &node;
-            row->onClick = [this, nodePtr]() {
-                int id = nodePtr->collection.id;
-                if (selectedId_ == id) {
-                    selectedId_ = 0;
-                    if (onCollectionSelected) onCollectionSelected(0);
-                } else {
-                    selectedId_ = id;
-                    if (onCollectionSelected) onCollectionSelected(id);
-                }
-                updateSelection();
-            };
-
-            row->onToggle = [this, nodePtr]() {
-                nodePtr->expanded = !nodePtr->expanded;
-                needsRebuildRows_ = true;
-                redraw();
-            };
-
-            rows_.push_back(row);
-            content_->addChild(row);
-            y += rowHeight_;
+        // DFS traversal — children appear directly under their parent
+        for (auto* root : rootNodes_) {
+            addNodeRowDFS(root, w, y);
         }
 
         content_->setSize(w, y + 10);
         scrollContainer_->updateScrollBounds();
+    }
+
+    void addNodeRowDFS(CollectionNode* node, float w, float& y) {
+        if (!isNodeVisible(*node)) return;
+
+        auto row = make_shared<CollectionRow>();
+        row->collectionId = node->collection.id;
+        row->displayName = node->collection.name;
+        row->photoCount = node->collection.photoCount;
+        row->depth = node->depth;
+        row->expanded = node->expanded;
+        row->hasChildren = !node->children.empty();
+        row->selected = (selectedId_ == node->collection.id);
+        row->collType = node->collection.type;
+        row->font = &font_;
+        row->fontSmall = &fontSmall_;
+        row->setRect(0, y, w, rowHeight_);
+
+        CollectionNode* nodePtr = node;
+        row->onClick = [this, nodePtr]() {
+            int id = nodePtr->collection.id;
+            if (selectedId_ == id) {
+                selectedId_ = 0;
+                if (onCollectionSelected) onCollectionSelected(0);
+            } else {
+                selectedId_ = id;
+                if (onCollectionSelected) onCollectionSelected(id);
+            }
+            updateSelection();
+        };
+
+        row->onToggle = [this, nodePtr]() {
+            nodePtr->expanded = !nodePtr->expanded;
+            needsRebuildRows_ = true;
+            redraw();
+        };
+
+        row->onRightClick = [this, nodePtr](int) {
+            buildRowContextMenu(nodePtr);
+        };
+
+        rows_.push_back(row);
+        content_->addChild(row);
+        y += rowHeight_;
+
+        // Recurse into children (DFS)
+        for (auto* child : node->children) {
+            addNodeRowDFS(child, w, y);
+        }
     }
 
     void updateSelection() {
@@ -380,5 +456,48 @@ private:
             }
         }
         redraw();
+    }
+
+    // --- Context menu builders ---
+
+    void buildHeaderContextMenu() {
+        auto menu = make_shared<ContextMenu>();
+        menu->addChild(make_shared<MenuItem>("New Collection", [this]() {
+            if (onCreateRequested) onCreateRequested(0);
+        }));
+        contextMenuRequested.notify(menu);
+    }
+
+    void buildRowContextMenu(CollectionNode* node) {
+        auto menu = make_shared<ContextMenu>();
+        int id = node->collection.id;
+        string name = node->collection.name;
+        auto type = node->collection.type;
+
+        // "Add Selected Photos" for Regular collections when grid has selection
+        if (type == Collection::Regular && hasSelectedPhotos && hasSelectedPhotos()) {
+            menu->addChild(make_shared<MenuItem>("Add Selected Photos", [this, id]() {
+                if (onAddSelectedPhotos) onAddSelectedPhotos(id);
+            }));
+            menu->addChild(make_shared<MenuSeparator>());
+        }
+
+        menu->addChild(make_shared<MenuItem>("Rename", [this, id, name]() {
+            if (onRenameRequested) onRenameRequested(id, name);
+        }));
+
+        menu->addChild(make_shared<MenuItem>("Delete", [this, id, name]() {
+            if (onDeleteRequested) onDeleteRequested(id, name);
+        }));
+
+        // Groups can have child collections created inside them
+        if (type == Collection::Group) {
+            menu->addChild(make_shared<MenuSeparator>());
+            menu->addChild(make_shared<MenuItem>("New Collection", [this, id]() {
+                if (onCreateRequested) onCreateRequested(id);
+            }));
+        }
+
+        contextMenuRequested.notify(menu);
     }
 };
