@@ -5,7 +5,7 @@
 // =============================================================================
 
 #include "ViewContainer.h"
-#include "PhotoGrid.h"
+#include "ui/PhotoGrid.h"
 
 using namespace std;
 using namespace tc;

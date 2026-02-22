@@ -8,9 +8,9 @@
 
 #include <TrussC.h>
 #include "PhotoProvider.h"
-#include "AsyncImageLoader.h"
+#include "pipeline/AsyncImageLoader.h"
 #include "ViewContainer.h"
-#include "FolderTree.h"  // for loadJapaneseFont
+#include "ui/FolderTree.h"  // for loadJapaneseFont
 #include <ctime>
 
 using namespace std;
