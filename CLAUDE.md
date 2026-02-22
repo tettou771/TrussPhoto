@@ -55,16 +55,57 @@ src/
 ├── AppConfig.h         # コマンドライン引数パース（--server, --port, --catalog, --raw-dir）
 ├── AppPaths.h          # カタログパス管理 + レガシーからの自動マイグレーション
 ├── CatalogSettings.h   # カタログ設定（catalog.json） + AppBootstrap（app_config.json）
+├── Constants.h         # 共通定数
 ├── ServerConfig.h      # APIキー生成・永続化（サーバモード用）
 ├── PhotoServer.h       # Crow HTTPサーバ（PhotoProvider をREST公開）
 ├── PhotoEntry.h        # PhotoEntry構造体 + JSON シリアライズ
 ├── Database.h          # SQLite3 薄い RAII ラッパー
 ├── PhotoDatabase.h     # photos テーブル CRUD、スキーマ管理、JSON マイグレーション
 ├── PhotoProvider.h     # 写真管理の中核（ローカル + サーバ抽象化、SQLite永続化）
-├── PhotoGrid.h         # スクロール可能なサムネイルグリッドUI
-├── PhotoItem.h         # 個々の写真アイテム（サムネ + ラベル）
-├── AsyncImageLoader.h  # バックグラウンドサムネイルローダー
-└── UploadQueue.h       # バックグラウンドアップロード（リトライ付き）
+├── UploadQueue.h       # バックグラウンドアップロード（リトライ付き）
+├── views/
+│   ├── ViewContainer.h     # ビュー基底クラス
+│   ├── ViewContext.h       # ビュー間共有コンテキスト
+│   ├── ViewManager.h       # ビュー切替管理
+│   ├── SingleView.h        # フルサイズ画像ビューア + RAW現像パイプライン
+│   ├── GridView.h          # グリッド表示（PhotoGrid ラッパー）
+│   ├── MapView.h           # 地図ビュー（OpenStreetMap + GPSピン）
+│   ├── PeopleView.h        # 人物ビュー（顔クラスタリング）
+│   └── RelatedView.h       # 関連写真ビュー（類似度グラフ）
+├── ui/
+│   ├── PhotoGrid.h         # スクロール可能なサムネイルグリッド
+│   ├── PhotoItem.h         # 個々の写真アイテム（サムネ + ラベル）
+│   ├── PhotoStrip.h        # 水平スクロール写真ストリップ
+│   ├── RecyclerGrid.h      # 仮想化スクロールグリッド基底
+│   ├── FolderTree.h        # フォルダツリー + 日本語フォント
+│   ├── MetadataPanel.h     # メタデータパネル（EXIF表示）
+│   ├── DevelopPanel.h      # 現像パラメータパネル
+│   ├── DevelopSlider.h     # 現像スライダーウィジェット
+│   ├── ExportDialog.h      # JPEG書き出しダイアログ
+│   ├── VideoSeekBar.h      # 動画シークバー
+│   ├── ContextMenu.h       # 右クリックメニュー
+│   ├── PaneToggle.h        # サイドバー開閉トグル
+│   └── SearchBar.h         # 検索バー
+├── pipeline/
+│   ├── DevelopShader.h     # GPU現像シェーダー管理
+│   ├── LensCorrector.h    # レンズ補正（自前実装、lensfun XML使用）
+│   ├── CameraProfileManager.h  # カメラプロファイル（.cube）管理
+│   ├── GuidedFilter.h     # ガイデッドフィルタ（CPU）
+│   ├── GuidedFilterMPS.mm # ガイデッドフィルタ（Metal Performance Shaders）
+│   ├── AsyncImageLoader.h # バックグラウンドサムネイルローダー
+│   ├── SmartPreview.h     # スマートプレビュー生成（JPEG XL）
+│   ├── PhotoExporter.h    # JPEG書き出しエンジン
+│   ├── PhotoExporter.mm   # macOS固有の書き出し処理
+│   └── LrcatImporter.h   # Lightroom カタログインポート
+├── ai/
+│   ├── ClipEmbedder.h         # CLIP画像エンベディング
+│   ├── ClipTextEncoder.h      # CLIPテキストエンコーダ
+│   ├── FaceDetector.h         # 顔検出（InsightFace）
+│   ├── FaceRecognizer.h       # 顔認識（ArcFace）
+│   ├── OnnxRunner.h           # ONNX Runtime ラッパー
+│   └── SentencePieceTokenizer.h  # SentencePiece トークナイザ
+├── crop/                  # クロップ編集
+└── shaders/               # GLSLシェーダー
 ```
 
 ### データフロー
