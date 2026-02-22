@@ -978,6 +978,10 @@ private:
             tmpEntry.userPerspH = perspH_;
             tmpEntry.userShear = shear_;
 
+            auto [bbW, bbH] = tmpEntry.computeBB(fboW_, fboH_);
+            float totalRot = tmpEntry.totalRotation();
+            float cosR = cos(-totalRot), sinR = sin(-totalRot);
+
             auto checkCorners = [&]() -> float {
                 // Returns max overshoot (>0 means out of bounds)
                 float maxOver = 0;
@@ -988,10 +992,17 @@ private:
                     {cropX_, cropY_ + cropH_}
                 };
                 for (auto& c : corners) {
-                    auto [u, v] = tmpEntry.getCropUV(
-                        (c[0] - cropX_) / cropW_,
-                        (c[1] - cropY_) / cropH_,
-                        fboW_, fboH_);
+                    // BB-norm → BB pixel (centered)
+                    float dx = (c[0] - 0.5f) * bbW;
+                    float dy = (c[1] - 0.5f) * bbH;
+                    // Inverse rotation → image pixel
+                    float ix = dx * cosR - dy * sinR;
+                    float iy = dx * sinR + dy * cosR;
+                    // Image pixel → warped UV → source UV
+                    float wu = ix / fboW_ + 0.5f;
+                    float wv = iy / fboH_ + 0.5f;
+                    auto [u, v] = tmpEntry.inverseWarp(wu, wv);
+
                     maxOver = max(maxOver, -u);
                     maxOver = max(maxOver, u - 1.0f);
                     maxOver = max(maxOver, -v);
@@ -1000,22 +1011,47 @@ private:
                 return maxOver;
             };
 
+            cropX_ = clamp(cropX_, 0.0f, 1.0f - cropW_);
+            cropY_ = clamp(cropY_, 0.0f, 1.0f - cropH_);
+
             float over = checkCorners();
             if (over > 0) {
-                // Binary search for maximum crop scale that fits
-                float lo = 0.02f, hi = 1.0f;
+                // Phase 1: Position-only adjustment (move toward BB center)
+                float origX = cropX_, origY = cropY_;
+                float targetX = clamp(0.5f - cropW_ / 2, 0.0f, 1.0f - cropW_);
+                float targetY = clamp(0.5f - cropH_ / 2, 0.0f, 1.0f - cropH_);
+
+                if (fabs(origX - targetX) > 0.0001f || fabs(origY - targetY) > 0.0001f) {
+                    float lo = 0.0f, hi = 1.0f;
+                    for (int iter = 0; iter < 16; iter++) {
+                        float mid = (lo + hi) / 2;
+                        cropX_ = origX + (targetX - origX) * mid;
+                        cropY_ = origY + (targetY - origY) * mid;
+                        if (checkCorners() > 0.001f) {
+                            lo = mid;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    cropX_ = origX + (targetX - origX) * hi;
+                    cropY_ = origY + (targetY - origY) * hi;
+                }
+            }
+
+            // Phase 2: If still out of bounds (crop too large), shrink uniformly
+            over = checkCorners();
+            if (over > 0) {
                 float cx = cropX_ + cropW_ / 2;
                 float cy = cropY_ + cropH_ / 2;
                 float origW = cropW_, origH = cropH_;
 
+                float lo = 0.02f, hi = 1.0f;
                 for (int iter = 0; iter < 16; iter++) {
                     float mid = (lo + hi) / 2;
                     cropW_ = origW * mid;
                     cropH_ = origH * mid;
-                    cropX_ = cx - cropW_ / 2;
-                    cropY_ = cy - cropH_ / 2;
-                    cropX_ = clamp(cropX_, 0.0f, 1.0f - cropW_);
-                    cropY_ = clamp(cropY_, 0.0f, 1.0f - cropH_);
+                    cropX_ = clamp(cx - cropW_ / 2, 0.0f, 1.0f - cropW_);
+                    cropY_ = clamp(cy - cropH_ / 2, 0.0f, 1.0f - cropH_);
                     if (checkCorners() > 0.001f) {
                         hi = mid;
                     } else {
@@ -1024,12 +1060,9 @@ private:
                 }
                 cropW_ = origW * lo;
                 cropH_ = origH * lo;
-                cropX_ = cx - cropW_ / 2;
-                cropY_ = cy - cropH_ / 2;
+                cropX_ = clamp(cx - cropW_ / 2, 0.0f, 1.0f - cropW_);
+                cropY_ = clamp(cy - cropH_ / 2, 0.0f, 1.0f - cropH_);
             }
-
-            cropX_ = clamp(cropX_, 0.0f, 1.0f - cropW_);
-            cropY_ = clamp(cropY_, 0.0f, 1.0f - cropH_);
             return;
         }
 
