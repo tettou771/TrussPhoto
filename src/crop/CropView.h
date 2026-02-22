@@ -115,6 +115,7 @@ public:
     void enterCrop() {
         if (!singleView_ || !singleView_->hasFbo()) return;
         if (!ctx_) return;
+        initRotateCursor();
 
         // Borrow FBO handles
         fboView_ = singleView_->fboView();
@@ -245,7 +246,7 @@ public:
             float margin = 60;
             if (pos.x >= bbRect_.x - margin && pos.x <= bbRect_.x + bbRect_.w + margin &&
                 pos.y >= bbRect_.y - margin && pos.y <= bbRect_.y + bbRect_.h + margin)
-                setCursor(Cursor::Crosshair);
+                setCursor(Cursor::Rotate);
             else
                 setCursor(Cursor::Default);
         }
@@ -1322,7 +1323,7 @@ private:
     void updateCursorForDrag() {
         switch (dragMode_) {
             case DragMode::Move:   setCursor(Cursor::ResizeAll); break;
-            case DragMode::Rotate: setCursor(Cursor::Crosshair); break;
+            case DragMode::Rotate: setCursor(Cursor::Rotate); break;
             case DragMode::TL:     setCursor(Cursor::ResizeNWSE); break;
             case DragMode::BR:     setCursor(Cursor::ResizeNWSE); break;
             case DragMode::TR:     setCursor(Cursor::ResizeNESW); break;
@@ -1333,6 +1334,104 @@ private:
             case DragMode::R:      setCursor(Cursor::ResizeEW); break;
             default:               setCursor(Cursor::Default); break;
         }
+    }
+
+    // Generate and register a circular-arrow rotation cursor icon
+    static void initRotateCursor() {
+        static bool done = false;
+        if (done) return;
+        done = true;
+
+        constexpr int S = 32;
+        static unsigned char pixels[S * S * 4];
+        memset(pixels, 0, sizeof(pixels));
+
+        float cx = S * 0.5f, cy = S * 0.5f;
+        float R = 7.0f;
+
+        // Arc with gap at top-right (~1 o'clock)
+        float gapAngle = -TAU * 0.15f;   // gap center at ~-54°
+        float gapHalf = TAU * 0.08f;     // ~29° each side
+
+        // Arrowhead at CW end of gap
+        float cwEnd = gapAngle + gapHalf;
+        float tipAngle = cwEnd - TAU * 0.03f;
+        float baseAngle = cwEnd + TAU * 0.045f;
+        float arrowW = 3.0f;
+
+        float tipX = cx + R * cos(tipAngle);
+        float tipY = cy + R * sin(tipAngle);
+        float boX = cx + (R + arrowW) * cos(baseAngle);
+        float boY = cy + (R + arrowW) * sin(baseAngle);
+        float biX = cx + (R - arrowW) * cos(baseAngle);
+        float biY = cy + (R - arrowW) * sin(baseAngle);
+
+        // Expanded triangle for outline
+        float tcx = (tipX + boX + biX) / 3;
+        float tcy = (tipY + boY + biY) / 3;
+        auto expandPt = [](float px, float py, float cx, float cy, float amt) {
+            float dx = px - cx, dy = py - cy;
+            float len = sqrt(dx * dx + dy * dy);
+            if (len < 0.001f) return make_pair(px, py);
+            return make_pair(px + dx / len * amt, py + dy / len * amt);
+        };
+        auto [etX, etY] = expandPt(tipX, tipY, tcx, tcy, 1.0f);
+        auto [eoX, eoY] = expandPt(boX, boY, tcx, tcy, 1.0f);
+        auto [eiX, eiY] = expandPt(biX, biY, tcx, tcy, 1.0f);
+
+        auto inTri = [](float px, float py,
+                        float x0, float y0, float x1, float y1, float x2, float y2) {
+            float d1 = (px - x1) * (y0 - y1) - (x0 - x1) * (py - y1);
+            float d2 = (px - x2) * (y1 - y2) - (x1 - x2) * (py - y2);
+            float d3 = (px - x0) * (y2 - y0) - (x2 - x0) * (py - y0);
+            return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
+        };
+
+        constexpr int SS = 4;
+        constexpr float invSS2 = 1.0f / (SS * SS);
+
+        for (int y = 0; y < S; y++) {
+            for (int x = 0; x < S; x++) {
+                float fillC = 0, outC = 0;
+
+                for (int sj = 0; sj < SS; sj++) {
+                    for (int si = 0; si < SS; si++) {
+                        float px = x + (si + 0.5f) / SS;
+                        float py = y + (sj + 0.5f) / SS;
+                        float dx = px - cx, dy = py - cy;
+                        float d = sqrt(dx * dx + dy * dy);
+                        float a = atan2(dy, dx);
+
+                        float rel = a - gapAngle;
+                        while (rel > (float)(TAU / 2)) rel -= (float)TAU;
+                        while (rel < -(float)(TAU / 2)) rel += (float)TAU;
+                        bool arc = fabs(rel) >= gapHalf;
+
+                        bool fill = (arc && fabs(d - R) <= 1.2f) ||
+                                    inTri(px, py, tipX, tipY, boX, boY, biX, biY);
+                        bool out  = (arc && fabs(d - R) <= 2.2f) ||
+                                    inTri(px, py, etX, etY, eoX, eoY, eiX, eiY);
+
+                        if (fill) fillC++;
+                        if (out) outC++;
+                    }
+                }
+
+                float fA = fillC * invSS2;
+                float oA = outC * invSS2;
+                int idx = (y * S + x) * 4;
+
+                if (fA > 0.01f) {
+                    pixels[idx] = 255; pixels[idx + 1] = 255;
+                    pixels[idx + 2] = 255; pixels[idx + 3] = (uint8_t)(fA * 255);
+                } else if (oA > 0.01f) {
+                    pixels[idx] = 30; pixels[idx + 1] = 30;
+                    pixels[idx + 2] = 30; pixels[idx + 3] = (uint8_t)(oA * 255);
+                }
+            }
+        }
+
+        bindCursorImage(Cursor::Rotate, S, S, pixels, S / 2, S / 2);
     }
 
     // Get target aspect ratio in BB-normalized space (crop w/h in 0-1 coords)
