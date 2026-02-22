@@ -72,17 +72,20 @@ public:
             drawRect(0, 0, w, h);
         }
 
-        // Check mark for selected item
+        // Check mark for selected item (draw two lines: ✓)
+        float cy = h / 2;
         if (selected) {
             float brightness = isMouseOver() ? 1.0f : 0.85f;
             setColor(brightness, brightness, brightness);
-            if (font_) font_->drawString("\xE2\x9C\x93", 6, h / 2, Left, Center);  // UTF-8 checkmark
+            noFill();
+            drawLine(5, cy, 8, cy + 3);
+            drawLine(8, cy + 3, 14, cy - 4);
         }
 
         // Label
         float brightness = isMouseOver() ? 1.0f : 0.85f;
         setColor(brightness, brightness, brightness);
-        if (font_) font_->drawString(label_, checkWidth_, h / 2, Left, Center);
+        if (font_) font_->drawString(label_, checkWidth_, cy + 2, Left, Center);
     }
 
 protected:
@@ -229,11 +232,13 @@ public:
 
         // Label
         setColor(0.8f, 0.8f, 0.85f);
-        if (font_) font_->drawString(selectedLabel_, 12, h / 2, Left, Center);
+        if (font_) font_->drawString(selectedLabel_, 12, h / 2 + 2, Left, Center);
 
-        // Down arrow
+        // Down arrow triangle (▾)
         setColor(0.5f, 0.5f, 0.55f);
-        if (font_) font_->drawString("\xE2\x96\xBE", w - 16, h / 2, Center, Center);  // ▾
+        fill();
+        float ax = w - 16, ay = h / 2;
+        drawTriangle(ax - 4, ay - 2, ax + 4, ay - 2, ax, ay + 3);
     }
 
 protected:

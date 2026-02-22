@@ -195,7 +195,7 @@ public:
         drawRect(0, 0, w, h);
 
         setColor(isAccent_ ? Color(0.95f, 0.95f, 1.0f) : Color(0.7f, 0.7f, 0.75f));
-        if (font_) font_->drawString(label_, w / 2, h / 2, Center, Center);
+        if (font_) font_->drawString(label_, w / 2, h / 2 + 2, Center, Center);
     }
 
 protected:
@@ -470,14 +470,16 @@ public:
         fill();
         drawRect(0, 0, btnW, h);
         setColor(0.7f, 0.7f, 0.75f);
-        if (font_) font_->drawString("\xE2\x86\xBA 90\xC2\xB0", btnW / 2, h / 2, Center, Center);
+        drawRotateIcon(btnW / 2 - 18, h / 2, false);  // CCW
+        if (font_) font_->drawString("90\xC2\xB0", btnW / 2 + 4, h / 2 + 2, Center, Center);
 
         // Right button (CW)
         setColor(0.18f, 0.18f, 0.2f);
         fill();
         drawRect(btnW + 6, 0, btnW, h);
         setColor(0.7f, 0.7f, 0.75f);
-        if (font_) font_->drawString("\xE2\x86\xBB 90\xC2\xB0", btnW + 6 + btnW / 2, h / 2, Center, Center);
+        drawRotateIcon(btnW + 6 + btnW / 2 - 18, h / 2, true);  // CW
+        if (font_) font_->drawString("90\xC2\xB0", btnW + 6 + btnW / 2 + 4, h / 2 + 2, Center, Center);
     }
 
 protected:
@@ -497,6 +499,34 @@ protected:
 
 private:
     Font* font_;
+
+    // Draw a rotation arrow icon (arc + arrowhead)
+    void drawRotateIcon(float cx, float cy, bool clockwise) {
+        float r = 6.0f;
+        int segments = 12;
+        // Draw arc (~270 degrees)
+        float startAngle = clockwise ? -TAU * 0.15f : TAU * 0.15f;
+        float sweep = clockwise ? TAU * 0.75f : -TAU * 0.75f;
+        noFill();
+        for (int i = 0; i < segments; i++) {
+            float a0 = startAngle + sweep * i / segments;
+            float a1 = startAngle + sweep * (i + 1) / segments;
+            drawLine(cx + cos(a0) * r, cy + sin(a0) * r,
+                     cx + cos(a1) * r, cy + sin(a1) * r);
+        }
+        // Arrowhead at end of arc
+        float endAngle = startAngle + sweep;
+        float ex = cx + cos(endAngle) * r;
+        float ey = cy + sin(endAngle) * r;
+        float tangent = endAngle + (clockwise ? TAU * 0.25f : -TAU * 0.25f);
+        float arrowLen = 4.5f;
+        float spread = 0.45f;
+        fill();
+        drawTriangle(
+            ex, ey,
+            ex - cos(tangent - spread) * arrowLen, ey - sin(tangent - spread) * arrowLen,
+            ex - cos(tangent + spread) * arrowLen, ey - sin(tangent + spread) * arrowLen);
+    }
 };
 
 // =============================================================================
