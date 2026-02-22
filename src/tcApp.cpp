@@ -57,6 +57,7 @@ void tcApp::setup() {
 
     // 6. Load library (instant display from previous session)
     bool hasLibrary = provider_.loadLibrary();
+    provider_.loadCollections();
 
     // 6b. Import from Lightroom Classic catalog (if --import-lrcat specified)
     if (!AppConfig::importLrcatPath.empty()) {
@@ -66,11 +67,15 @@ void tcApp::setup() {
 
         int facesAdded = provider_.importFaces(result.faces);
 
+        // Import collections
+        provider_.importCollections(result.collections, result.collectionImages);
+
         logNotice() << "[LrcatImport] imported=" << added
                     << " total=" << result.stats.totalImages
                     << " missing_files=" << result.stats.missingFile
                     << " faces=" << facesAdded
-                    << " persons=" << result.stats.persons;
+                    << " persons=" << result.stats.persons
+                    << " collections=" << result.stats.collections;
 
         // Resolve stacks after lrcat import (RAW+JPG, Live Photo grouping)
         provider_.resolveStacks();
@@ -152,15 +157,62 @@ void tcApp::setup() {
         redraw();
     });
 
-    // 5b. Create folder tree sidebar
+    // 5b. Create sidebar tabs + folder tree + collection tree
+    sidebarTabs_ = make_shared<SidebarTabs>();
+    addChild(sidebarTabs_);
+
     folderTree_ = make_shared<FolderTree>();
     addChild(folderTree_);
 
+    collectionTree_ = make_shared<CollectionTree>();
+    addChild(collectionTree_);
+    collectionTree_->setActive(false); // start hidden (Folders tab active)
+
     folderTree_->onFolderSelected = [this](const string& path) {
         grid()->setFilterPath(path);
+        grid()->clearFilterPhotoIds();
         grid()->populate(provider_);
         redraw();
     };
+
+    collectionTree_->onCollectionSelected = [this](int collectionId) {
+        auto g = grid();
+        if (!g) return;
+        g->setFilterPath(""); // clear folder filter
+        if (collectionId <= 0) {
+            g->clearFilterPhotoIds();
+        } else {
+            auto ids = provider_.getCollectionPhotoIds(collectionId);
+            g->setFilterPhotoIds(unordered_set<string>(ids.begin(), ids.end()));
+        }
+        g->populate(provider_);
+        redraw();
+    };
+
+    sidebarTabListener_ = sidebarTabs_->tabChanged.listen([this](int& tab) {
+        sidebarTab_ = tab;
+        folderTree_->setActive(tab == 0 && showSidebar_);
+        collectionTree_->setActive(tab == 1 && showSidebar_);
+        // Reset grid filter when switching tabs
+        auto g = grid();
+        if (g) {
+            g->setFilterPath("");
+            g->clearFilterPhotoIds();
+            g->populate(provider_);
+        }
+        if (tab == 0) {
+            folderTree_->clearSelection();
+        } else {
+            collectionTree_->clearSelection();
+        }
+        updateLayout();
+        redraw();
+    });
+
+    // Build collection tree if we have collections
+    if (!provider_.getCollections().empty()) {
+        collectionTree_->buildTree(provider_.getCollections());
+    }
 
     // 5c. Configure map view callbacks
     auto mapView = viewManager_->mapView();
@@ -379,6 +431,9 @@ void tcApp::setup() {
     if (hasLibrary && provider_.getCount() > 0) {
         grid()->populate(provider_);
         rebuildFolderTree();
+        if (collectionTree_ && !provider_.getCollections().empty()) {
+            collectionTree_->buildTree(provider_.getCollections());
+        }
     }
 
     // 6. Start upload queue (only if server configured)
@@ -1549,7 +1604,7 @@ void tcApp::updateLayout() {
     float contentH = h - searchH;
 
     // Animated pane widths (slide in/out)
-    bool leftInGrid = inGrid && folderTree_;
+    bool leftInGrid = inGrid && (folderTree_ || collectionTree_);
     float leftW = leftInGrid ? leftPaneWidth_ : 0;
     float rightW = rightPaneWidth_;
 
@@ -1557,12 +1612,27 @@ void tcApp::updateLayout() {
     float contentX = leftW;
     float contentW = w - leftW - rightW;
 
-    // FolderTree
-    if (folderTree_) {
+    // Sidebar tabs + tree panels
+    float tabH = 28.0f;
+    if (sidebarTabs_) {
         bool leftActive = leftInGrid && leftPaneWidth_ > 0;
+        sidebarTabs_->setActive(leftActive);
+        if (leftActive) {
+            sidebarTabs_->setRect(leftW - sidebarWidth_, contentY, sidebarWidth_, tabH);
+        }
+    }
+    if (folderTree_) {
+        bool leftActive = leftInGrid && leftPaneWidth_ > 0 && sidebarTab_ == 0;
         folderTree_->setActive(leftActive);
         if (leftActive) {
-            folderTree_->setRect(leftW - sidebarWidth_, contentY, sidebarWidth_, contentH);
+            folderTree_->setRect(leftW - sidebarWidth_, contentY + tabH, sidebarWidth_, contentH - tabH);
+        }
+    }
+    if (collectionTree_) {
+        bool leftActive = leftInGrid && leftPaneWidth_ > 0 && sidebarTab_ == 1;
+        collectionTree_->setActive(leftActive);
+        if (leftActive) {
+            collectionTree_->setRect(leftW - sidebarWidth_, contentY + tabH, sidebarWidth_, contentH - tabH);
         }
     }
 

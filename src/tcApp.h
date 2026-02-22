@@ -11,6 +11,8 @@
 #include "CatalogSettings.h"
 #include "PhotoProvider.h"
 #include "ui/FolderTree.h"
+#include "ui/CollectionTree.h"
+#include "ui/SidebarTabs.h"
 #include "ui/MetadataPanel.h"
 #include "ui/DevelopPanel.h"
 #include "ui/PaneToggle.h"
@@ -57,6 +59,9 @@ private:
     // UI
     StatusBar::Ptr statusBar_;
     FolderTree::Ptr folderTree_;
+    CollectionTree::Ptr collectionTree_;
+    SidebarTabs::Ptr sidebarTabs_;
+    int sidebarTab_ = 0;  // 0=Folders, 1=Collections
     MetadataPanel::Ptr metadataPanel_;
     DevelopPanel::Ptr developPanel_;
     bool showDevelop_ = false;
@@ -102,6 +107,7 @@ private:
     EventListener developListener_;
     EventListener leftToggleListener_;
     EventListener rightToggleListener_;
+    EventListener sidebarTabListener_;
 
     // Context menu
     ContextMenu::Ptr contextMenu_;

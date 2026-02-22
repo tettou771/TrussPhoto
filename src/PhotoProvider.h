@@ -856,6 +856,82 @@ public:
         return result;
     }
 
+    // --- Collections ---
+
+    void loadCollections() {
+        collections_ = db_.loadCollections();
+    }
+
+    const vector<Collection>& getCollections() const { return collections_; }
+
+    vector<string> getCollectionPhotoIds(int collectionId) {
+        return db_.getCollectionPhotoIds(collectionId);
+    }
+
+    // Import collections from LrcatImporter results into DB
+    void importCollections(const vector<LrcatImporter::CollectionEntry>& entries,
+                           const vector<LrcatImporter::CollectionImageEntry>& images) {
+        if (entries.empty()) return;
+
+        // Clear existing collections before re-import
+        db_.clearCollections();
+
+        // Map LR id -> our DB id for parent resolution
+        unordered_map<int64_t, int> lrIdToDbId;
+
+        // First pass: insert groups and top-level collections (parentId == 0)
+        // Second pass: insert children using mapped parent IDs
+        // Since LR uses its own id_local, we need to map them.
+
+        // Sort: groups first, then others, to ensure parents exist before children.
+        // But LR allows arbitrary nesting, so we do multi-pass.
+        vector<const LrcatImporter::CollectionEntry*> pending;
+        for (const auto& e : entries) pending.push_back(&e);
+
+        int maxPasses = 10;
+        while (!pending.empty() && maxPasses-- > 0) {
+            vector<const LrcatImporter::CollectionEntry*> next;
+            for (auto* e : pending) {
+                int dbParentId = 0;
+                if (e->lrParentId != 0) {
+                    auto it = lrIdToDbId.find(e->lrParentId);
+                    if (it == lrIdToDbId.end()) {
+                        // Parent not yet inserted, defer
+                        next.push_back(e);
+                        continue;
+                    }
+                    dbParentId = it->second;
+                }
+                int dbId = db_.insertCollection(
+                    e->name, dbParentId, e->type, e->rules, "", "", 0);
+                if (dbId > 0) {
+                    lrIdToDbId[e->lrId] = dbId;
+                }
+            }
+            pending = std::move(next);
+        }
+
+        // Insert collection-photo associations
+        // Group by collection for batch insert
+        unordered_map<int, vector<pair<string, int>>> collPhotos;
+        for (const auto& img : images) {
+            auto it = lrIdToDbId.find(img.lrCollectionId);
+            if (it == lrIdToDbId.end()) continue;
+            collPhotos[it->second].push_back({img.photoId, img.position});
+        }
+        for (auto& [collId, photos] : collPhotos) {
+            db_.insertCollectionPhotos(collId, photos);
+        }
+
+        // Reload cache
+        loadCollections();
+
+        int totalPhotos = 0;
+        for (const auto& c : collections_) totalPhotos += c.photoCount;
+        logNotice() << "[PhotoProvider] importCollections: " << collections_.size()
+                    << " collections, " << totalPhotos << " photo associations";
+    }
+
     // --- Accessors ---
 
     void setSyncState(const string& id, SyncState state) {
@@ -2305,6 +2381,7 @@ private:
     PhotoDatabase db_;
     unordered_map<string, PhotoEntry> photos_;
     unordered_map<string, vector<string>> stackIndex_; // stackId -> member ids
+    vector<Collection> collections_;
     string catalogDir_;
     string thumbnailCacheDir_;
     string databasePath_;
