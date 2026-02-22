@@ -20,7 +20,7 @@ int main(int argc, char* argv[]) {
 
         tc::WindowSettings settings;
         settings.setHighDpi(true);
-        settings.setSize(960, 600);
+        settings.setSize(1500, 900);
         return tc::runApp<tcApp>(settings);
     }
 }
