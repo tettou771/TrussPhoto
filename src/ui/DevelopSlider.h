@@ -21,6 +21,7 @@ public:
     float maxVal = 1;
     float defaultVal = 0;
     bool enabled = true;
+    bool centerZero = false;  // true: draw fill from center, show center mark
     function<void(float)> onChange;
 
     DevelopSlider() = default;
@@ -49,7 +50,11 @@ public:
 
         // Value text
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.2f", value);
+        if (centerZero) {
+            snprintf(buf, sizeof(buf), "%+.0f", value);
+        } else {
+            snprintf(buf, sizeof(buf), "%.2f", value);
+        }
         setColor(0.75f * dim, 0.75f * dim, 0.8f * dim);
         float tw = getBitmapStringWidth(buf);
         drawBitmapString(buf, w - pad - tw, 14);
@@ -67,7 +72,26 @@ public:
         float t = (value - minVal) / (maxVal - minVal);
         t = clamp(t, 0.0f, 1.0f);
         setColor(0.4f * dim, 0.6f * dim, 0.9f * dim);
-        drawRect(trackLeft, trackY, trackW * t, trackH);
+        if (centerZero) {
+            float center = (-minVal) / (maxVal - minVal);
+            float cx = trackLeft + trackW * center;
+            float kx = trackLeft + trackW * t;
+            float fillX = min(cx, kx);
+            float fillW = fabs(kx - cx);
+            drawRect(fillX, trackY, fillW, trackH);
+        } else {
+            drawRect(trackLeft, trackY, trackW * t, trackH);
+        }
+
+        // Center mark (for bipolar sliders)
+        if (centerZero) {
+            float center = (-minVal) / (maxVal - minVal);
+            float cx = trackLeft + trackW * center;
+            setColor(0.35f * dim, 0.35f * dim, 0.4f * dim);
+            noFill();
+            drawLine(cx, trackY - 2, cx, trackY + trackH + 2);
+            fill();
+        }
 
         // Knob
         float knobX = trackLeft + trackW * t;

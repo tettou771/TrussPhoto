@@ -192,10 +192,24 @@ public:
     void setExposure(float ev) { exposure_ = ev; }
     void setWbTemp(float t) { wbTemp_ = t; }
     void setWbTint(float t) { wbTint_ = t; }
+    void setContrast(float v) { contrast_ = v; }
+    void setHighlights(float v) { highlights_ = v; }
+    void setShadows(float v) { shadows_ = v; }
+    void setWhites(float v) { whites_ = v; }
+    void setBlacks(float v) { blacks_ = v; }
+    void setVibrance(float v) { vibrance_ = v; }
+    void setSaturation(float v) { saturation_ = v; }
 
     float getExposure() const { return exposure_; }
     float getWbTemp() const { return wbTemp_; }
     float getWbTint() const { return wbTint_; }
+    float getContrast() const { return contrast_; }
+    float getHighlights() const { return highlights_; }
+    float getShadows() const { return shadows_; }
+    float getWhites() const { return whites_; }
+    float getBlacks() const { return blacks_; }
+    float getVibrance() const { return vibrance_; }
+    float getSaturation() const { return saturation_; }
 
     void clearLensData() {
         hasLensLut_ = false;
@@ -289,6 +303,13 @@ public:
         params.exposure = exposure_;
         params.wbTemp = wbTemp_;
         params.wbTint = wbTint_;
+        params.contrast = contrast_;
+        params.highlights = highlights_;
+        params.shadows = shadows_;
+        params.whites = whites_;
+        params.blacks = blacks_;
+        params.vibrance = vibrance_;
+        params.saturation = saturation_;
 
         sg_range range = { &params, sizeof(params) };
         sg_apply_uniforms(UB_develop_fs_develop_params, &range);
@@ -343,6 +364,15 @@ private:
     float exposure_ = 0.0f;
     float wbTemp_ = 0.0f;
     float wbTint_ = 0.0f;
+
+    // Tone / Color
+    float contrast_ = 0.0f;
+    float highlights_ = 0.0f;
+    float shadows_ = 0.0f;
+    float whites_ = 0.0f;
+    float blacks_ = 0.0f;
+    float vibrance_ = 0.0f;
+    float saturation_ = 0.0f;
 
     // Lens uniform state
     bool lensEnabled_ = false;

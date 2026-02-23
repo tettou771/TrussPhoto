@@ -87,6 +87,9 @@ void tcApp::setup() {
         }
     }
 
+    // 6c. Backfill develop parameters from LR text blob (one-time)
+    provider_.backfillDevelopSettings();
+
     // 7. Save bootstrap (remember catalog path for next launch)
     bootstrap_.lastCatalogPath = catalogPath_;
     bootstrap_.save(AppPaths::appConfigPath());
@@ -335,6 +338,13 @@ void tcApp::setup() {
             sv->onDevelopChanged(developPanel_->getExposure(),
                                  developPanel_->getTemperature(),
                                  developPanel_->getTint(),
+                                 developPanel_->getContrast(),
+                                 developPanel_->getHighlights(),
+                                 developPanel_->getShadows(),
+                                 developPanel_->getWhites(),
+                                 developPanel_->getBlacks(),
+                                 developPanel_->getVibrance(),
+                                 developPanel_->getSaturation(),
                                  developPanel_->getChromaDenoise(),
                                  developPanel_->getLumaDenoise());
         }
@@ -592,9 +602,15 @@ void tcApp::setup() {
 
     // Sync DevelopPanel sliders when photo changes
     viewManager_->singleView()->onDevelopRestored = [this](float exp, float temp, float tint,
+                                                            float contrast, float highlights, float shadows,
+                                                            float whites, float blacks,
+                                                            float vibrance, float saturation,
                                                             float chroma, float luma) {
         if (developPanel_ && showDevelop_) {
-            developPanel_->setValues(exp, temp, tint, chroma, luma);
+            developPanel_->setValues(exp, temp, tint,
+                                     contrast, highlights, shadows, whites, blacks,
+                                     vibrance, saturation,
+                                     chroma, luma);
             developPanel_->setNrEnabled(viewManager_->singleView()->isRawImage());
         }
     };
@@ -943,6 +959,10 @@ void tcApp::keyPressed(int key) {
                     if (entry) {
                         developPanel_->setValues(entry->devExposure, entry->devWbTemp,
                                                  entry->devWbTint,
+                                                 entry->devContrast, entry->devHighlights,
+                                                 entry->devShadows, entry->devWhites,
+                                                 entry->devBlacks,
+                                                 entry->devVibrance, entry->devSaturation,
                                                  entry->chromaDenoise, entry->lumaDenoise);
                     }
                 }

@@ -115,6 +115,67 @@ public:
         return result;
     }
 
+    // Extract LR develop parameters from the text blob stored in develop_settings.
+    // LR stores key-value pairs like "Contrast2012 = +15\n" etc.
+    // Uses simple string search (no regex) for safety and performance.
+    static void parseDevelopSettings(const string& text, PhotoEntry& e) {
+        // Extract a float value for a key that appears at line start (or after whitespace/newline)
+        // This prevents "Saturation" from matching inside "CurveRefineSaturation"
+        auto extractFloat = [&](const string& key) -> pair<bool, float> {
+            size_t searchFrom = 0;
+            while (searchFrom < text.size()) {
+                size_t pos = text.find(key, searchFrom);
+                if (pos == string::npos) return {false, 0.0f};
+                // Verify it's a standalone key (preceded by newline, tab, or start of string)
+                if (pos > 0) {
+                    char prev = text[pos - 1];
+                    if (prev != '\n' && prev != '\r' && prev != '\t' && prev != ' ') {
+                        searchFrom = pos + key.size();
+                        continue; // Part of a longer key name
+                    }
+                }
+                pos += key.size();
+                while (pos < text.size() && (text[pos] == ' ' || text[pos] == '\t' || text[pos] == '='))
+                    pos++;
+                if (pos >= text.size()) return {false, 0.0f};
+                size_t start = pos;
+                if (text[pos] == '+' || text[pos] == '-') pos++;
+                while (pos < text.size() && (isdigit(text[pos]) || text[pos] == '.')) pos++;
+                if (pos == start) return {false, 0.0f};
+                try { return {true, stof(text.substr(start, pos - start))}; } catch (...) { return {false, 0.0f}; }
+            }
+            return {false, 0.0f};
+        };
+
+        auto [hasExp, lrExposure] = extractFloat("Exposure2012");
+        if (hasExp && e.devExposure == 0.0f) e.devExposure = lrExposure;
+
+        auto [hasCon, lrContrast] = extractFloat("Contrast2012");
+        if (hasCon) e.devContrast = lrContrast;
+
+        auto [hasHi, lrHighlights] = extractFloat("Highlights2012");
+        if (hasHi) e.devHighlights = lrHighlights;
+
+        auto [hasSh, lrShadows] = extractFloat("Shadows2012");
+        if (hasSh) e.devShadows = lrShadows;
+
+        auto [hasWh, lrWhites] = extractFloat("Whites2012");
+        if (hasWh) e.devWhites = lrWhites;
+
+        auto [hasBl, lrBlacks] = extractFloat("Blacks2012");
+        if (hasBl) e.devBlacks = lrBlacks;
+
+        auto [hasVib, lrVibrance] = extractFloat("Vibrance");
+        if (hasVib) e.devVibrance = lrVibrance;
+
+        auto [hasSat, lrSaturation] = extractFloat("Saturation");
+        if (hasSat) e.devSaturation = lrSaturation;
+
+        // Note: LR Temperature/Tint are absolute Kelvin values (e.g. 3108K).
+        // Our devWbTemp/Tint are relative shader shifts (-1 to +1).
+        // Converting requires knowing the as-shot WB, which is complex. Skip for now.
+    }
+
 private:
     // Load keywords: image id_local -> vector of keyword names
     static unordered_map<int64_t, vector<string>> loadKeywords(sqlite3* db) {
@@ -273,6 +334,11 @@ private:
                     tagArr.push_back(kw);
                 }
                 e.tags = tagArr.dump();
+            }
+
+            // Extract develop parameters from LR text blob
+            if (!developText.empty()) {
+                parseDevelopSettings(developText, e);
             }
 
             result.entries.push_back(std::move(e));

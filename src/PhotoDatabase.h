@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 16;
+    static constexpr int SCHEMA_VERSION = 18;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -99,7 +99,14 @@ public:
                 "  user_rotation90     INTEGER NOT NULL DEFAULT 0,"
                 "  user_persp_v        REAL NOT NULL DEFAULT 0.0,"
                 "  user_persp_h        REAL NOT NULL DEFAULT 0.0,"
-                "  user_shear          REAL NOT NULL DEFAULT 0.0"
+                "  user_shear          REAL NOT NULL DEFAULT 0.0,"
+                "  dev_contrast        REAL NOT NULL DEFAULT 0.0,"
+                "  dev_highlights      REAL NOT NULL DEFAULT 0.0,"
+                "  dev_shadows         REAL NOT NULL DEFAULT 0.0,"
+                "  dev_whites          REAL NOT NULL DEFAULT 0.0,"
+                "  dev_blacks          REAL NOT NULL DEFAULT 0.0,"
+                "  dev_vibrance        REAL NOT NULL DEFAULT 0.0,"
+                "  dev_saturation      REAL NOT NULL DEFAULT 0.0"
                 ")"
             );
             if (!ok) return false;
@@ -359,8 +366,45 @@ public:
                 logError() << "[PhotoDatabase] Migration v15->v16 failed";
                 return false;
             }
+            version = 16;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v15 -> v16";
+        }
+
+        // v16 -> v17: add tone/color develop settings
+        if (version == 16) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN dev_contrast REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN dev_highlights REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN dev_shadows REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN dev_whites REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN dev_blacks REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN dev_vibrance REAL NOT NULL DEFAULT 0.0",
+                "ALTER TABLE photos ADD COLUMN dev_saturation REAL NOT NULL DEFAULT 0.0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v16->v17 failed: " << sql;
+                    return false;
+                }
+            }
+            version = 17;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v16 -> v17";
+        }
+
+        // v17 -> v18: reset develop params (fix Saturation parsing bug)
+        if (version == 17) {
+            const char* sql =
+                "UPDATE photos SET dev_contrast=0, dev_highlights=0, dev_shadows=0, "
+                "dev_whites=0, dev_blacks=0, dev_vibrance=0, dev_saturation=0 "
+                "WHERE develop_settings != ''";
+            if (!db_.exec(sql)) {
+                logError() << "[PhotoDatabase] Migration v17->v18 failed";
+                return false;
+            }
             db_.setSchemaVersion(SCHEMA_VERSION);
-            logNotice() << "[PhotoDatabase] Migrated v15 -> v" << SCHEMA_VERSION;
+            logNotice() << "[PhotoDatabase] Migrated v17 -> v18 (reset develop params for re-parse)";
         }
 
         return true;
@@ -488,18 +532,31 @@ public:
     }
 
     bool updateDevelop(const string& id, float exposure, float wbTemp, float wbTint,
+                       float contrast, float highlights, float shadows,
+                       float whites, float blacks,
+                       float vibrance, float saturation,
                        float chroma, float luma) {
         lock_guard<mutex> lock(db_.writeMutex());
         auto stmt = db_.prepare(
             "UPDATE photos SET dev_exposure=?1, dev_wb_temp=?2, dev_wb_tint=?3, "
-            "chroma_denoise=?4, luma_denoise=?5 WHERE id=?6");
+            "dev_contrast=?4, dev_highlights=?5, dev_shadows=?6, "
+            "dev_whites=?7, dev_blacks=?8, "
+            "dev_vibrance=?9, dev_saturation=?10, "
+            "chroma_denoise=?11, luma_denoise=?12 WHERE id=?13");
         if (!stmt.valid()) return false;
         stmt.bind(1, (double)exposure);
         stmt.bind(2, (double)wbTemp);
         stmt.bind(3, (double)wbTint);
-        stmt.bind(4, (double)chroma);
-        stmt.bind(5, (double)luma);
-        stmt.bind(6, id);
+        stmt.bind(4, (double)contrast);
+        stmt.bind(5, (double)highlights);
+        stmt.bind(6, (double)shadows);
+        stmt.bind(7, (double)whites);
+        stmt.bind(8, (double)blacks);
+        stmt.bind(9, (double)vibrance);
+        stmt.bind(10, (double)saturation);
+        stmt.bind(11, (double)chroma);
+        stmt.bind(12, (double)luma);
+        stmt.bind(13, id);
         return stmt.execute();
     }
 
@@ -674,6 +731,8 @@ public:
             "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
             "stack_id, stack_primary, "
             "dev_exposure, dev_wb_temp, dev_wb_tint, "
+            "dev_contrast, dev_highlights, dev_shadows, dev_whites, dev_blacks, "
+            "dev_vibrance, dev_saturation, "
             "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
             "user_angle, user_rotation90, "
             "user_persp_v, user_persp_h, user_shear "
@@ -738,15 +797,22 @@ public:
             e.devExposure        = (float)stmt.getDouble(52);
             e.devWbTemp          = (float)stmt.getDouble(53);
             e.devWbTint          = (float)stmt.getDouble(54);
-            e.userCropX          = (float)stmt.getDouble(55);
-            e.userCropY          = (float)stmt.getDouble(56);
-            e.userCropW          = (float)stmt.getDouble(57);
-            e.userCropH          = (float)stmt.getDouble(58);
-            e.userAngle          = (float)stmt.getDouble(59);
-            e.userRotation90     = stmt.getInt(60);
-            e.userPerspV         = (float)stmt.getDouble(61);
-            e.userPerspH         = (float)stmt.getDouble(62);
-            e.userShear          = (float)stmt.getDouble(63);
+            e.devContrast        = (float)stmt.getDouble(55);
+            e.devHighlights      = (float)stmt.getDouble(56);
+            e.devShadows         = (float)stmt.getDouble(57);
+            e.devWhites          = (float)stmt.getDouble(58);
+            e.devBlacks          = (float)stmt.getDouble(59);
+            e.devVibrance        = (float)stmt.getDouble(60);
+            e.devSaturation      = (float)stmt.getDouble(61);
+            e.userCropX          = (float)stmt.getDouble(62);
+            e.userCropY          = (float)stmt.getDouble(63);
+            e.userCropW          = (float)stmt.getDouble(64);
+            e.userCropH          = (float)stmt.getDouble(65);
+            e.userAngle          = (float)stmt.getDouble(66);
+            e.userRotation90     = stmt.getInt(67);
+            e.userPerspV         = (float)stmt.getDouble(68);
+            e.userPerspH         = (float)stmt.getDouble(69);
+            e.userShear          = (float)stmt.getDouble(70);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -1487,13 +1553,15 @@ private:
             "focal_length_35mm, offset_time, body_serial, lens_serial, subject_distance, "
             "subsec_time_original, companion_files, chroma_denoise, luma_denoise, "
             "stack_id, stack_primary, dev_exposure, dev_wb_temp, dev_wb_tint, "
+            "dev_contrast, dev_highlights, dev_shadows, dev_whites, dev_blacks, "
+            "dev_vibrance, dev_saturation, "
             "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
             "user_angle, user_rotation90, "
             "user_persp_v, user_persp_h, user_shear) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
             "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,"
-            "?56,?57,?58,?59,?60,?61,?62,?63,?64)";
+            "?56,?57,?58,?59,?60,?61,?62,?63,?64,?65,?66,?67,?68,?69,?70,?71)";
     }
 
     static void bindEntry(Database::Statement& stmt, const PhotoEntry& e) {
@@ -1552,14 +1620,21 @@ private:
         stmt.bind(53, (double)e.devExposure);
         stmt.bind(54, (double)e.devWbTemp);
         stmt.bind(55, (double)e.devWbTint);
-        stmt.bind(56, (double)e.userCropX);
-        stmt.bind(57, (double)e.userCropY);
-        stmt.bind(58, (double)e.userCropW);
-        stmt.bind(59, (double)e.userCropH);
-        stmt.bind(60, (double)e.userAngle);
-        stmt.bind(61, e.userRotation90);
-        stmt.bind(62, (double)e.userPerspV);
-        stmt.bind(63, (double)e.userPerspH);
-        stmt.bind(64, (double)e.userShear);
+        stmt.bind(56, (double)e.devContrast);
+        stmt.bind(57, (double)e.devHighlights);
+        stmt.bind(58, (double)e.devShadows);
+        stmt.bind(59, (double)e.devWhites);
+        stmt.bind(60, (double)e.devBlacks);
+        stmt.bind(61, (double)e.devVibrance);
+        stmt.bind(62, (double)e.devSaturation);
+        stmt.bind(63, (double)e.userCropX);
+        stmt.bind(64, (double)e.userCropY);
+        stmt.bind(65, (double)e.userCropW);
+        stmt.bind(66, (double)e.userCropH);
+        stmt.bind(67, (double)e.userAngle);
+        stmt.bind(68, e.userRotation90);
+        stmt.bind(69, (double)e.userPerspV);
+        stmt.bind(70, (double)e.userPerspH);
+        stmt.bind(71, (double)e.userShear);
     }
 };

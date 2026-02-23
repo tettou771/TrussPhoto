@@ -684,15 +684,27 @@ public:
     }
 
     bool setDevelop(const string& id, float exposure, float wbTemp, float wbTint,
+                    float contrast, float highlights, float shadows,
+                    float whites, float blacks,
+                    float vibrance, float saturation,
                     float chroma, float luma) {
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
         it->second.devExposure = exposure;
         it->second.devWbTemp = wbTemp;
         it->second.devWbTint = wbTint;
+        it->second.devContrast = contrast;
+        it->second.devHighlights = highlights;
+        it->second.devShadows = shadows;
+        it->second.devWhites = whites;
+        it->second.devBlacks = blacks;
+        it->second.devVibrance = vibrance;
+        it->second.devSaturation = saturation;
         it->second.chromaDenoise = chroma;
         it->second.lumaDenoise = luma;
-        db_.updateDevelop(id, exposure, wbTemp, wbTint, chroma, luma);
+        db_.updateDevelop(id, exposure, wbTemp, wbTint,
+                          contrast, highlights, shadows, whites, blacks,
+                          vibrance, saturation, chroma, luma);
         return true;
     }
 
@@ -1930,6 +1942,38 @@ public:
     }
 
     bool isExifBackfillRunning() const { return exifBackfillRunning_; }
+
+    // Backfill develop parameters from LR develop_settings text blob.
+    // Targets photos with non-empty developSettings but all 7 tone/color params at 0.
+    int backfillDevelopSettings() {
+        int count = 0;
+        for (auto& [id, photo] : photos_) {
+            if (photo.developSettings.empty()) continue;
+            // Skip if any param is already non-zero (already parsed)
+            if (photo.devContrast != 0 || photo.devHighlights != 0 || photo.devShadows != 0 ||
+                photo.devWhites != 0 || photo.devBlacks != 0 ||
+                photo.devVibrance != 0 || photo.devSaturation != 0) continue;
+
+            LrcatImporter::parseDevelopSettings(photo.developSettings, photo);
+
+            // Check if anything was actually extracted
+            if (photo.devContrast != 0 || photo.devHighlights != 0 || photo.devShadows != 0 ||
+                photo.devWhites != 0 || photo.devBlacks != 0 ||
+                photo.devVibrance != 0 || photo.devSaturation != 0 ||
+                photo.devExposure != 0) {
+                db_.updateDevelop(id, photo.devExposure, photo.devWbTemp, photo.devWbTint,
+                                  photo.devContrast, photo.devHighlights, photo.devShadows,
+                                  photo.devWhites, photo.devBlacks,
+                                  photo.devVibrance, photo.devSaturation,
+                                  photo.chromaDenoise, photo.lumaDenoise);
+                count++;
+            }
+        }
+        if (count > 0) {
+            logNotice() << "[DevelopBackfill] Updated " << count << " photos";
+        }
+        return count;
+    }
 
     // --- CLIP Embedding ---
 

@@ -71,6 +71,13 @@ struct PhotoEntry {
     float devExposure = 0.0f;    // EV stops (-3 to +3)
     float devWbTemp = 0.0f;      // temperature shift (-1 to +1)
     float devWbTint = 0.0f;      // tint shift (-1 to +1)
+    float devContrast = 0.0f;    // -100 to +100
+    float devHighlights = 0.0f;  // -100 to +100
+    float devShadows = 0.0f;     // -100 to +100
+    float devWhites = 0.0f;      // -100 to +100
+    float devBlacks = 0.0f;      // -100 to +100
+    float devVibrance = 0.0f;    // -100 to +100
+    float devSaturation = 0.0f;  // -100 to +100
 
     // Lens correction (JSON: Sony EXIF spline, DNG polynomial, or Fuji MakerNote)
     string lensCorrectionParams;
@@ -389,6 +396,13 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"devExposure", e.devExposure},
         {"devWbTemp", e.devWbTemp},
         {"devWbTint", e.devWbTint},
+        {"devContrast", e.devContrast},
+        {"devHighlights", e.devHighlights},
+        {"devShadows", e.devShadows},
+        {"devWhites", e.devWhites},
+        {"devBlacks", e.devBlacks},
+        {"devVibrance", e.devVibrance},
+        {"devSaturation", e.devSaturation},
         {"lensCorrectionParams", e.lensCorrectionParams},
         {"exposureTime", e.exposureTime},
         {"exposureBias", e.exposureBias},
@@ -458,6 +472,13 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.devExposure = j.value("devExposure", 0.0f);
     e.devWbTemp = j.value("devWbTemp", 0.0f);
     e.devWbTint = j.value("devWbTint", 0.0f);
+    e.devContrast = j.value("devContrast", 0.0f);
+    e.devHighlights = j.value("devHighlights", 0.0f);
+    e.devShadows = j.value("devShadows", 0.0f);
+    e.devWhites = j.value("devWhites", 0.0f);
+    e.devBlacks = j.value("devBlacks", 0.0f);
+    e.devVibrance = j.value("devVibrance", 0.0f);
+    e.devSaturation = j.value("devSaturation", 0.0f);
 
     e.lensCorrectionParams = j.value("lensCorrectionParams", string(""));
     e.exposureTime = j.value("exposureTime", string(""));

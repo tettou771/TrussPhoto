@@ -54,6 +54,9 @@ public:
 
     // Callback when photo changes (for DevelopPanel slider sync)
     function<void(float exposure, float wbTemp, float wbTint,
+                  float contrast, float highlights, float shadows,
+                  float whites, float blacks,
+                  float vibrance, float saturation,
                   float chroma, float luma)> onDevelopRestored;
 
     // Right-click context menu
@@ -96,12 +99,29 @@ public:
         exposure_ = entry->devExposure;
         wbTemp_ = entry->devWbTemp;
         wbTint_ = entry->devWbTint;
+        contrast_ = entry->devContrast;
+        highlights_ = entry->devHighlights;
+        shadows_ = entry->devShadows;
+        whites_ = entry->devWhites;
+        blacks_ = entry->devBlacks;
+        vibrance_ = entry->devVibrance;
+        saturation_ = entry->devSaturation;
         chromaDenoise_ = entry->chromaDenoise;
         lumaDenoise_ = entry->lumaDenoise;
         developShader_.setExposure(exposure_);
         developShader_.setWbTemp(wbTemp_);
         developShader_.setWbTint(wbTint_);
+        developShader_.setContrast(contrast_);
+        developShader_.setHighlights(highlights_);
+        developShader_.setShadows(shadows_);
+        developShader_.setWhites(whites_);
+        developShader_.setBlacks(blacks_);
+        developShader_.setVibrance(vibrance_);
+        developShader_.setSaturation(saturation_);
         if (onDevelopRestored) onDevelopRestored(exposure_, wbTemp_, wbTint_,
+                                                 contrast_, highlights_, shadows_,
+                                                 whites_, blacks_,
+                                                 vibrance_, saturation_,
                                                  chromaDenoise_, lumaDenoise_);
 
         bool loaded = false;
@@ -607,15 +627,35 @@ public:
 
     // Called when DevelopPanel sliders change
     void onDevelopChanged(float exposure, float wbTemp, float wbTint,
+                          float contrast, float highlights, float shadows,
+                          float whites, float blacks,
+                          float vibrance, float saturation,
                           float chroma, float luma) {
         // GPU-only params: update shader uniforms
-        bool gpuChanged = (exposure_ != exposure || wbTemp_ != wbTemp || wbTint_ != wbTint);
+        bool gpuChanged = (exposure_ != exposure || wbTemp_ != wbTemp || wbTint_ != wbTint ||
+                           contrast_ != contrast || highlights_ != highlights ||
+                           shadows_ != shadows || whites_ != whites || blacks_ != blacks ||
+                           vibrance_ != vibrance || saturation_ != saturation);
         exposure_ = exposure;
         wbTemp_ = wbTemp;
         wbTint_ = wbTint;
+        contrast_ = contrast;
+        highlights_ = highlights;
+        shadows_ = shadows;
+        whites_ = whites;
+        blacks_ = blacks;
+        vibrance_ = vibrance;
+        saturation_ = saturation;
         developShader_.setExposure(exposure_);
         developShader_.setWbTemp(wbTemp_);
         developShader_.setWbTint(wbTint_);
+        developShader_.setContrast(contrast_);
+        developShader_.setHighlights(highlights_);
+        developShader_.setShadows(shadows_);
+        developShader_.setWhites(whites_);
+        developShader_.setBlacks(blacks_);
+        developShader_.setVibrance(vibrance_);
+        developShader_.setSaturation(saturation_);
 
         // NR: needs CPU re-processing (only if changed)
         bool nrChanged = (chromaDenoise_ != chroma || lumaDenoise_ != luma);
@@ -639,6 +679,9 @@ public:
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
             const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
             ctx_->provider->setDevelop(pid, exposure_, wbTemp_, wbTint_,
+                                       contrast_, highlights_, shadows_,
+                                       whites_, blacks_,
+                                       vibrance_, saturation_,
                                        chromaDenoise_, lumaDenoise_);
         }
 
@@ -879,6 +922,13 @@ private:
     float exposure_ = 0.0f;
     float wbTemp_ = 0.0f;
     float wbTint_ = 0.0f;
+    float contrast_ = 0.0f;
+    float highlights_ = 0.0f;
+    float shadows_ = 0.0f;
+    float whites_ = 0.0f;
+    float blacks_ = 0.0f;
+    float vibrance_ = 0.0f;
+    float saturation_ = 0.0f;
 
     // Noise reduction
     float chromaDenoise_ = 0.5f;
@@ -1110,13 +1160,23 @@ private:
         menu->addChild(make_shared<MenuItem>("Reset Develop",
             [this, photoId]() {
                 exposure_ = 0; wbTemp_ = 0; wbTint_ = 0;
+                contrast_ = 0; highlights_ = 0; shadows_ = 0;
+                whites_ = 0; blacks_ = 0;
+                vibrance_ = 0; saturation_ = 0;
                 chromaDenoise_ = 0.5f; lumaDenoise_ = 0;
                 developShader_.setExposure(0);
                 developShader_.setWbTemp(0);
                 developShader_.setWbTint(0);
+                developShader_.setContrast(0);
+                developShader_.setHighlights(0);
+                developShader_.setShadows(0);
+                developShader_.setWhites(0);
+                developShader_.setBlacks(0);
+                developShader_.setVibrance(0);
+                developShader_.setSaturation(0);
                 needsFboRender_ = true;
-                if (ctx_) ctx_->provider->setDevelop(photoId, 0, 0, 0, 0.5f, 0);
-                if (onDevelopRestored) onDevelopRestored(0, 0, 0, 0.5f, 0);
+                if (ctx_) ctx_->provider->setDevelop(photoId, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.5f, 0);
+                if (onDevelopRestored) onDevelopRestored(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.5f, 0);
                 if (ctx_ && ctx_->redraw) ctx_->redraw(1);
             }));
 
