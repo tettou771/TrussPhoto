@@ -90,103 +90,129 @@ void main() {
         color = texture(sampler2D(srcTex, srcSmp), texUV).rgb;
     }
 
-    // 5. Exposure (linear light — Lr applies exposure as linear gain)
-    if (exposure != 0.0) {
-        color = pow(max(color, 0.0), vec3(2.2));   // sRGB → linear
-        color *= pow(2.0, exposure);                // EV gain
-        color = pow(color, vec3(1.0 / 2.2));        // linear → sRGB
-    }
-
-    // 6. White balance (simplified RGB multiplier)
-    if (wbTemp != 0.0 || wbTint != 0.0) {
-        color.r *= 1.0 + wbTemp * 0.2;
-        color.b *= 1.0 - wbTemp * 0.2;
-        color.g *= 1.0 - wbTint * 0.2;
-    }
-
-    // 7. Tone adjustments (Contrast, Highlights, Shadows, Whites, Blacks)
-    // Lr uses Local Laplacian Filters (image-adaptive) which we can't do
-    // in a pixel shader, so we approximate with a global parametric curve.
-    // Lr processes in linear ProPhoto RGB; we process in sRGB gamma.
-    // Zone ranges from Lr §9.3 (linear) are converted to sRGB equivalents.
+    // 5–7. Exposure + WB + Tone — all in linear light (single linearize pass)
+    // Lr processes in linear ProPhoto RGB; we approximate in linear sRGB.
+    // Lr uses Local Laplacian for HL/SH which we can't do in a pixel shader,
+    // so we approximate with a global parametric curve.
     {
-        float lum = clamp(dot(color, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
+        color = pow(max(color, 0.0), vec3(2.2));  // sRGB → linear
 
-        // Contrast: S-curve via smoothstep blend (pivot at 18% gray ≈ sRGB 0.46)
-        if (contrast != 0.0) {
-            float c = contrast / 100.0;
-            vec3 clamped = clamp(color, 0.0, 1.0);
-            // Remap so pivot (0.46) maps to 0.5, apply smoothstep S-curve, remap back
-            vec3 norm = clamp(clamped * (0.5 / 0.46), 0.0, 1.0);  // 0.46 → 0.5
-            vec3 scurve = norm * norm * (3.0 - 2.0 * norm);        // Hermite S-curve
-            scurve = scurve * (0.46 / 0.5);                        // 0.5 → 0.46
-            color = mix(color, scurve + (color - clamped), c * 0.5);
+        // Exposure (linear gain, §7)
+        if (exposure != 0.0) {
+            color *= pow(2.0, exposure);
         }
 
-        // Accumulate luminance adjustment from zone masks.
-        // Lr §9.3 linear ranges → sRGB: pow(x, 1/2.2)
-        //   Shadows  0.05–0.35 lin → ~0.25–0.62 sRGB
-        //   Highlights 0.65–0.95 lin → ~0.82–0.98 sRGB
-        //   Blacks   0.00–0.10 lin → ~0.00–0.35 sRGB
-        //   Whites   0.90–1.00 lin → ~0.95–1.00 sRGB
+        // White balance (linear RGB multiplier, §5)
+        if (wbTemp != 0.0 || wbTint != 0.0) {
+            color.r *= 1.0 + wbTemp * 0.2;
+            color.b *= 1.0 - wbTemp * 0.2;
+            color.g *= 1.0 - wbTint * 0.2;
+        }
+
+        // Contrast: log-space expansion (pivot at 18% gray = linear 0.18)
+        // Log space is perceptually uniform, gives a natural S-curve.
+        if (contrast != 0.0) {
+            float c = contrast / 100.0 * 0.3;
+            float logMid = log2(0.18);  // -2.474
+            vec3 logC = log2(max(color, vec3(0.00001)));
+            logC = logMid + (logC - logMid) * (1.0 + c);
+            color = max(exp2(logC), 0.0);
+        }
+
+        // Blacks: black-point curve bend (levels-style remap)
+        // Negative: crush (push dark pixels toward 0)
+        // Positive: lift (raise the floor)
+        if (blacks != 0.0) {
+            float b = blacks / 100.0;
+            if (b < 0.0) {
+                float thresh = -b * 0.06;  // at -100: 6% threshold in linear
+                color = max((color - thresh) / (1.0 - thresh), 0.0);
+            } else {
+                float lift = b * 0.06;
+                color = color * (1.0 - lift) + lift;
+            }
+        }
+
+        // Whites: white-point curve bend (masked to highlights only)
+        if (whites != 0.0) {
+            float lumNow = dot(color, vec3(0.2126, 0.7152, 0.0722));
+            float mask = smoothstep(0.80, 1.0, clamp(lumNow, 0.0, 1.0));
+            float scale = 1.0 + whites / 100.0 * 0.12;
+            color = mix(color, color * scale, mask);
+        }
+
+        // Highlights / Shadows: zone-based adjustment via luminance ratio.
+        // Computed after Blacks/Whites so zone masks see the adjusted image.
+        // Zone ranges from Lr §9.3 in linear space.
+        float lum = clamp(dot(color, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
         float adj = 0.0;
 
-        // Highlights: ramp up in bright zone (sRGB 0.70–0.95)
+        // Highlights: 0.65–0.95 linear (ramp up)
         if (highlights != 0.0) {
-            float mask = smoothstep(0.70, 0.95, lum);
+            float mask = smoothstep(0.55, 0.90, lum);
             adj += highlights / 100.0 * 0.25 * mask;
         }
 
-        // Shadows: bell-shaped mask — lifts shadow detail but preserves
-        // true blacks (which the Blacks slider controls).
-        // Rises from 0.03, peaks at ~0.15–0.35, falls to 0 at ~0.60.
+        // Shadows: bell-shaped — lifts shadow detail while preserving
+        // true blacks. Rises from 0.02, peaks at ~0.08–0.20, fades by 0.40.
         if (shadows != 0.0) {
-            float mask = smoothstep(0.03, 0.15, lum) * (1.0 - smoothstep(0.35, 0.60, lum));
+            float mask = smoothstep(0.02, 0.08, lum) * (1.0 - smoothstep(0.20, 0.40, lum));
             adj += shadows / 100.0 * 0.30 * mask;
         }
 
-        // Whites: narrow top end — white point adjustment (sRGB 0.92–1.0)
-        if (whites != 0.0) {
-            float mask = smoothstep(0.92, 1.0, lum);
-            adj += whites / 100.0 * 0.12 * mask;
-        }
-
-        // Blacks: narrow bottom — black point adjustment (sRGB 0.0–0.10)
-        if (blacks != 0.0) {
-            float mask = 1.0 - smoothstep(0.0, 0.10, lum);
-            adj += blacks / 100.0 * 0.08 * mask;
-        }
-
-        // Apply adjustment preserving color ratios.
-        // Soft blend: additive for dark pixels, ratio for bright pixels.
+        // Apply via luminance ratio with soft additive fallback for darks
         if (adj != 0.0) {
             float lumPost = dot(color, vec3(0.2126, 0.7152, 0.0722));
             float target = max(lumPost + adj, 0.0);
-            float blend = smoothstep(0.05, 0.20, lumPost);
+            float blend = smoothstep(0.02, 0.10, lumPost);
             vec3 addResult = max(color + adj, 0.0);
-            vec3 ratResult = (lumPost > 0.001) ? color * (target / lumPost) : addResult;
+            vec3 ratResult = (lumPost > 0.0001) ? color * (target / lumPost) : addResult;
             color = mix(addResult, ratResult, blend);
         }
+
+        // --- Back to sRGB gamma ---
+        color = pow(max(color, 0.0), vec3(1.0 / 2.2));
     }
 
-    // 8. Color adjustments (Saturation, Vibrance)
+    // 8. Color adjustments (Saturation, Vibrance) — in sRGB/perceptual space
     {
         float gray = dot(color, vec3(0.2126, 0.7152, 0.0722));
 
-        // Saturation: uniform linear mix
+        // Saturation: uniform linear mix (§14)
         if (saturation != 0.0) {
             float s = saturation / 100.0;
             color = mix(vec3(gray), color, 1.0 + s);
         }
 
-        // Vibrance: weighted by inverse saturation + skin tone protection
+        // Vibrance: non-linear saturation boost with skin tone protection (§13)
         if (vibrance != 0.0) {
             float maxC = max(color.r, max(color.g, color.b));
             float minC = min(color.r, min(color.g, color.b));
-            float sat = (maxC > 0.001) ? (maxC - minC) / maxC : 0.0;
-            float weight = 1.0 - sat;
+            float range = maxC - minC;
+            float sat = (maxC > 0.001) ? range / maxC : 0.0;
+
+            // g(S) = (1-S)^gamma — low saturation gets more boost (§13.1)
+            float weight = pow(1.0 - sat, 1.5);
+
+            // h(H) — skin tone protection: reduce effect near hue ≈ 20° (§13.1)
+            float skinProtect = 1.0;
+            if (range > 0.001) {
+                float hue;
+                if (maxC == color.r) {
+                    hue = mod((color.g - color.b) / range, 6.0) / 6.0;
+                } else if (maxC == color.g) {
+                    hue = ((color.b - color.r) / range + 2.0) / 6.0;
+                } else {
+                    hue = ((color.r - color.g) / range + 4.0) / 6.0;
+                }
+                // Gaussian centered at 20° (0.055), sigma 15° (0.042)
+                float d = abs(hue - 0.055);
+                d = min(d, 1.0 - d);  // circular distance
+                skinProtect = 1.0 - 0.6 * exp(-(d * d) / (2.0 * 0.042 * 0.042));
+            }
+
             float v = vibrance / 100.0;
-            color = mix(vec3(gray), color, 1.0 + v * weight);
+            color = mix(vec3(gray), color, 1.0 + v * weight * skinProtect);
         }
     }
 
