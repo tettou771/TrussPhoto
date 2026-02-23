@@ -186,7 +186,13 @@ void tcApp::setup() {
             g->clearFilterPhotoIds();
         } else {
             auto ids = provider_.getCollectionPhotoIds(collectionId);
-            g->setFilterPhotoIds(unordered_set<string>(ids.begin(), ids.end()));
+            if (ids.empty()) {
+                // Empty collection (or smart collection with no static members)
+                // Use a sentinel ID that matches nothing to show 0 results
+                g->setFilterPhotoIds({"__empty_collection__"});
+            } else {
+                g->setFilterPhotoIds(unordered_set<string>(ids.begin(), ids.end()));
+            }
         }
         g->populate(provider_);
         redraw();
@@ -211,6 +217,72 @@ void tcApp::setup() {
         updateLayout();
         redraw();
     });
+
+    // Collection tree: right-click context menu
+    collectionContextMenuListener_ = collectionTree_->contextMenuRequested.listen(
+        [this](ContextMenu::Ptr& menu) { showContextMenu(menu); });
+
+    collectionTree_->onRenameRequested = [this](int collectionId, const string& currentName) {
+        if (!nameOverlay_) return;
+        nameOverlay_->onConfirm = [this, collectionId](const string& newName) {
+            provider_.renameCollection(collectionId, newName);
+            collectionTree_->buildTree(provider_.getCollections());
+            nameOverlay_->hide();
+            redraw();
+        };
+        nameOverlay_->onCancel = [this]() { nameOverlay_->hide(); redraw(); };
+        nameOverlay_->setSize(getWindowWidth(), getWindowHeight());
+        nameOverlay_->show(currentName, "Collection name");
+        redraw();
+    };
+
+    collectionTree_->onCreateRequested = [this](int parentId) {
+        if (!nameOverlay_) return;
+        nameOverlay_->onConfirm = [this, parentId](const string& name) {
+            provider_.createCollection(name, parentId);
+            collectionTree_->buildTree(provider_.getCollections());
+            nameOverlay_->hide();
+            redraw();
+        };
+        nameOverlay_->onCancel = [this]() { nameOverlay_->hide(); redraw(); };
+        nameOverlay_->setSize(getWindowWidth(), getWindowHeight());
+        nameOverlay_->show("", "New collection name");
+        redraw();
+    };
+
+    collectionTree_->onDeleteRequested = [this](int collectionId, const string& name) {
+        string msg = "Delete collection \"" + name + "\"?\nPhotos will not be deleted.";
+        if (confirmDialog("Delete Collection", msg)) {
+            provider_.deleteCollection(collectionId);
+            collectionTree_->buildTree(provider_.getCollections());
+            if (collectionTree_->getSelectedId() == collectionId) {
+                collectionTree_->clearSelection();
+            }
+            redraw();
+        }
+    };
+
+    collectionTree_->hasSelectedPhotos = [this]() -> bool {
+        return grid() && grid()->hasSelection();
+    };
+
+    collectionTree_->onAddSelectedPhotos = [this](int collectionId) {
+        if (!grid()) return;
+        auto ids = grid()->getSelectedIds();
+        if (ids.empty()) return;
+        provider_.addToCollection(collectionId, ids);
+        collectionTree_->buildTree(provider_.getCollections());
+        logNotice() << "[Collection] Added " << ids.size()
+                    << " photos to collection " << collectionId;
+        redraw();
+    };
+
+    // Name edit overlay (shared modal for rename/create)
+    nameOverlay_ = make_shared<NameEditOverlay>();
+    loadJapaneseFont(nameOverlayFont_, 14);
+    nameOverlay_->fontRef = &nameOverlayFont_;
+    addChild(nameOverlay_);
+    nameOverlay_->setActive(false);
 
     // Build collection tree if we have collections
     if (!provider_.getCollections().empty()) {
@@ -866,6 +938,27 @@ void tcApp::draw() {
         popStyle();
     }
 
+    // Drag badge (drawn on top of everything)
+    if (isDraggingToCollection_ && !dragPhotoIds_.empty()) {
+        pushStyle();
+        Vec2 mouse = getMousePos();
+        string badge = to_string(dragPhotoIds_.size()) + " photo" +
+            (dragPhotoIds_.size() > 1 ? "s" : "");
+        float badgeW = fontSmall_.getWidth(badge) + 16;
+        float badgeH = 20;
+        float bx = mouse.x + 12;
+        float by = mouse.y - 10;
+
+        setColor(0.2f, 0.4f, 0.7f, 0.9f);
+        fill();
+        drawRect(bx, by, badgeW, badgeH);
+
+        setColor(1, 1, 1);
+        fontSmall_.drawString(badge, bx + 8, by + badgeH * 0.5f,
+            Direction::Left, Direction::Center);
+        popStyle();
+    }
+
     // Status bar draws itself via Node tree (addChild in setup)
     statusBar_->setFps(getFrameRate());
     statusBar_->setRamGiB(StatusBar::measureRamGiB());
@@ -1314,6 +1407,11 @@ void tcApp::mousePressed(Vec2 pos, int button) {
     if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related ||
         viewMode() == ViewMode::People || viewMode() == ViewMode::Single ||
         viewMode() == ViewMode::Crop) return;
+
+    // Record drag start for potential collection drag
+    if (button == 0) {
+        dragStartPos_ = pos;
+    }
 }
 
 void tcApp::showContextMenu(ContextMenu::Ptr menu) {
@@ -1347,7 +1445,26 @@ void tcApp::closeContextMenu() {
 }
 
 void tcApp::mouseReleased(Vec2 pos, int button) {
-    (void)pos;
+    if (button == 0 && isDraggingToCollection_) {
+        isDraggingToCollection_ = false;
+
+        // Check if dropped on a collection
+        if (collectionTree_ && collectionTree_->getActive()) {
+            Vec2 localPos = pos - Vec2(collectionTree_->getX(), collectionTree_->getY());
+            int dropId = collectionTree_->getDropTargetId(localPos);
+            if (dropId > 0 && !dragPhotoIds_.empty()) {
+                provider_.addToCollection(dropId, dragPhotoIds_);
+                collectionTree_->buildTree(provider_.getCollections());
+                logNotice() << "[Drag] Added " << dragPhotoIds_.size()
+                            << " photos to collection " << dropId;
+            }
+        }
+        collectionTree_->clearDropHighlight();
+        dragPhotoIds_.clear();
+        redraw();
+        return;
+    }
+
     if (button == 0) {
         redraw();
     }
@@ -1363,6 +1480,25 @@ void tcApp::mouseDragged(Vec2 pos, int button) {
     if (viewMode() == ViewMode::Map || viewMode() == ViewMode::Related ||
         viewMode() == ViewMode::People || viewMode() == ViewMode::Single ||
         viewMode() == ViewMode::Crop) return;
+
+    if (button != 0) return;
+
+    // Start drag if threshold exceeded and we have selected photos
+    if (!isDraggingToCollection_) {
+        float dist = (pos - dragStartPos_).length();
+        if (dist > dragThreshold_ && grid() && grid()->hasSelection()) {
+            isDraggingToCollection_ = true;
+            dragPhotoIds_ = grid()->getSelectedIds();
+        }
+    }
+
+    // Update drop target highlight
+    if (isDraggingToCollection_ && collectionTree_ && collectionTree_->getActive()) {
+        Vec2 localPos = pos - Vec2(collectionTree_->getX(), collectionTree_->getY());
+        int dropId = collectionTree_->getDropTargetId(localPos);
+        collectionTree_->setDropHighlight(dropId);
+        redraw();
+    }
 }
 
 void tcApp::mouseScrolled(Vec2 delta) {

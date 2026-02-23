@@ -18,6 +18,7 @@
 #include "ui/PaneToggle.h"
 #include "ui/SearchBar.h"
 #include "ui/ContextMenu.h"
+#include "ui/NameEditOverlay.h"
 #include "ui/StatusBar.h"
 #include "views/ViewManager.h"
 #include "UploadQueue.h"
@@ -117,6 +118,18 @@ private:
     void showContextMenu(ContextMenu::Ptr menu);
     void closeContextMenu();
 
+    // Name edit overlay (shared modal for rename/create)
+    shared_ptr<NameEditOverlay> nameOverlay_;
+
+    // Collection tree context menu
+    EventListener collectionContextMenuListener_;
+
+    // Drag & drop (Grid -> CollectionTree)
+    bool isDraggingToCollection_ = false;
+    Vec2 dragStartPos_;
+    vector<string> dragPhotoIds_;
+    static constexpr float dragThreshold_ = 8.0f;
+
     // Modifier key tracking
     bool cmdDown_ = false;
     bool shiftDown_ = false;
@@ -128,6 +141,7 @@ private:
     // Fonts
     Font font_;
     Font fontSmall_;
+    Font nameOverlayFont_;
 
     // Helper accessors (convenience shortcuts into ViewManager)
     PhotoGrid::Ptr grid() { return viewManager_ ? viewManager_->gridView()->grid() : nullptr; }

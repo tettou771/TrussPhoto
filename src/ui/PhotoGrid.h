@@ -267,6 +267,12 @@ protected:
             int dataIdx = reverseMap_[poolIdx];
             if (dataIdx < 0 || !provider_) return;
 
+            // Auto-select right-clicked photo if not already selected
+            if (!isSelected(dataIdx)) {
+                clearSelection();
+                toggleSelection(dataIdx);
+            }
+
             string photoId = photoIds_[dataIdx];
             auto* photo = provider_->getPhoto(photoId);
             if (!photo) return;
@@ -281,9 +287,9 @@ protected:
             menu->addChild(make_shared<MenuSeparator>());
 
             menu->addChild(make_shared<MenuItem>("Delete",
-                [this, photoId]() {
-                    vector<string> ids = {photoId};
-                    deleteRequested.notify(ids);
+                [this]() {
+                    auto ids = getSelectedIds();
+                    if (!ids.empty()) deleteRequested.notify(ids);
                 }));
 
             menu->addChild(make_shared<MenuSeparator>());
