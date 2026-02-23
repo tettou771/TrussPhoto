@@ -107,54 +107,62 @@ void main() {
     // 7. Tone adjustments (Contrast, Highlights, Shadows, Whites, Blacks)
     // Lr uses Local Laplacian Filters (image-adaptive) which we can't do
     // in a pixel shader, so we approximate with a global parametric curve.
-    // Zone ranges based on Lr documentation (§9.3).
+    // Lr processes in linear ProPhoto RGB; we process in sRGB gamma.
+    // Zone ranges from Lr §9.3 (linear) are converted to sRGB equivalents.
     {
         float lum = clamp(dot(color, vec3(0.2126, 0.7152, 0.0722)), 0.0, 1.0);
 
-        // Contrast: S-curve via smoothstep blend (pivot at 0.5)
-        // Lr uses sigmoid around 18% gray; we approximate in gamma space.
+        // Contrast: S-curve via smoothstep blend (pivot at 18% gray ≈ sRGB 0.46)
         if (contrast != 0.0) {
             float c = contrast / 100.0;
-            // smoothstep(0,1,x) = 3x²-2x³: a natural S-curve
             vec3 clamped = clamp(color, 0.0, 1.0);
-            vec3 scurve = clamped * clamped * (3.0 - 2.0 * clamped);
-            // Blend toward (positive) or away from (negative) S-curve
-            color = mix(color, scurve + (color - clamped), c * 0.4);
+            // Remap so pivot (0.46) maps to 0.5, apply smoothstep S-curve, remap back
+            vec3 norm = clamp(clamped * (0.5 / 0.46), 0.0, 1.0);  // 0.46 → 0.5
+            vec3 scurve = norm * norm * (3.0 - 2.0 * norm);        // Hermite S-curve
+            scurve = scurve * (0.46 / 0.5);                        // 0.5 → 0.46
+            color = mix(color, scurve + (color - clamped), c * 0.5);
         }
 
-        // Accumulate luminance adjustment from zone masks
-        // Zone ranges matched to Lr (§9.3 of Lightroom_develop_algorithm.md)
+        // Accumulate luminance adjustment from zone masks.
+        // Lr §9.3 linear ranges → sRGB: pow(x, 1/2.2)
+        //   Shadows  0.05–0.35 lin → ~0.25–0.62 sRGB
+        //   Highlights 0.65–0.95 lin → ~0.82–0.98 sRGB
+        //   Blacks   0.00–0.10 lin → ~0.00–0.35 sRGB
+        //   Whites   0.90–1.00 lin → ~0.95–1.00 sRGB
         float adj = 0.0;
 
-        // Highlights: 0.65–0.95 (Lr spec). Gentle rolloff.
+        // Highlights: ramp up in bright zone (sRGB 0.70–0.95)
         if (highlights != 0.0) {
-            float mask = smoothstep(0.55, 0.90, lum);
-            adj += highlights / 100.0 * 0.20 * mask;
+            float mask = smoothstep(0.70, 0.95, lum);
+            adj += highlights / 100.0 * 0.25 * mask;
         }
-        // Shadows: 0.05–0.35 (Lr spec).
+
+        // Shadows: bell-shaped mask — lifts shadow detail but preserves
+        // true blacks (which the Blacks slider controls).
+        // Rises from 0.03, peaks at ~0.15–0.35, falls to 0 at ~0.60.
         if (shadows != 0.0) {
-            float mask = 1.0 - smoothstep(0.10, 0.40, lum);
-            adj += shadows / 100.0 * 0.20 * mask;
+            float mask = smoothstep(0.03, 0.15, lum) * (1.0 - smoothstep(0.35, 0.60, lum));
+            adj += shadows / 100.0 * 0.30 * mask;
         }
-        // Whites: 0.90–1.00 (Lr spec). Narrow.
+
+        // Whites: narrow top end — white point adjustment (sRGB 0.92–1.0)
         if (whites != 0.0) {
-            float mask = smoothstep(0.85, 1.0, lum);
-            adj += whites / 100.0 * 0.10 * mask;
+            float mask = smoothstep(0.92, 1.0, lum);
+            adj += whites / 100.0 * 0.12 * mask;
         }
-        // Blacks: 0.00–0.10 (Lr spec). Narrow.
+
+        // Blacks: narrow bottom — black point adjustment (sRGB 0.0–0.10)
         if (blacks != 0.0) {
-            float mask = 1.0 - smoothstep(0.0, 0.15, lum);
-            adj += blacks / 100.0 * 0.10 * mask;
+            float mask = 1.0 - smoothstep(0.0, 0.10, lum);
+            adj += blacks / 100.0 * 0.08 * mask;
         }
 
         // Apply adjustment preserving color ratios.
-        // Use soft blending between ratio (bright) and additive (dark)
-        // to prevent ratio explosion in shadows.
+        // Soft blend: additive for dark pixels, ratio for bright pixels.
         if (adj != 0.0) {
             float lumPost = dot(color, vec3(0.2126, 0.7152, 0.0722));
             float target = max(lumPost + adj, 0.0);
-            // Soft blend: full additive at lum<0.05, full ratio at lum>0.15
-            float blend = smoothstep(0.05, 0.15, lumPost);
+            float blend = smoothstep(0.05, 0.20, lumPost);
             vec3 addResult = max(color + adj, 0.0);
             vec3 ratResult = (lumPost > 0.001) ? color * (target / lumPost) : addResult;
             color = mix(addResult, ratResult, blend);
