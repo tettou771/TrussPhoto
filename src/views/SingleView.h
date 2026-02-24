@@ -426,7 +426,21 @@ public:
 
         auto [x, y, drawW, drawH] = calcDrawRect(cropPxW, cropPxH);
 
-        if ((hasRotation || hasPersp) && hasFbo) {
+        // Resolve texture source (FBO > preview > fullImage)
+        sg_view texView;
+        sg_sampler texSampler;
+        if (hasFbo) {
+            texView = developShader_.getFboView();
+            texSampler = developShader_.getFboSampler();
+        } else if (hasPreviewRaw) {
+            texView = previewTexture_.getView();
+            texSampler = previewTexture_.getSampler();
+        } else {
+            texView = fullImage_.getTexture().getView();
+            texSampler = fullImage_.getTexture().getSampler();
+        }
+
+        if (hasRotation || hasPersp) {
             float drawCX = x + drawW / 2;
             float drawCY = y + drawH / 2;
 
@@ -459,7 +473,7 @@ public:
 
                 setColor(1.0f, 1.0f, 1.0f);
                 sgl_enable_texture();
-                sgl_texture(developShader_.getFboView(), developShader_.getFboSampler());
+                sgl_texture(texView, texSampler);
                 Color col = getDefaultContext().getColor();
                 sgl_begin_quads();
                 sgl_c4f(col.r, col.g, col.b, col.a);
@@ -474,7 +488,7 @@ public:
                 int tessN = 16;
                 setColor(1.0f, 1.0f, 1.0f);
                 sgl_enable_texture();
-                sgl_texture(developShader_.getFboView(), developShader_.getFboSampler());
+                sgl_texture(texView, texSampler);
                 Color col = getDefaultContext().getColor();
 
                 sgl_begin_triangles();
@@ -509,15 +523,9 @@ public:
         } else {
             // No rotation: simple axis-aligned draw
             setColor(1.0f, 1.0f, 1.0f);
-            if (hasFbo) {
-                drawTextureView(developShader_.getFboView(), developShader_.getFboSampler(),
-                                x, y, drawW, drawH,
-                                ucX, ucY, ucX + ucW, ucY + ucH);
-            } else if (hasPreviewRaw) {
-                previewTexture_.draw(x, y, drawW, drawH);
-            } else {
-                fullImage_.draw(x, y, drawW, drawH);
-            }
+            drawTextureView(texView, texSampler,
+                            x, y, drawW, drawH,
+                            ucX, ucY, ucX + ucW, ucY + ucH);
         }
     }
 

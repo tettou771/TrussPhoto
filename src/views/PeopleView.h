@@ -724,9 +724,8 @@ private:
 
         bool onMouseDrag(Vec2 pos, int button) override {
             if (button != 0 || !mouseDown_) return false;
-            float gx, gy;
-            localToGlobal(pos.x, pos.y, gx, gy);
-            Vec2 screenPos{gx, gy};
+            Vec3 gp = localToGlobal(Vec3(pos.x, pos.y, 0));
+            Vec2 screenPos{gp.x, gp.y};
             if (!isDragging_) {
                 float dist = screenPos.distance(mouseDownPos_);
                 if (dist > 5.0f) {
@@ -742,9 +741,8 @@ private:
 
         bool onMouseRelease(Vec2 pos, int button) override {
             if (button != 0) return false;
-            float gx, gy;
-            localToGlobal(pos.x, pos.y, gx, gy);
-            Vec2 screenPos{gx, gy};
+            Vec3 gp = localToGlobal(Vec3(pos.x, pos.y, 0));
+            Vec2 screenPos{gp.x, gp.y};
             if (isDragging_) {
                 if (onDragEnd) onDragEnd(screenPos);
             } else {
@@ -1620,10 +1618,9 @@ private:
                 cardItems_[dataIdx]->personId > 0 &&
                 dataIdx != selectedDataIdx_) {
 
-                float lx, ly;
-                card->globalToLocal(screenPos.x, screenPos.y, lx, ly);
+                Vec3 lp = card->globalToLocal(Vec3(screenPos.x, screenPos.y, 0));
                 float cw = card->getWidth(), ch = card->getHeight();
-                if (lx >= 0 && lx < cw && ly >= 0 && ly < ch) {
+                if (lp.x >= 0 && lp.x < cw && lp.y >= 0 && lp.y < ch) {
                     newTarget = dataIdx;
                     card->dropHighlight = true;
                 } else {
