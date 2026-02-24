@@ -40,8 +40,9 @@ layout(binding=0) uniform fs_develop_params {
     float vigEnabled;
     vec2 imageSize;      // source image size in pixels
     float exposure;      // EV stops (-3 to +3), default 0
-    float wbTemp;        // temperature shift (-1 to +1), default 0
-    float wbTint;        // tint shift (-1 to +1), default 0
+    float wbR;           // WB red multiplier (default 1.0)
+    float wbG;           // WB green multiplier (default 1.0)
+    float wbB;           // WB blue multiplier (default 1.0)
     float contrast;      // -100 to +100, default 0
     float highlights;    // -100 to +100, default 0
     float shadows;       // -100 to +100, default 0
@@ -102,21 +103,21 @@ void main() {
             color *= pow(2.0, exposure);
         }
 
-        // White balance (linear RGB multiplier, §5)
-        if (wbTemp != 0.0 || wbTint != 0.0) {
-            color.r *= 1.0 + wbTemp * 0.2;
-            color.b *= 1.0 - wbTemp * 0.2;
-            color.g *= 1.0 - wbTint * 0.2;
-        }
+        // White balance (physically-based RGB multiplier from Bradford CAT)
+        // Default (1,1,1) = no correction. Computed on CPU from color temperature.
+        color *= vec3(wbR, wbG, wbB);
 
-        // Contrast: log-space expansion (pivot at 18% gray = linear 0.18)
-        // Log space is perceptually uniform, gives a natural S-curve.
+        // Contrast: sigmoid S-curve (pivot at 18% gray = linear 0.18)
+        // f(x) = x^p / (x^p + k^p) * k for pivot preservation
         if (contrast != 0.0) {
-            float c = contrast / 100.0 * 0.3;
-            float logMid = log2(0.18);  // -2.474
-            vec3 logC = log2(max(color, vec3(0.00001)));
-            logC = logMid + (logC - logMid) * (1.0 + c);
-            color = max(exp2(logC), 0.0);
+            float c = contrast / 100.0;
+            float p = 1.0 + c * 1.5;  // positive → steepen, negative → flatten
+            vec3 ratio = max(color, vec3(0.00001)) / 0.18;
+            vec3 rp = pow(ratio, vec3(p));
+            vec3 sig = rp / (rp + 1.0);
+            // Normalize so sigmoid(1.0) maps back to 0.18
+            // sigmoid(1) = 1^p / (1^p + 1) = 0.5, so multiply by 0.18/0.5 = 0.36
+            color = sig * 0.36;
         }
 
         // Blacks: black-point curve bend (levels-style remap)
@@ -133,12 +134,16 @@ void main() {
             }
         }
 
-        // Whites: white-point curve bend (masked to highlights only)
+        // Whites: levels-style white-point adjustment (global, symmetric to Blacks)
         if (whites != 0.0) {
-            float lumNow = dot(color, vec3(0.2126, 0.7152, 0.0722));
-            float mask = smoothstep(0.80, 1.0, clamp(lumNow, 0.0, 1.0));
-            float scale = 1.0 + whites / 100.0 * 0.12;
-            color = mix(color, color * scale, mask);
+            float w = whites / 100.0;
+            if (w > 0.0) {
+                // Extend: push white point out (brighten highlights globally)
+                color = color / (1.0 - w * 0.06);
+            } else {
+                // Compress: pull white point in (darken highlights globally)
+                color = color * (1.0 + w * 0.06);
+            }
         }
 
         // Highlights / Shadows: zone-based adjustment via luminance ratio.

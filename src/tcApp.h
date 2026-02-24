@@ -95,6 +95,7 @@ private:
     // Background pipeline flags
     bool spQueued_ = false;
     bool embeddingsQueued_ = false;
+    bool wbBackfillQueued_ = false;
     bool visionModelUnloaded_ = false;
 
     // Event listeners (RAII — auto-disconnect on destroy)

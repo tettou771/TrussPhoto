@@ -34,6 +34,7 @@ namespace fs = std::filesystem;
 #include "ai/FaceDetector.h"
 #include "ai/FaceRecognizer.h"
 #include "pipeline/LrcatImporter.h"
+#include "pipeline/WhiteBalance.h"
 
 // Photo provider - manages local + server photos
 class PhotoProvider {
@@ -683,7 +684,7 @@ public:
         return true;
     }
 
-    bool setDevelop(const string& id, float exposure, float wbTemp, float wbTint,
+    bool setDevelop(const string& id, float exposure, float temperature, float tint,
                     float contrast, float highlights, float shadows,
                     float whites, float blacks,
                     float vibrance, float saturation,
@@ -691,8 +692,8 @@ public:
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
         it->second.devExposure = exposure;
-        it->second.devWbTemp = wbTemp;
-        it->second.devWbTint = wbTint;
+        it->second.devTemperature = temperature;
+        it->second.devTint = tint;
         it->second.devContrast = contrast;
         it->second.devHighlights = highlights;
         it->second.devShadows = shadows;
@@ -702,7 +703,7 @@ public:
         it->second.devSaturation = saturation;
         it->second.chromaDenoise = chroma;
         it->second.lumaDenoise = luma;
-        db_.updateDevelop(id, exposure, wbTemp, wbTint,
+        db_.updateDevelop(id, exposure, temperature, tint,
                           contrast, highlights, shadows, whites, blacks,
                           vibrance, saturation, chroma, luma);
         return true;
@@ -1987,8 +1988,8 @@ public:
             if (photo.devContrast != 0 || photo.devHighlights != 0 || photo.devShadows != 0 ||
                 photo.devWhites != 0 || photo.devBlacks != 0 ||
                 photo.devVibrance != 0 || photo.devSaturation != 0 ||
-                photo.devExposure != 0) {
-                db_.updateDevelop(id, photo.devExposure, photo.devWbTemp, photo.devWbTint,
+                photo.devExposure != 0 || photo.devTemperature != 0) {
+                db_.updateDevelop(id, photo.devExposure, photo.devTemperature, photo.devTint,
                                   photo.devContrast, photo.devHighlights, photo.devShadows,
                                   photo.devWhites, photo.devBlacks,
                                   photo.devVibrance, photo.devSaturation,
@@ -2000,6 +2001,52 @@ public:
             logNotice() << "[DevelopBackfill] Updated " << count << " photos";
         }
         return count;
+    }
+
+    // --- As-Shot WB Backfill (from LibRaw cam_mul) ---
+
+    bool isWbBackfillRunning() const { return wbBackfillRunning_; }
+
+    int queueWbBackfill() {
+        if (wbBackfillRunning_) return 0;
+
+        vector<pair<string, string>> jobs;  // {id, localPath}
+        for (const auto& [id, photo] : photos_) {
+            if (!photo.isRaw) continue;
+            if (photo.asShotTemp > 0) continue;  // already has WB
+            if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
+            jobs.push_back({id, photo.localPath});
+        }
+
+        if (jobs.empty()) return 0;
+
+        // Backup DB before bulk write
+        backupDatabase();
+
+        startWbBackfillThread(jobs);
+        return (int)jobs.size();
+    }
+
+    struct WbBackfillResult {
+        string photoId;
+        float asShotTemp = 0;
+        float asShotTint = 0;
+    };
+
+    void processWbBackfillResults() {
+        lock_guard<mutex> lock(wbBackfillMutex_);
+        for (const auto& r : completedWbBackfills_) {
+            auto it = photos_.find(r.photoId);
+            if (it == photos_.end()) continue;
+            auto& photo = it->second;
+            photo.asShotTemp = r.asShotTemp;
+            photo.asShotTint = r.asShotTint;
+            db_.updateAsShotWb(r.photoId, r.asShotTemp, r.asShotTint);
+        }
+        if (!completedWbBackfills_.empty()) {
+            logNotice() << "[WbBackfill] Saved " << completedWbBackfills_.size() << " results to DB";
+        }
+        completedWbBackfills_.clear();
     }
 
     // --- CLIP Embedding ---
@@ -2431,6 +2478,7 @@ public:
         if (copyThread_.joinable()) copyThread_.join();
         if (consolidateThread_.joinable()) consolidateThread_.join();
         if (exifBackfillThread_.joinable()) exifBackfillThread_.join();
+        if (wbBackfillThread_.joinable()) wbBackfillThread_.join();
     }
 
 private:
@@ -2518,6 +2566,13 @@ private:
     atomic<bool> exifBackfillRunning_{false};
     thread exifBackfillThread_;
     static constexpr int EXIF_BACKFILL_WORKERS = 2;
+
+    // WB backfill (as-shot temperature from LibRaw cam_mul)
+    mutable mutex wbBackfillMutex_;
+    vector<WbBackfillResult> completedWbBackfills_;
+    atomic<bool> wbBackfillRunning_{false};
+    thread wbBackfillThread_;
+    static constexpr int WB_BACKFILL_WORKERS = 1; // LibRaw open_file is not thread-safe (SIGBUS)
 
     // CLIP embedding
     ClipEmbedder clipEmbedder_;
@@ -3867,6 +3922,92 @@ private:
         if (photo.localPath.empty() || !fs::exists(photo.localPath)) return;
         if (!photo.isManaged) return;  // don't write XMP for external references
         writeXmpSidecar(photo.localPath, photo);
+    }
+
+    // Backup library.db with timestamp before bulk operations
+    void backupDatabase() {
+        string src = databasePath_;
+        if (!fs::exists(src)) return;
+
+        auto now = chrono::system_clock::now();
+        auto tt = chrono::system_clock::to_time_t(now);
+        struct tm lt;
+        localtime_r(&tt, &lt);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &lt);
+
+        string dst = catalogDir_ + "/library_backup_" + string(buf) + ".db";
+        try {
+            fs::copy_file(src, dst, fs::copy_options::skip_existing);
+            logNotice() << "[Backup] " << dst;
+        } catch (const exception& e) {
+            logWarning() << "[Backup] Failed: " << e.what();
+        }
+    }
+
+    // WB backfill thread: extract as-shot WB from LibRaw cam_mul
+    void startWbBackfillThread(const vector<pair<string, string>>& jobs) {
+        if (wbBackfillRunning_) return;
+        wbBackfillRunning_ = true;
+
+        if (wbBackfillThread_.joinable()) wbBackfillThread_.join();
+
+        auto sharedJobs = make_shared<vector<pair<string, string>>>(jobs);
+
+        logNotice() << "[WbBackfill] Starting " << sharedJobs->size() << " jobs with "
+                     << WB_BACKFILL_WORKERS << " workers";
+
+        wbBackfillThread_ = thread([this, sharedJobs]() {
+            atomic<int> nextIdx{0};
+            int total = (int)sharedJobs->size();
+            atomic<int> errorCount{0};
+
+            auto worker = [&]() {
+                while (!stopping_) {
+                    int idx = nextIdx.fetch_add(1);
+                    if (idx >= total) break;
+
+                    const auto& [id, path] = (*sharedJobs)[idx];
+
+                    WbBackfillResult result;
+                    result.photoId = id;
+
+                    LibRaw raw;
+                    int err = raw.open_file(path.c_str());
+                    if (err != LIBRAW_SUCCESS) {
+                        raw.recycle();
+                        errorCount++;
+                        continue;
+                    }
+
+                    float* cm = raw.imgdata.color.cam_mul;
+                    float g = cm[1];
+                    if (g <= 0) {
+                        raw.recycle();
+                        continue;
+                    }
+
+                    result.asShotTemp = wb::camMulToKelvin(cm[0] / g, 1.0f, cm[2] / g);
+                    result.asShotTint = 0;
+                    raw.recycle();
+
+                    if (result.asShotTemp > 0) {
+                        lock_guard<mutex> lock(wbBackfillMutex_);
+                        completedWbBackfills_.push_back(result);
+                    }
+
+                    if (total > 0 && (idx + 1) % (max(1, total / 4)) == 0) {
+                        logNotice() << "[WbBackfill] " << (idx + 1) << "/" << total;
+                    }
+                }
+            };
+
+            worker(); // single-threaded: LibRaw open_file is not thread-safe
+
+            logNotice() << "[WbBackfill] Complete: " << total << " photos, "
+                         << errorCount.load() << " errors";
+            wbBackfillRunning_ = false;
+        });
     }
 
     // EXIF backfill thread: re-read EXIF from local files for v9 fields

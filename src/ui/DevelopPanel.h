@@ -28,8 +28,14 @@ public:
 
         // Create sliders - Basic section (GPU, no debounce)
         exposureSlider_ = make_shared<DevelopSlider>("Exposure", 0.0f, -3.0f, 3.0f);
-        tempSlider_ = make_shared<DevelopSlider>("Temperature", 0.0f, -1.0f, 1.0f);
-        tintSlider_ = make_shared<DevelopSlider>("Tint", 0.0f, -1.0f, 1.0f);
+        tempSlider_ = make_shared<DevelopSlider>("Temperature", 5500.0f, 2000.0f, 12000.0f);
+        tintSlider_ = make_shared<DevelopSlider>("Tint", 0.0f, -150.0f, 150.0f);
+        tempSlider_->formatValue = [](float v) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%dK", (int)v);
+            return string(buf);
+        };
+        tintSlider_->centerZero = true;
 
         exposureSlider_->onChange = [this](float) {
             settingsChanged.notify();
@@ -113,13 +119,13 @@ public:
     float getChromaDenoise() const { return chromaSlider_->value; }
     float getLumaDenoise() const { return lumaSlider_->value; }
 
-    void setValues(float exposure, float temp, float tint,
+    void setValues(float exposure, float temperature, float tint,
                    float contrast, float highlights, float shadows,
                    float whites, float blacks,
                    float vibrance, float saturation,
                    float chroma, float luma) {
         exposureSlider_->value = exposure;
-        tempSlider_->value = temp;
+        tempSlider_->value = temperature;
         tintSlider_->value = tint;
         contrastSlider_->value = contrast;
         highlightsSlider_->value = highlights;
@@ -131,6 +137,12 @@ public:
         chromaSlider_->value = chroma;
         lumaSlider_->value = luma;
         redraw();
+    }
+
+    // Set as-shot WB as double-click reset default
+    void setAsShotDefaults(float asShotTemp, float asShotTint) {
+        tempSlider_->defaultVal = (asShotTemp > 0) ? asShotTemp : 5500.0f;
+        tintSlider_->defaultVal = asShotTint;
     }
 
     void setNrEnabled(bool en) {

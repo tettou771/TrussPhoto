@@ -23,6 +23,7 @@ public:
     bool enabled = true;
     bool centerZero = false;  // true: draw fill from center, show center mark
     function<void(float)> onChange;
+    function<string(float)> formatValue;  // custom value display (optional)
 
     DevelopSlider() = default;
 
@@ -49,15 +50,21 @@ public:
         drawBitmapString(label, pad, 14);
 
         // Value text
-        char buf[16];
-        if (centerZero) {
-            snprintf(buf, sizeof(buf), "%+.0f", value);
+        string valStr;
+        if (formatValue) {
+            valStr = formatValue(value);
         } else {
-            snprintf(buf, sizeof(buf), "%.2f", value);
+            char buf[16];
+            if (centerZero) {
+                snprintf(buf, sizeof(buf), "%+.0f", value);
+            } else {
+                snprintf(buf, sizeof(buf), "%.2f", value);
+            }
+            valStr = buf;
         }
         setColor(0.75f * dim, 0.75f * dim, 0.8f * dim);
-        float tw = getBitmapStringWidth(buf);
-        drawBitmapString(buf, w - pad - tw, 14);
+        float tw = getBitmapStringWidth(valStr);
+        drawBitmapString(valStr, w - pad - tw, 14);
 
         // Track background
         float trackLeft = pad;

@@ -269,7 +269,7 @@ public:
             float margin = 60;
             if (pos.x >= bbRect_.x - margin && pos.x <= bbRect_.x + bbRect_.w + margin &&
                 pos.y >= bbRect_.y - margin && pos.y <= bbRect_.y + bbRect_.h + margin)
-                setCursor(Cursor::Rotate);
+                setCursor(Cursor::Custom0); // rotate cursor
             else
                 setCursor(Cursor::Default);
         }
@@ -1591,7 +1591,7 @@ private:
     void updateCursorForDrag() {
         switch (dragMode_) {
             case DragMode::Move:   setCursor(Cursor::ResizeAll); break;
-            case DragMode::Rotate: setCursor(Cursor::Rotate); break;
+            case DragMode::Rotate: setCursor(Cursor::Custom0); break; // rotate cursor
             case DragMode::TL:     setCursor(Cursor::ResizeNWSE); break;
             case DragMode::BR:     setCursor(Cursor::ResizeNWSE); break;
             case DragMode::TR:     setCursor(Cursor::ResizeNESW); break;
@@ -1699,7 +1699,8 @@ private:
             }
         }
 
-        bindCursorImage(Cursor::Rotate, S, S, pixels, S / 2, S / 2);
+        // set custom cursor image
+        bindCursorImage(Cursor::Custom0, S, S, pixels, S / 2, S / 2);
     }
 
     // Get target aspect ratio in BB-normalized space (crop w/h in 0-1 coords)

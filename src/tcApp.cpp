@@ -673,13 +673,15 @@ void tcApp::setup() {
     viewManager_->singleView()->init(getDataPath("profiles"));
 
     // Sync DevelopPanel sliders when photo changes
-    viewManager_->singleView()->onDevelopRestored = [this](float exp, float temp, float tint,
+    viewManager_->singleView()->onDevelopRestored = [this](float exp, float temperature, float tint,
                                                             float contrast, float highlights, float shadows,
                                                             float whites, float blacks,
                                                             float vibrance, float saturation,
-                                                            float chroma, float luma) {
+                                                            float chroma, float luma,
+                                                            float asShotTemp, float asShotTint) {
         if (developPanel_ && showDevelop_) {
-            developPanel_->setValues(exp, temp, tint,
+            developPanel_->setAsShotDefaults(asShotTemp, asShotTint);
+            developPanel_->setValues(exp, temperature, tint,
                                      contrast, highlights, shadows, whites, blacks,
                                      vibrance, saturation,
                                      chroma, luma);
@@ -786,6 +788,11 @@ void tcApp::update() {
 
     // Process EXIF backfill results
     provider_.processExifBackfillResults();
+
+    // Process WB backfill results
+    provider_.processWbBackfillResults();
+
+    // WB backfill is deferred — as-shot WB is extracted during RAW decode instead
 
     // Process embedding generation results
     provider_.processEmbeddingResults();
@@ -1050,8 +1057,11 @@ void tcApp::keyPressed(int key) {
                     string photoId = singleView->currentPhotoId();
                     auto* entry = provider_.getPhoto(photoId);
                     if (entry) {
-                        developPanel_->setValues(entry->devExposure, entry->devWbTemp,
-                                                 entry->devWbTint,
+                        float temp = (entry->devTemperature > 0) ? entry->devTemperature
+                                     : (entry->asShotTemp > 0) ? entry->asShotTemp : 5500.0f;
+                        developPanel_->setAsShotDefaults(entry->asShotTemp, entry->asShotTint);
+                        developPanel_->setValues(entry->devExposure, temp,
+                                                 entry->devTint,
                                                  entry->devContrast, entry->devHighlights,
                                                  entry->devShadows, entry->devWhites,
                                                  entry->devBlacks,

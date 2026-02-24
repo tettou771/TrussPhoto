@@ -68,16 +68,20 @@ struct PhotoEntry {
     // Develop settings (per-photo)
     float chromaDenoise = 0.5f;  // 0-1, chroma noise reduction strength
     float lumaDenoise = 0.0f;    // 0-1, luma noise reduction strength
-    float devExposure = 0.0f;    // EV stops (-3 to +3)
-    float devWbTemp = 0.0f;      // temperature shift (-1 to +1)
-    float devWbTint = 0.0f;      // tint shift (-1 to +1)
-    float devContrast = 0.0f;    // -100 to +100
-    float devHighlights = 0.0f;  // -100 to +100
-    float devShadows = 0.0f;     // -100 to +100
-    float devWhites = 0.0f;      // -100 to +100
-    float devBlacks = 0.0f;      // -100 to +100
-    float devVibrance = 0.0f;    // -100 to +100
-    float devSaturation = 0.0f;  // -100 to +100
+    float devExposure = 0.0f;       // EV stops (-3 to +3)
+    float devTemperature = 0.0f;    // Color temperature (Kelvin, 0 = use as-shot)
+    float devTint = 0.0f;           // Tint (-150 to +150, LR compatible)
+    float devContrast = 0.0f;       // -100 to +100
+    float devHighlights = 0.0f;     // -100 to +100
+    float devShadows = 0.0f;        // -100 to +100
+    float devWhites = 0.0f;         // -100 to +100
+    float devBlacks = 0.0f;         // -100 to +100
+    float devVibrance = 0.0f;       // -100 to +100
+    float devSaturation = 0.0f;     // -100 to +100
+
+    // As-shot white balance (read-only, from camera RAW metadata)
+    float asShotTemp = 0;           // As-shot temperature (Kelvin, from cam_mul)
+    float asShotTint = 0;           // As-shot tint
 
     // Lens correction (JSON: Sony EXIF spline, DNG polynomial, or Fuji MakerNote)
     string lensCorrectionParams;
@@ -394,8 +398,8 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"chromaDenoise", e.chromaDenoise},
         {"lumaDenoise", e.lumaDenoise},
         {"devExposure", e.devExposure},
-        {"devWbTemp", e.devWbTemp},
-        {"devWbTint", e.devWbTint},
+        {"devTemperature", e.devTemperature},
+        {"devTint", e.devTint},
         {"devContrast", e.devContrast},
         {"devHighlights", e.devHighlights},
         {"devShadows", e.devShadows},
@@ -403,6 +407,8 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"devBlacks", e.devBlacks},
         {"devVibrance", e.devVibrance},
         {"devSaturation", e.devSaturation},
+        {"asShotTemp", e.asShotTemp},
+        {"asShotTint", e.asShotTint},
         {"lensCorrectionParams", e.lensCorrectionParams},
         {"exposureTime", e.exposureTime},
         {"exposureBias", e.exposureBias},
@@ -470,8 +476,8 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.chromaDenoise = j.value("chromaDenoise", 0.5f);
     e.lumaDenoise = j.value("lumaDenoise", 0.0f);
     e.devExposure = j.value("devExposure", 0.0f);
-    e.devWbTemp = j.value("devWbTemp", 0.0f);
-    e.devWbTint = j.value("devWbTint", 0.0f);
+    e.devTemperature = j.value("devTemperature", 0.0f);
+    e.devTint = j.value("devTint", 0.0f);
     e.devContrast = j.value("devContrast", 0.0f);
     e.devHighlights = j.value("devHighlights", 0.0f);
     e.devShadows = j.value("devShadows", 0.0f);
@@ -479,6 +485,8 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.devBlacks = j.value("devBlacks", 0.0f);
     e.devVibrance = j.value("devVibrance", 0.0f);
     e.devSaturation = j.value("devSaturation", 0.0f);
+    e.asShotTemp = j.value("asShotTemp", 0.0f);
+    e.asShotTint = j.value("asShotTint", 0.0f);
 
     e.lensCorrectionParams = j.value("lensCorrectionParams", string(""));
     e.exposureTime = j.value("exposureTime", string(""));

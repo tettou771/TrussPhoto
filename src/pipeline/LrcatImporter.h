@@ -171,9 +171,12 @@ public:
         auto [hasSat, lrSaturation] = extractFloat("Saturation");
         if (hasSat) e.devSaturation = lrSaturation;
 
-        // Note: LR Temperature/Tint are absolute Kelvin values (e.g. 3108K).
-        // Our devWbTemp/Tint are relative shader shifts (-1 to +1).
-        // Converting requires knowing the as-shot WB, which is complex. Skip for now.
+        // LR Temperature/Tint → devTemperature/devTint (absolute Kelvin + Adobe tint)
+        auto [hasTemp, lrTemp] = extractFloat("Temperature");
+        if (hasTemp && lrTemp > 0) e.devTemperature = lrTemp;
+
+        auto [hasTint, lrTint] = extractFloat("Tint");
+        if (hasTint) e.devTint = lrTint;
     }
 
 private:

@@ -190,8 +190,7 @@ public:
     // -------------------------------------------------------------------------
 
     void setExposure(float ev) { exposure_ = ev; }
-    void setWbTemp(float t) { wbTemp_ = t; }
-    void setWbTint(float t) { wbTint_ = t; }
+    void setWbMultiplier(float r, float g, float b) { wbMul_[0] = r; wbMul_[1] = g; wbMul_[2] = b; }
     void setContrast(float v) { contrast_ = v; }
     void setHighlights(float v) { highlights_ = v; }
     void setShadows(float v) { shadows_ = v; }
@@ -201,8 +200,7 @@ public:
     void setSaturation(float v) { saturation_ = v; }
 
     float getExposure() const { return exposure_; }
-    float getWbTemp() const { return wbTemp_; }
-    float getWbTint() const { return wbTint_; }
+    const float* getWbMultiplier() const { return wbMul_; }
     float getContrast() const { return contrast_; }
     float getHighlights() const { return highlights_; }
     float getShadows() const { return shadows_; }
@@ -301,8 +299,9 @@ public:
         params._imageSize[0] = imageSize_[0];
         params._imageSize[1] = imageSize_[1];
         params.exposure = exposure_;
-        params.wbTemp = wbTemp_;
-        params.wbTint = wbTint_;
+        params.wbR = wbMul_[0];
+        params.wbG = wbMul_[1];
+        params.wbB = wbMul_[2];
         params.contrast = contrast_;
         params.highlights = highlights_;
         params.shadows = shadows_;
@@ -362,8 +361,7 @@ private:
 
     // Exposure / WB
     float exposure_ = 0.0f;
-    float wbTemp_ = 0.0f;
-    float wbTint_ = 0.0f;
+    float wbMul_[3] = {1.0f, 1.0f, 1.0f};
 
     // Tone / Color
     float contrast_ = 0.0f;

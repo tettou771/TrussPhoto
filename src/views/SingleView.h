@@ -17,6 +17,7 @@
 #include "pipeline/CameraProfileManager.h"
 #include "pipeline/LensCorrector.h"
 #include "pipeline/DevelopShader.h"
+#include "pipeline/WhiteBalance.h"
 #include "pipeline/GuidedFilter.h"
 #include "ui/ContextMenu.h"
 #include "pipeline/PhotoExporter.h"
@@ -53,11 +54,12 @@ public:
     bool wantsLeftSidebar() const override { return false; }
 
     // Callback when photo changes (for DevelopPanel slider sync)
-    function<void(float exposure, float wbTemp, float wbTint,
+    function<void(float exposure, float temperature, float tint,
                   float contrast, float highlights, float shadows,
                   float whites, float blacks,
                   float vibrance, float saturation,
-                  float chroma, float luma)> onDevelopRestored;
+                  float chroma, float luma,
+                  float asShotTemp, float asShotTint)> onDevelopRestored;
 
     // Right-click context menu
     function<void(ContextMenu::Ptr)> onContextMenu;
@@ -97,8 +99,12 @@ public:
 
         // Restore develop settings from entry
         exposure_ = entry->devExposure;
-        wbTemp_ = entry->devWbTemp;
-        wbTint_ = entry->devWbTint;
+        asShotTemp_ = entry->asShotTemp;
+        asShotTint_ = entry->asShotTint;
+        // devTemperature 0 = "use as-shot"
+        temperature_ = (entry->devTemperature > 0) ? entry->devTemperature
+                       : (entry->asShotTemp > 0) ? entry->asShotTemp : 5500.0f;
+        tint_ = entry->devTint;
         contrast_ = entry->devContrast;
         highlights_ = entry->devHighlights;
         shadows_ = entry->devShadows;
@@ -109,8 +115,7 @@ public:
         chromaDenoise_ = entry->chromaDenoise;
         lumaDenoise_ = entry->lumaDenoise;
         developShader_.setExposure(exposure_);
-        developShader_.setWbTemp(wbTemp_);
-        developShader_.setWbTint(wbTint_);
+        updateWbMultiplier();
         developShader_.setContrast(contrast_);
         developShader_.setHighlights(highlights_);
         developShader_.setShadows(shadows_);
@@ -118,11 +123,12 @@ public:
         developShader_.setBlacks(blacks_);
         developShader_.setVibrance(vibrance_);
         developShader_.setSaturation(saturation_);
-        if (onDevelopRestored) onDevelopRestored(exposure_, wbTemp_, wbTint_,
+        if (onDevelopRestored) onDevelopRestored(exposure_, temperature_, tint_,
                                                  contrast_, highlights_, shadows_,
                                                  whites_, blacks_,
                                                  vibrance_, saturation_,
-                                                 chromaDenoise_, lumaDenoise_);
+                                                 chromaDenoise_, lumaDenoise_,
+                                                 asShotTemp_, asShotTint_);
 
         bool loaded = false;
         isSmartPreview_ = false;
@@ -626,19 +632,19 @@ public:
     }
 
     // Called when DevelopPanel sliders change
-    void onDevelopChanged(float exposure, float wbTemp, float wbTint,
+    void onDevelopChanged(float exposure, float temperature, float tint,
                           float contrast, float highlights, float shadows,
                           float whites, float blacks,
                           float vibrance, float saturation,
                           float chroma, float luma) {
         // GPU-only params: update shader uniforms
-        bool gpuChanged = (exposure_ != exposure || wbTemp_ != wbTemp || wbTint_ != wbTint ||
+        bool gpuChanged = (exposure_ != exposure || temperature_ != temperature || tint_ != tint ||
                            contrast_ != contrast || highlights_ != highlights ||
                            shadows_ != shadows || whites_ != whites || blacks_ != blacks ||
                            vibrance_ != vibrance || saturation_ != saturation);
         exposure_ = exposure;
-        wbTemp_ = wbTemp;
-        wbTint_ = wbTint;
+        temperature_ = temperature;
+        tint_ = tint;
         contrast_ = contrast;
         highlights_ = highlights;
         shadows_ = shadows;
@@ -647,8 +653,7 @@ public:
         vibrance_ = vibrance;
         saturation_ = saturation;
         developShader_.setExposure(exposure_);
-        developShader_.setWbTemp(wbTemp_);
-        developShader_.setWbTint(wbTint_);
+        updateWbMultiplier();
         developShader_.setContrast(contrast_);
         developShader_.setHighlights(highlights_);
         developShader_.setShadows(shadows_);
@@ -678,7 +683,7 @@ public:
         // Save all develop settings to DB
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
             const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
-            ctx_->provider->setDevelop(pid, exposure_, wbTemp_, wbTint_,
+            ctx_->provider->setDevelop(pid, exposure_, temperature_, tint_,
                                        contrast_, highlights_, shadows_,
                                        whites_, blacks_,
                                        vibrance_, saturation_,
@@ -920,8 +925,10 @@ private:
 
     // Develop settings (GPU)
     float exposure_ = 0.0f;
-    float wbTemp_ = 0.0f;
-    float wbTint_ = 0.0f;
+    float temperature_ = 5500.0f;  // absolute Kelvin (LR compatible)
+    float tint_ = 0.0f;           // LR tint (-150 to +150)
+    float asShotTemp_ = 0.0f;     // as-shot kelvin (from entry, read-only)
+    float asShotTint_ = 0.0f;     // as-shot tint (from entry, read-only)
     float contrast_ = 0.0f;
     float highlights_ = 0.0f;
     float shadows_ = 0.0f;
@@ -1098,6 +1105,22 @@ private:
         updateDisplayDimensions();
     }
 
+    // Compute WB multiplier from absolute temperature/tint and set on shader.
+    void updateWbMultiplier() {
+        if (asShotTemp_ <= 0) {
+            // No as-shot info: neutral (no correction)
+            developShader_.setWbMultiplier(1.0f, 1.0f, 1.0f);
+            return;
+        }
+
+        float targetK = temperature_;
+        if (targetK < 2000.0f) targetK = 2000.0f;
+        if (targetK > 12000.0f) targetK = 12000.0f;
+
+        auto mul = wb::kelvinToWbMultiplier(targetK, tint_, asShotTemp_, asShotTint_);
+        developShader_.setWbMultiplier(mul.r, mul.g, mul.b);
+    }
+
     void updateDisplayDimensions() {
         int srcW, srcH;
         if (intermediateTexture_.isAllocated()) {
@@ -1159,14 +1182,15 @@ private:
         // Reset develop settings
         menu->addChild(make_shared<MenuItem>("Reset Develop",
             [this, photoId]() {
-                exposure_ = 0; wbTemp_ = 0; wbTint_ = 0;
+                exposure_ = 0;
+                temperature_ = (asShotTemp_ > 0) ? asShotTemp_ : 5500.0f;
+                tint_ = asShotTint_;
                 contrast_ = 0; highlights_ = 0; shadows_ = 0;
                 whites_ = 0; blacks_ = 0;
                 vibrance_ = 0; saturation_ = 0;
                 chromaDenoise_ = 0.5f; lumaDenoise_ = 0;
                 developShader_.setExposure(0);
-                developShader_.setWbTemp(0);
-                developShader_.setWbTint(0);
+                updateWbMultiplier();
                 developShader_.setContrast(0);
                 developShader_.setHighlights(0);
                 developShader_.setShadows(0);
@@ -1175,8 +1199,11 @@ private:
                 developShader_.setVibrance(0);
                 developShader_.setSaturation(0);
                 needsFboRender_ = true;
+                // Save reset: devTemperature=0 means "use as-shot"
                 if (ctx_) ctx_->provider->setDevelop(photoId, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.5f, 0);
-                if (onDevelopRestored) onDevelopRestored(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.5f, 0);
+                if (onDevelopRestored) onDevelopRestored(0, temperature_, tint_,
+                                                         0, 0, 0, 0, 0, 0, 0, 0.5f, 0,
+                                                         asShotTemp_, asShotTint_);
                 if (ctx_ && ctx_->redraw) ctx_->redraw(1);
             }));
 
