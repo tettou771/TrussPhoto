@@ -494,9 +494,21 @@ void tcApp::setup() {
     gridRepairListener_ = grid()->repairRequested.listen([this]() { repairLibrary(); });
     gridConsolidateListener_ = grid()->consolidateRequested.listen([this]() { consolidateLibrary(); });
     gridUpdateThumbnailListener_ = grid()->updateThumbnailRequested.listen([this](string& photoId) {
-        // Phase 1: log only — Phase 2 will use ExportQueue for background generation
-        logNotice() << "[Thumbnail] Update requested for: " << photoId
-                    << " (requires opening in SingleView first)";
+        auto* entry = provider_.getPhoto(photoId);
+        if (!entry) return;
+
+        ExportJobRequest req;
+        req.type = ExportJobType::Thumbnail;
+        req.photoId = photoId;
+        req.outPath = provider_.getThumbnailCachePath(photoId);
+        req.settings.maxEdge = THUMBNAIL_MAX_SIZE;
+        req.settings.quality = THUMBNAIL_JPEG_QUALITY;
+        req.entry = *entry;
+        req.spPath = entry->localSmartPreviewPath;
+        req.rawPath = entry->localPath;
+        req.lensCorrectionParams = entry->lensCorrectionParams;
+        exportQueue_.enqueueThumbnail(req);
+        logNotice() << "[Thumbnail] Queued background update: " << photoId;
     });
     gridDeleteListener_ = grid()->deleteRequested.listen([this](vector<string>& ids) {
         int count = (int)ids.size();
@@ -517,6 +529,30 @@ void tcApp::setup() {
         auto g = grid();
         if (g) g->reloadItemThumbnail(photoId);
     };
+
+    // 5f. Start background export queue
+    string profileDir = string(getenv("HOME") ? getenv("HOME") : ".") + "/.trussc/profiles";
+    exportQueue_.setProfileDir(profileDir);
+    exportQueue_.start();
+    exportThumbnailReadyListener_ = exportQueue_.thumbnailReady.listen([this](string& pid) {
+        provider_.updateThumbnailPath(pid, provider_.getThumbnailCachePath(pid));
+        auto g = grid();
+        if (g) g->reloadItemThumbnail(pid);
+        redraw();
+    });
+    exportDoneListener_ = exportQueue_.exportDone.listen([this](ExportResult& r) {
+        if (r.type == ExportJobType::Jpeg) {
+            if (r.success) {
+                logNotice() << "[ExportQueue] Exported: " << r.outPath;
+            } else {
+                logWarning() << "[ExportQueue] Export failed: " << r.photoId;
+            }
+        }
+        if (exportQueue_.isIdle() && statusBar_) {
+            statusBar_->clearTask("Export");
+        }
+        redraw();
+    });
 
     // Display previous library immediately
     if (hasLibrary && provider_.getCount() > 0) {
@@ -861,6 +897,16 @@ void tcApp::update() {
             provider_.getConsolidateProgress(), provider_.getConsolidateTotal());
     } else {
         statusBar_->clearTask("Consolidate");
+    }
+
+    // Process export queue (GPU render + readback on main thread)
+    if (exportQueue_.processMainThread()) {
+        redraw();
+    }
+    if (!exportQueue_.isIdle()) {
+        statusBar_->setTaskProgress("Export",
+            exportQueue_.completedCount(), exportQueue_.totalCount());
+        redraw();
     }
 
     // Process background RAW load / video update
@@ -1618,6 +1664,7 @@ void tcApp::exit() {
     }
 
     if (viewManager_) viewManager_->shutdownAll();
+    exportQueue_.stop();
     uploadQueue_.stop();
     if (syncThread_.joinable()) syncThread_.join();
     provider_.shutdown();

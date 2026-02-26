@@ -25,6 +25,7 @@
 #include "ServerConfig.h"
 #include "PhotoServer.h"
 #include "pipeline/LrcatImporter.h"
+#include "pipeline/ExportQueue.h"
 using namespace std;
 using namespace tc;
 
@@ -97,6 +98,11 @@ private:
     bool embeddingsQueued_ = false;
     bool wbBackfillQueued_ = false;
     bool visionModelUnloaded_ = false;
+
+    // Background export queue
+    ExportQueue exportQueue_;
+    EventListener exportThumbnailReadyListener_;
+    EventListener exportDoneListener_;
 
     // Event listeners (RAII — auto-disconnect on destroy)
     EventListener cropDoneListener_;
