@@ -127,6 +127,39 @@ struct PhotoEntry {
         return userPerspV != 0.0f || userPerspH != 0.0f || userShear != 0.0f;
     }
 
+    // Any crop/rotation/perspective/develop parameter differs from default
+    bool hasDevEdits() const {
+        return hasCrop() || hasRotation() || hasPerspective() ||
+               devExposure != 0.0f || devTemperature != 0.0f ||
+               devTint != 0.0f || devContrast != 0.0f ||
+               devHighlights != 0.0f || devShadows != 0.0f ||
+               devWhites != 0.0f || devBlacks != 0.0f ||
+               devVibrance != 0.0f || devSaturation != 0.0f;
+    }
+
+    // Snapshot of editable params for change detection
+    struct DevSnapshot {
+        float cropX, cropY, cropW, cropH;
+        float angle; int rotation90;
+        float perspV, perspH, shear;
+        float exposure, temperature, tint;
+        float contrast, highlights, shadows, whites, blacks;
+        float vibrance, saturation;
+        float chromaDenoise, lumaDenoise;
+        bool operator==(const DevSnapshot&) const = default;
+        bool operator!=(const DevSnapshot&) const = default;
+    };
+
+    DevSnapshot devSnapshot() const {
+        return {userCropX, userCropY, userCropW, userCropH,
+                userAngle, userRotation90,
+                userPerspV, userPerspH, userShear,
+                devExposure, devTemperature, devTint,
+                devContrast, devHighlights, devShadows, devWhites, devBlacks,
+                devVibrance, devSaturation,
+                chromaDenoise, lumaDenoise};
+    }
+
     float totalRotation() const {
         constexpr float kHalfPi = 1.5707963267948966f;
         return userRotation90 * kHalfPi + userAngle;

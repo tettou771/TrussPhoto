@@ -39,6 +39,7 @@ public:
     }
 
     void endView() override {
+        generateDevelopedThumbnail();
         cleanupState();
         ctx_ = nullptr;
     }
@@ -60,6 +61,9 @@ public:
                   float vibrance, float saturation,
                   float chroma, float luma,
                   float asShotTemp, float asShotTint)> onDevelopRestored;
+
+    // Callback when a developed thumbnail is generated (photoId)
+    function<void(const string&)> onThumbnailGenerated;
 
     // Right-click context menu
     function<void(ContextMenu::Ptr)> onContextMenu;
@@ -94,16 +98,26 @@ public:
 
         logNotice() << "Opening: " << entry->filename;
 
+        // Save developed thumbnail for previous photo before switching
+        generateDevelopedThumbnail();
+
         // Clean up previous state
         cleanupState();
+
+        // Snapshot current params for change detection on exit
+        openedSnapshot_ = entry->devSnapshot();
 
         // Restore develop settings from entry
         exposure_ = entry->devExposure;
         asShotTemp_ = entry->asShotTemp;
         asShotTint_ = entry->asShotTint;
+        // For JPEG/HEIC without as-shot WB info, assume daylight (5500K)
+        // so temperature/tint adjustments still work as relative shifts
+        if (asShotTemp_ <= 0) asShotTemp_ = 5500.0f;
+        if (asShotTint_ == 0) asShotTint_ = 0.0f;  // neutral tint
         // devTemperature 0 = "use as-shot"
         temperature_ = (entry->devTemperature > 0) ? entry->devTemperature
-                       : (entry->asShotTemp > 0) ? entry->asShotTemp : 5500.0f;
+                       : asShotTemp_;
         tint_ = entry->devTint;
         contrast_ = entry->devContrast;
         highlights_ = entry->devHighlights;
@@ -363,7 +377,30 @@ public:
         bool hasImage = hasFbo || hasPreviewRaw || fullImage_.isAllocated();
         if (!hasImage) return;
 
-        // Get user crop + rotation + perspective from entry (if available)
+        // Preview / fullImage: simple fit-to-window draw (no crop/rotation)
+        // Crop/rotation coordinates are relative to the developed FBO,
+        // so they are meaningless for preview or non-FBO textures.
+        if (!hasFbo) {
+            float srcW, srcH;
+            if (hasPreviewRaw) {
+                srcW = previewTexture_.getWidth();
+                srcH = previewTexture_.getHeight();
+            } else {
+                srcW = fullImage_.getWidth();
+                srcH = fullImage_.getHeight();
+            }
+            auto [x, y, drawW, drawH] = calcDrawRect(srcW, srcH);
+            setColor(1.0f, 1.0f, 1.0f);
+            if (hasPreviewRaw) {
+                previewTexture_.draw(x, y, drawW, drawH);
+            } else {
+                fullImage_.draw(x, y, drawW, drawH);
+            }
+            return;
+        }
+
+        // === FBO path: apply crop/rotation/perspective ===
+
         float ucX = 0, ucY = 0, ucW = 1, ucH = 1;
         float ucAngle = 0;
         int ucRot90 = 0;
@@ -377,7 +414,7 @@ public:
                 ucW = entry->userCropW;
                 ucH = entry->userCropH;
             }
-            if (entry && entry->hasRotation()) {
+            if (entry) {
                 ucAngle = entry->userAngle;
                 ucRot90 = entry->userRotation90;
             }
@@ -388,22 +425,14 @@ public:
             }
         }
 
-        // Source dimensions (what we're reading from)
-        float srcW, srcH;
-        if (hasFbo) {
-            srcW = (float)displayW_;
-            srcH = (float)displayH_;
-        } else if (hasPreviewRaw) {
-            srcW = previewTexture_.getWidth();
-            srcH = previewTexture_.getHeight();
-        } else {
-            srcW = fullImage_.getWidth();
-            srcH = fullImage_.getHeight();
-        }
+        float srcW = (float)displayW_;
+        float srcH = (float)displayH_;
 
         float totalRot = ucRot90 * TAU / 4 + ucAngle;
         bool hasRotation = (totalRot != 0);
         bool hasPersp = (ucPerspV != 0 || ucPerspH != 0 || ucShear != 0);
+
+
 
         // Build temporary entry for perspective-aware BB calculation
         PhotoEntry tmpEntry;
@@ -426,19 +455,8 @@ public:
 
         auto [x, y, drawW, drawH] = calcDrawRect(cropPxW, cropPxH);
 
-        // Resolve texture source (FBO > preview > fullImage)
-        sg_view texView;
-        sg_sampler texSampler;
-        if (hasFbo) {
-            texView = developShader_.getFboView();
-            texSampler = developShader_.getFboSampler();
-        } else if (hasPreviewRaw) {
-            texView = previewTexture_.getView();
-            texSampler = previewTexture_.getSampler();
-        } else {
-            texView = fullImage_.getTexture().getView();
-            texSampler = fullImage_.getTexture().getSampler();
-        }
+        sg_view texView = developShader_.getFboView();
+        sg_sampler texSampler = developShader_.getFboSampler();
 
         if (hasRotation || hasPersp) {
             float drawCX = x + drawW / 2;
@@ -821,6 +839,30 @@ public:
         return ctx_->grid->getPhotoId(selectedIndex_);
     }
 
+    // Generate developed thumbnail if FBO ready and params changed since show().
+    // Returns true if thumbnail was generated.
+    bool generateDevelopedThumbnail() {
+        if (!ctx_ || !developShader_.isFboReady()) return false;
+        string pid = currentPhotoId();
+        if (pid.empty()) return false;
+        auto* entry = ctx_->provider->getPhoto(pid);
+        if (!entry) return false;
+
+        // Skip if nothing changed since this photo was opened
+        if (entry->devSnapshot() == openedSnapshot_) return false;
+
+        string thumbPath = ctx_->provider->getThumbnailCachePath(pid);
+        if (thumbPath.empty()) return false;
+
+        bool ok = PhotoExporter::generateThumbnail(developShader_, thumbPath, *entry);
+        if (ok) {
+            ctx_->provider->updateThumbnailPath(pid, thumbPath);
+            logNotice() << "[Thumbnail] Generated developed thumbnail: " << pid;
+            if (onThumbnailGenerated) onThumbnailGenerated(pid);
+        }
+        return ok;
+    }
+
     bool hasEmbedding() const {
         if (!ctx_) return false;
         string id = currentPhotoId();
@@ -890,6 +932,7 @@ private:
 
     // Image state
     int selectedIndex_ = -1;
+    PhotoEntry::DevSnapshot openedSnapshot_; // params at show() time
     Image fullImage_;
     Pixels rawPixels_;
     Pixels nrPixels_;            // NR result cache
@@ -1114,11 +1157,10 @@ private:
     }
 
     // Compute WB multiplier from absolute temperature/tint and set on shader.
+    // Works for both RAW (real as-shot WB) and JPEG/HEIC (assumed 5500K).
     void updateWbMultiplier() {
         if (asShotTemp_ <= 0) {
-            // No as-shot info: neutral (no correction)
-            developShader_.setWbMultiplier(1.0f, 1.0f, 1.0f);
-            return;
+            asShotTemp_ = 5500.0f;  // fallback to daylight
         }
 
         float targetK = temperature_;

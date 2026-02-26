@@ -25,6 +25,7 @@ public:
     Event<ContextMenu::Ptr> contextMenuRequested;
     Event<void> repairRequested;
     Event<void> consolidateRequested;
+    Event<string> updateThumbnailRequested;
 
     PhotoGrid() {
         itemWidth_ = 140;
@@ -60,6 +61,20 @@ public:
     void setPadding(float pad) {
         padding_ = pad;
         rebuild();
+    }
+
+    // Reload a specific photo's thumbnail (after developed thumbnail generation)
+    void reloadItemThumbnail(const string& photoId) {
+        for (int i = 0; i < (int)photoIds_.size(); i++) {
+            if (photoIds_[i] != photoId) continue;
+            auto it = poolMap_.find(i);
+            if (it == poolMap_.end()) break;  // not currently visible
+            auto& item = pool_[it->second];
+            item->unloadImage();
+            loader_.cancelRequest(i);
+            requestLoad(i);
+            break;
+        }
     }
 
     // --- Filters ---
@@ -284,6 +299,15 @@ protected:
                     revealInFinder(path);
                 }));
 
+            // "Update Thumbnail" — only for photos with dev edits
+            if (photo->hasDevEdits()) {
+                menu->addChild(make_shared<MenuItem>("Update Thumbnail",
+                    [this, pid = photoId]() {
+                        string id = pid;
+                        updateThumbnailRequested.notify(id);
+                    }));
+            }
+
             menu->addChild(make_shared<MenuSeparator>());
 
             menu->addChild(make_shared<MenuItem>("Delete",
@@ -485,6 +509,7 @@ private:
 
     void processLoadResults() {
         LoadResult result;
+        bool anyLoaded = false;
         while (loader_.tryGetResult(result)) {
             if (!result.success) continue;
 
@@ -493,6 +518,7 @@ private:
                 if (companionLoading_ && companionPreview_ && companionPreview_->isShowing()) {
                     companionPreview_->setPixels(std::move(result.pixels));
                     companionLoading_ = false;
+                    anyLoaded = true;
                 }
                 continue;
             }
@@ -503,8 +529,10 @@ private:
             auto& item = pool_[it->second];
             if (item->getActive() && item->getLoadState() == LoadState::Loading) {
                 item->setPixels(std::move(result.pixels));
+                anyLoaded = true;
             }
         }
+        if (anyLoaded) redraw();
     }
 
     // =========================================================================

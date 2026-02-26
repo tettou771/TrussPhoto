@@ -493,6 +493,11 @@ void tcApp::setup() {
     });
     gridRepairListener_ = grid()->repairRequested.listen([this]() { repairLibrary(); });
     gridConsolidateListener_ = grid()->consolidateRequested.listen([this]() { consolidateLibrary(); });
+    gridUpdateThumbnailListener_ = grid()->updateThumbnailRequested.listen([this](string& photoId) {
+        // Phase 1: log only — Phase 2 will use ExportQueue for background generation
+        logNotice() << "[Thumbnail] Update requested for: " << photoId
+                    << " (requires opening in SingleView first)";
+    });
     gridDeleteListener_ = grid()->deleteRequested.listen([this](vector<string>& ids) {
         int count = (int)ids.size();
         string msg = format("Delete {} photo{}?\nThis will permanently remove the file{} from disk.",
@@ -507,6 +512,10 @@ void tcApp::setup() {
     });
     viewManager_->singleView()->onContextMenu = [this](ContextMenu::Ptr menu) {
         showContextMenu(menu);
+    };
+    viewManager_->singleView()->onThumbnailGenerated = [this](const string& photoId) {
+        auto g = grid();
+        if (g) g->reloadItemThumbnail(photoId);
     };
 
     // Display previous library immediately
@@ -989,6 +998,7 @@ void tcApp::keyPressed(int key) {
 
         if (key == SAPP_KEYCODE_ESCAPE) {
             // ESC: go back to previous view
+            // (Developed thumbnail is generated in SingleView::endView)
             // Hide develop panel if visible
             if (showDevelop_) {
                 showDevelop_ = false;
@@ -1087,6 +1097,7 @@ void tcApp::keyPressed(int key) {
             auto cv = viewManager_->cropView();
             cropDoneListener_ = cv->doneEvent.listen([this]() {
                 // Return to single view
+                // (Developed thumbnail will be generated when leaving SingleView)
                 viewManager_->switchTo(ViewMode::Single);
                 if (showDevelop_) {
                     if (developPanel_) developPanel_->setActive(true);
