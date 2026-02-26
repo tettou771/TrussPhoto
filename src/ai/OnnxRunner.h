@@ -194,8 +194,8 @@ public:
         size_t numInputs = session_->GetInputCount();
         for (size_t i = 0; i < numInputs; i++) {
             auto name = session_->GetInputNameAllocated(i, alloc);
-            auto info = session_->GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
-            auto shape = info.GetShape();
+            auto typeInfo = session_->GetInputTypeInfo(i);
+            auto shape = typeInfo.GetTensorTypeAndShapeInfo().GetShape();
             logNotice() << "[OnnxRunner] Input " << i << ": " << name.get()
                         << " shape=[" << shapeStr(shape) << "]";
         }
@@ -203,8 +203,8 @@ public:
         size_t numOutputs = session_->GetOutputCount();
         for (size_t i = 0; i < numOutputs; i++) {
             auto name = session_->GetOutputNameAllocated(i, alloc);
-            auto info = session_->GetOutputTypeInfo(i).GetTensorTypeAndShapeInfo();
-            auto shape = info.GetShape();
+            auto typeInfo = session_->GetOutputTypeInfo(i);
+            auto shape = typeInfo.GetTensorTypeAndShapeInfo().GetShape();
             logNotice() << "[OnnxRunner] Output " << i << ": " << name.get()
                         << " shape=[" << shapeStr(shape) << "]";
         }

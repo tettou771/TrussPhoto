@@ -496,6 +496,15 @@ public:
         }
     }
 
+    // Restore a Missing photo to LocalOnly (when file becomes accessible again)
+    void restoreMissing(const string& id) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return;
+        if (it->second.syncState != SyncState::Missing) return;
+        it->second.syncState = SyncState::LocalOnly;
+        db_.updateSyncState(id, SyncState::LocalOnly);
+    }
+
     // --- Thumbnail resolution ---
 
     // Priority: local cache -> server -> local decode
@@ -503,6 +512,12 @@ public:
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
         auto& photo = it->second;
+
+        // Restore Missing → LocalOnly if file is now accessible
+        if (photo.syncState == SyncState::Missing &&
+            !photo.localPath.empty() && fs::exists(photo.localPath)) {
+            restoreMissing(id);
+        }
 
         // Video thumbnail: extract frame via AVFoundation
         if (photo.isVideo) {
@@ -591,9 +606,15 @@ public:
                 if (loaded) {
                     // Embedded preview returns float RGBA — convert to 8-bit for thumbnails
                     convertF32ToU8(outPixels);
+                } else {
+                    logWarning() << "[Thumbnail] Embedded preview failed: " << photo.filename;
                 }
                 if (!loaded) {
                     loaded = RawLoader::loadWithMaxSize(photo.localPath, outPixels, THUMBNAIL_MAX_SIZE);
+                    if (!loaded) {
+                        logWarning() << "[Thumbnail] loadWithMaxSize also failed: " << photo.filename
+                                     << " path=" << photo.localPath;
+                    }
                 }
                 if (loaded) {
                     // Resize if needed (embedded preview may be larger)
@@ -606,6 +627,7 @@ public:
                     saveThumbnailCache(id, photo, outPixels);
                     return true;
                 }
+                logWarning() << "[Thumbnail] RAW decode failed: " << photo.filename;
             } else {
                 Pixels full;
                 if (full.load(photo.localPath)) {
@@ -619,7 +641,10 @@ public:
                     saveThumbnailCache(id, photo, outPixels);
                     return true;
                 }
+                logWarning() << "[Thumbnail] Image load failed: " << photo.filename;
             }
+        } else if (!photo.localPath.empty()) {
+            logWarning() << "[Thumbnail] File not found: " << photo.localPath;
         }
 
         return false;

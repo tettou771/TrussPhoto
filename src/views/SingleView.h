@@ -133,6 +133,12 @@ public:
         bool loaded = false;
         isSmartPreview_ = false;
 
+        // Restore Missing → LocalOnly if file is now accessible
+        if (entry->syncState == SyncState::Missing &&
+            !entry->localPath.empty() && fs::exists(entry->localPath)) {
+            provider.restoreMissing(photoId);
+        }
+
         // Video playback
         if (entry->isVideo) {
             if (!entry->localPath.empty() && fs::exists(entry->localPath)) {
