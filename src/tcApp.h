@@ -105,6 +105,7 @@ private:
     EventListener gridRepairListener_;
     EventListener gridConsolidateListener_;
     EventListener gridDeleteListener_;
+    EventListener gridUpdateThumbnailListener_;
     EventListener searchListener_;
     EventListener developListener_;
     EventListener leftToggleListener_;

@@ -62,7 +62,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE ${sentencepiece_SOURCE_DIR}/s
 add_library(sqlite3_lib STATIC ${sqlite3_SOURCE_DIR}/sqlite3.c)
 target_include_directories(sqlite3_lib PUBLIC ${sqlite3_SOURCE_DIR})
 target_compile_definitions(sqlite3_lib PRIVATE
-    SQLITE_THREADSAFE=2
+    SQLITE_THREADSAFE=1
     SQLITE_DEFAULT_WAL_SYNCHRONOUS=1
 )
 target_compile_options(sqlite3_lib PRIVATE -w)

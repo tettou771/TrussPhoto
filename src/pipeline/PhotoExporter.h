@@ -341,6 +341,16 @@ inline bool exportJpeg(const DevelopShader& shader,
                           outPtr->getData(), settings.quality) != 0;
 }
 
+// Generate a developed thumbnail (crop+rotation+develop applied, 512px Q60)
+inline bool generateThumbnail(const DevelopShader& shader,
+                               const string& outPath,
+                               const PhotoEntry& entry) {
+    ExportSettings settings;
+    settings.maxEdge = THUMBNAIL_MAX_SIZE;
+    settings.quality = THUMBNAIL_JPEG_QUALITY;
+    return exportJpeg(shader, outPath, settings, entry);
+}
+
 // Export path: catalog/exports/stem.jpg (auto-increment if exists)
 inline string makeExportPath(const string& catalogPath,
                              const string& originalFilename) {

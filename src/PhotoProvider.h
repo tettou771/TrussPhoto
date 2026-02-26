@@ -2506,6 +2506,23 @@ public:
         if (wbBackfillThread_.joinable()) wbBackfillThread_.join();
     }
 
+    // Get the thumbnail cache path for a photo (used by PhotoExporter)
+    string getThumbnailCachePath(const string& id) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return "";
+        auto& photo = it->second;
+        string subdir = dateToSubdir(photo.dateTimeOriginal, photo.localPath);
+        return thumbnailCacheDir_ + "/" + subdir + "/" + id + ".jpg";
+    }
+
+    // Update thumbnail path after developed thumbnail generation
+    void updateThumbnailPath(const string& id, const string& path) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return;
+        it->second.localThumbnailPath = path;
+        db_.updateThumbnailPath(id, path);
+    }
+
 private:
     void rebuildStackIndex() {
         stackIndex_.clear();

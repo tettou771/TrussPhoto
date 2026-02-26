@@ -107,17 +107,14 @@ void main() {
         // Default (1,1,1) = no correction. Computed on CPU from color temperature.
         color *= vec3(wbR, wbG, wbB);
 
-        // Contrast: sigmoid S-curve (pivot at 18% gray = linear 0.18)
-        // f(x) = x^p / (x^p + k^p) * k for pivot preservation
+        // Contrast: power-curve around 18% gray pivot (linear 0.18)
+        // f(x) = pivot * pow(x / pivot, p)  — identity when p=1
+        // p > 1 steepens (more contrast), p < 1 flattens (less contrast)
         if (contrast != 0.0) {
             float c = contrast / 100.0;
-            float p = 1.0 + c * 1.5;  // positive → steepen, negative → flatten
-            vec3 ratio = max(color, vec3(0.00001)) / 0.18;
-            vec3 rp = pow(ratio, vec3(p));
-            vec3 sig = rp / (rp + 1.0);
-            // Normalize so sigmoid(1.0) maps back to 0.18
-            // sigmoid(1) = 1^p / (1^p + 1) = 0.5, so multiply by 0.18/0.5 = 0.36
-            color = sig * 0.36;
+            float p = 1.0 + c * 1.5;  // range: -0.5 to 2.5
+            float pivot = 0.18;
+            color = pivot * pow(max(color, vec3(0.00001)) / pivot, vec3(p));
         }
 
         // Blacks: black-point curve bend (levels-style remap)
