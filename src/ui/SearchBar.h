@@ -56,15 +56,25 @@ public:
         return result;
     }
 
+    SearchBar() {
+        textField_ = make_shared<tcxIME::TextField>();
+        textField_->setEnableNewLine(false);
+    }
+
     void setup() override {
         enableEvents();
 
-        // Load font for IME
+        // Load font for label and IME
         loadJapaneseFont(labelFont_, 14);
-        ime_.setFont(&labelFont_);
+        textField_->setFont(&labelFont_);
 
-        // Enter key triggers search (not incremental)
-        ime_.onEnter = [this]() {
+        // Compute input X offset and vertical centering
+        inputX_ = 12 + labelFont_.stringWidth("Search:") + 8;
+        updateTextFieldLayout();
+        addChild(textField_);
+
+        // Enter key triggers search
+        textField_->getIME().onEnter = [this]() {
             string q = getQuery();
             searched.notify(q);
         };
@@ -74,14 +84,14 @@ public:
         if (active_) return;
         active_ = true;
         lastInputTime_ = getElapsedTimef();
-        ime_.enable();
+        textField_->enable();
         redraw();
     }
 
     void deactivate() {
         if (!active_) return;
         active_ = false;
-        ime_.disable();
+        textField_->disable();
         deactivated.notify();
         redraw();
     }
@@ -89,7 +99,7 @@ public:
     bool isActive() const { return active_; }
 
     void clear() {
-        ime_.clear();
+        textField_->clear();
         lastQuery_.clear();
         string empty;
         searched.notify(empty);
@@ -97,8 +107,12 @@ public:
     }
 
     string getQuery() const {
-        // const_cast needed because tcxIME::getString() isn't const
-        return const_cast<tcxIME&>(ime_).getString();
+        return const_cast<tcxIME::TextField*>(textField_.get())->getString();
+    }
+
+    void setSize(float w, float h) override {
+        RectNode::setSize(w, h);
+        updateTextFieldLayout();
     }
 
     void update() override {
@@ -113,7 +127,7 @@ public:
         }
 
         // Detect composition changes (IME preedit) for redraw
-        string marked = ime_.getMarkedText();
+        string marked = textField_->getMarkedText();
         if (marked != lastMarked_) {
             lastMarked_ = marked;
             lastInputTime_ = getElapsedTimef();
@@ -148,46 +162,58 @@ public:
         fill();
         drawRect(0, h - 1, w, 1);
 
-        // Search icon / label
-        float textY = h / 2.0f;
+        // Search label (baseline-aligned with TextField)
         float labelX = 12;
 
         setColor(0.45f, 0.45f, 0.5f);
-        labelFont_.drawString("Search:", labelX, textY,
-            Direction::Left, Direction::Center);
-
-        float inputX = labelX + labelFont_.stringWidth("Search:") + 8;
+        labelFont_.drawString("Search:", labelX, baselineY_,
+            Direction::Left, Direction::Baseline);
 
         if (active_) {
-            // Draw IME input
+            // TextField draws itself as child node — just set color
             setColor(1.0f, 1.0f, 1.0f);
-            ime_.draw(inputX, textY - labelFont_.getAscent() / 2.0f);
+            textField_->setVisible(true);
         } else {
+            textField_->setVisible(false);
+
             // Draw current query (or placeholder)
             string q = getQuery();
             if (q.empty()) {
                 setColor(0.35f, 0.35f, 0.4f);
-                labelFont_.drawString("Enter to search / @place", inputX, textY,
-                    Direction::Left, Direction::Center);
+                labelFont_.drawString("Enter to search / @place", inputX_, baselineY_,
+                    Direction::Left, Direction::Baseline);
             } else {
                 setColor(0.8f, 0.8f, 0.85f);
-                labelFont_.drawString(q, inputX, textY,
-                    Direction::Left, Direction::Center);
+                labelFont_.drawString(q, inputX_, baselineY_,
+                    Direction::Left, Direction::Baseline);
             }
         }
     }
 
     bool onMousePress(Vec2 localPos, int button) override {
-        (void)localPos; (void)button;
+        (void)button;
         if (!active_) {
             activate();
         }
+        lastInputTime_ = getElapsedTimef();
         return true;
     }
 
 private:
-    tcxIME ime_;
+    shared_ptr<tcxIME::TextField> textField_;
     Font labelFont_;
+    float inputX_ = 0;
+    float baselineY_ = 0;
+
+    void updateTextFieldLayout() {
+        if (!textField_) return;
+        float h = getHeight();
+        // Baseline at vertical center of bar (visually centered)
+        baselineY_ = h / 2.0f + labelFont_.getAscent() / 2.0f;
+        float textFieldY = baselineY_ - labelFont_.getAscent();
+        textField_->setPos(inputX_, textFieldY);
+        textField_->setSize(getWidth() - inputX_, h - textFieldY);
+    }
     bool active_ = false;
     bool lastCursorOn_ = false;
     float lastInputTime_ = 0;

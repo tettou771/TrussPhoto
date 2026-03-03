@@ -18,13 +18,19 @@ public:
     function<void()> onCancel;
     string placeholder;
 
+    NameEditOverlay() {
+        textField_ = make_shared<tcxIME::TextField>();
+        textField_->setEnableNewLine(false);
+    }
+
     void setup() override {
         enableEvents();
-        ime_.setFont(fontRef);
+        textField_->setFont(fontRef);
+        addChild(textField_);
 
-        // Intercept Enter at IME level (prevents newline insertion)
-        ime_.onEnter = [this]() {
-            string text = ime_.getString();
+        // Enter confirms
+        textField_->getIME().onEnter = [this]() {
+            string text = textField_->getString();
             // Trim whitespace
             auto s = text.find_first_not_of(" \t\n\r");
             auto e = text.find_last_not_of(" \t\n\r");
@@ -37,17 +43,23 @@ public:
 
     void show(const string& initialText, const string& placeholderText) {
         placeholder = placeholderText;
-        ime_.clear();
+        textField_->clear();
         if (!initialText.empty()) {
-            ime_.setString(initialText);
+            textField_->getIME().setString(initialText);
         }
-        ime_.enable();
+        textField_->enable();
         setActive(true);
+        updateDialogLayout();
     }
 
     void hide() {
-        ime_.disable();
+        textField_->disable();
         setActive(false);
+    }
+
+    void setSize(float w, float h) override {
+        RectNode::setSize(w, h);
+        updateDialogLayout();
     }
 
     void update() override {
@@ -65,17 +77,16 @@ public:
         fill();
         drawRect(0, 0, w, h);
 
-        float dlgW = 320, dlgH = 100;
-        float dlgX = (w - dlgW) / 2;
-        float dlgY = (h - dlgH) / 2;
+        float dlgX = (w - DLG_W) / 2;
+        float dlgY = (h - DLG_H) / 2;
 
         setColor(0.15f, 0.15f, 0.18f);
         fill();
-        drawRect(dlgX, dlgY, dlgW, dlgH);
+        drawRect(dlgX, dlgY, DLG_W, DLG_H);
 
         setColor(0.3f, 0.3f, 0.35f);
         noFill();
-        drawRect(dlgX, dlgY, dlgW, dlgH);
+        drawRect(dlgX, dlgY, DLG_W, DLG_H);
 
         setColor(0.7f, 0.7f, 0.75f);
         if (fontRef) fontRef->drawString("Name:", dlgX + 12, dlgY + 24,
@@ -83,7 +94,7 @@ public:
 
         float inputX = dlgX + 12;
         float inputY = dlgY + 40;
-        float inputW = dlgW - 24;
+        float inputW = DLG_W - 24;
         float inputH = 28;
 
         setColor(0.1f, 0.1f, 0.12f);
@@ -94,7 +105,7 @@ public:
         noFill();
         drawRect(inputX, inputY, inputW, inputH);
 
-        string text = const_cast<tcxIME&>(ime_).getString();
+        string text = textField_->getString();
         if (text.empty() && !placeholder.empty()) {
             setColor(0.4f, 0.4f, 0.45f);
             if (fontRef) fontRef->drawString(placeholder,
@@ -102,12 +113,12 @@ public:
                 Direction::Left, Direction::Center);
         }
 
+        // TextField draws itself as child at the correct position
         setColor(1, 1, 1);
-        ime_.draw(inputX + 6, inputY + 4);
 
         setColor(0.4f, 0.4f, 0.45f);
         if (fontRef) fontRef->drawString("Enter to confirm, ESC to cancel",
-            dlgX + dlgW / 2, dlgY + dlgH - 12,
+            dlgX + DLG_W / 2, dlgY + DLG_H - 12,
             Direction::Center, Direction::Center);
     }
 
@@ -121,11 +132,26 @@ public:
             if (onCancel) onCancel();
             return true;
         }
-        // Enter is handled by ime_.onEnter (no newline insertion)
         return false;
     }
 
 private:
-    tcxIME ime_;
+    shared_ptr<tcxIME::TextField> textField_;
     bool lastCursorOn_ = false;
+
+    static constexpr float DLG_W = 320;
+    static constexpr float DLG_H = 100;
+
+    void updateDialogLayout() {
+        if (!textField_) return;
+        float w = getWidth(), h = getHeight();
+        float dlgX = (w - DLG_W) / 2;
+        float dlgY = (h - DLG_H) / 2;
+        float inputX = dlgX + 12 + 6;  // dialog left + padding + text inset
+        float inputY = dlgY + 40 + 4;  // dialog top + label area + padding
+        float inputW = DLG_W - 24 - 12;
+        float inputH = 20;
+        textField_->setPos(inputX, inputY);
+        textField_->setSize(inputW, inputH);
+    }
 };
