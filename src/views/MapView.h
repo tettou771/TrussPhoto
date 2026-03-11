@@ -137,11 +137,16 @@ public:
 
     bool isFocused() const { return focused_; }
 
+    MapSearchBar() {
+        textField_ = make_shared<tcxIME::TextField>();
+        textField_->setEnableNewLine(false);
+    }
+
     void blur() {
         if (!focused_) return;
         focused_ = false;
-        ime_.disable();
-        ime_.clear();
+        textField_->disable();
+        textField_->clear();
         if (onRedraw) onRedraw();
     }
 
@@ -150,9 +155,15 @@ public:
         setSize(BAR_W, BAR_H);
         setPos(BAR_MARGIN, BAR_MARGIN);
         loadJapaneseFont(font_, 14);
-        ime_.setFont(&font_);
-        ime_.onEnter = [this]() {
-            string q = ime_.getString();
+        textField_->setFont(&font_);
+        baselineY_ = BAR_H / 2.0f + font_.getAscent() / 2.0f;
+        float textFieldY = baselineY_ - font_.getAscent();
+        textField_->setPos(TEXT_X, textFieldY);
+        textField_->setSize(BAR_W - TEXT_X, BAR_H - textFieldY);
+        addChild(textField_);
+
+        textField_->getIME().onEnter = [this]() {
+            string q = textField_->getString();
             if (!q.empty() && onSearch) onSearch(q);
         };
     }
@@ -180,22 +191,20 @@ public:
         noFill();
         drawRect(0, 0, w, h);
 
-        float textX = 10;
-        float textY = h / 2.0f;
-
         if (focused_) {
             setColor(1.0f, 1.0f, 1.0f);
-            ime_.draw(textX, textY - font_.getAscent() / 2.0f);
+            textField_->setVisible(true);
         } else {
-            string q = const_cast<tcxIME&>(ime_).getString();
+            textField_->setVisible(false);
+            string q = textField_->getString();
             if (q.empty()) {
                 setColor(0.45f, 0.45f, 0.5f);
-                font_.drawString("Search location...", textX, textY,
-                    Direction::Left, Direction::Center);
+                font_.drawString("Search location...", TEXT_X, baselineY_,
+                    Direction::Left, Direction::Baseline);
             } else {
                 setColor(0.8f, 0.8f, 0.85f);
-                font_.drawString(q, textX, textY,
-                    Direction::Left, Direction::Center);
+                font_.drawString(q, TEXT_X, baselineY_,
+                    Direction::Left, Direction::Baseline);
             }
         }
     }
@@ -205,21 +214,23 @@ public:
         if (button != 0) return false;
         if (!focused_) {
             focused_ = true;
-            ime_.enable();
+            textField_->enable();
             if (onRedraw) onRedraw();
         }
         return true;
     }
 
 private:
-    tcxIME ime_;
+    shared_ptr<tcxIME::TextField> textField_;
     Font font_;
+    float baselineY_ = 0;
     bool focused_ = false;
     bool lastCursorOn_ = false;
 
     static constexpr float BAR_W = 260;
     static constexpr float BAR_H = 32;
     static constexpr float BAR_MARGIN = 10;
+    static constexpr float TEXT_X = 10;
 };
 
 // =============================================================================
