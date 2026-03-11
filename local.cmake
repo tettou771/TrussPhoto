@@ -28,8 +28,16 @@ if(NOT EMSCRIPTEN)
     message(STATUS "[${PROJECT_NAME}] Found libjxl: ${JXL_VERSION}")
 
     # onnxruntime - CLIP embedding inference
-    # Official Microsoft release (includes CoreML execution provider)
-    set(ORT_DIR "${CMAKE_SOURCE_DIR}/lib/onnxruntime-osx-arm64-1.24.1")
+    if(APPLE)
+        # Official Microsoft release (includes CoreML execution provider)
+        set(ORT_DIR "${CMAKE_SOURCE_DIR}/lib/onnxruntime-osx-arm64-1.24.1")
+    elseif(UNIX)
+        # Linux: CPU or GPU build from GitHub Releases
+        set(ORT_DIR "${CMAKE_SOURCE_DIR}/lib/onnxruntime-linux-x64-1.21.1")
+        if(EXISTS "${CMAKE_SOURCE_DIR}/lib/onnxruntime-linux-x64-gpu-1.21.1")
+            set(ORT_DIR "${CMAKE_SOURCE_DIR}/lib/onnxruntime-linux-x64-gpu-1.21.1")
+        endif()
+    endif()
     target_include_directories(${PROJECT_NAME} PRIVATE "${ORT_DIR}/include")
     target_link_directories(${PROJECT_NAME} PRIVATE "${ORT_DIR}/lib")
     target_link_libraries(${PROJECT_NAME} PRIVATE onnxruntime)

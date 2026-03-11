@@ -49,7 +49,7 @@ public:
 
 #if defined(__APPLE__)
             opts.AppendExecutionProvider("CoreML", {
-                {kCoremlProviderOption_ModelCacheDirectory, getCoreMLCacheDir()}
+                {kCoremlProviderOption_ModelCacheDirectory, getOnnxCacheDir()}
             });
 #endif
 

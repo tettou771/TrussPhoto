@@ -104,12 +104,66 @@ void tcApp::setup() {
         server_.setup(provider_, catalogPath_ + "/thumbnail_cache");
         server_.start(port, serverConfig_.apiKey);
 
+        // Start ExportQueue in CPU mode (no GPU)
+        string profileDir = string(getenv("HOME") ? getenv("HOME") : ".") + "/.trussc/profiles";
+        exportQueue_.setProfileDir(profileDir);
+        exportQueue_.setCpuMode(true);
+        exportQueue_.start();
+        exportThumbnailReadyListener_ = exportQueue_.thumbnailReady.listen([this](string& pid) {
+            provider_.updateThumbnailPath(pid, provider_.getThumbnailCachePath(pid));
+        });
+
+        // Consolidate library if requested
+        if (AppConfig::consolidate) {
+            provider_.consolidateLibrary();
+            logNotice() << "[Server] Consolidating library (" << provider_.getConsolidateTotal() << " files)";
+        }
+
+        // Queue thumbnail generation if requested
+        if (AppConfig::generateThumbnails) {
+            int queued = 0;
+            for (auto& [id, entry] : provider_.photos()) {
+                string thumbPath = provider_.getThumbnailCachePath(id);
+                if (thumbPath.empty()) continue;
+                if (fs::exists(thumbPath)) continue;
+
+                ExportJobRequest req;
+                req.type = ExportJobType::Thumbnail;
+                req.photoId = id;
+                req.outPath = thumbPath;
+                req.settings.maxEdge = THUMBNAIL_MAX_SIZE;
+                req.settings.quality = THUMBNAIL_JPEG_QUALITY;
+                req.entry = entry;
+                req.spPath = entry.localSmartPreviewPath;
+                req.rawPath = entry.localPath;
+                req.lensCorrectionParams = entry.lensCorrectionParams;
+                exportQueue_.enqueueThumbnail(req);
+                queued++;
+            }
+            if (queued > 0) {
+                logNotice() << "[Server] Queued " << queued << " thumbnail generations";
+            }
+        }
+
+        // Queue smart preview generation if requested
+        if (AppConfig::generateSP) {
+            int queued = provider_.queueAllMissingSP();
+            if (queued > 0) {
+                logNotice() << "[Server] Queued " << queued << " smart preview generations";
+            }
+        }
+
         logNotice() << "=== TrussPhoto Server ===";
         logNotice() << "Port: " << port;
         logNotice() << "API Key: " << serverConfig_.apiKey;
         logNotice() << "Catalog: " << catalogPath_;
         logNotice() << "RAW Storage: " << rawStorage;
         logNotice() << "Photos: " << provider_.getCount();
+        if (AppConfig::hasPathRemap()) {
+            for (auto& [from, to] : AppConfig::pathRemaps) {
+                logNotice() << "Path remap: " << from << " -> " << to;
+            }
+        }
         return;
     }
 
@@ -747,6 +801,20 @@ void tcApp::setup() {
 void tcApp::update() {
     if (AppConfig::serverMode) {
         provider_.processCopyResults();
+        provider_.processConsolidateResults();
+        provider_.processSPResults();
+
+        // ExportQueue: drain results (CPU mode)
+        exportQueue_.processMainThread();
+
+        // Periodic progress logging
+        if (!exportQueue_.isIdle()) {
+            int done = exportQueue_.completedCount();
+            int total = exportQueue_.totalCount();
+            if (done > 0 && done % 100 == 0) {
+                logNotice() << "[Server] Export progress: " << done << "/" << total;
+            }
+        }
         return;
     }
 

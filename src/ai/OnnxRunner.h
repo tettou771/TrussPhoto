@@ -7,6 +7,9 @@
 #include <onnxruntime_cxx_api.h>
 #if defined(__APPLE__)
 #include <coreml_provider_factory.h>
+#elif defined(__linux__) && __has_include(<cuda_provider_factory.h>)
+#define TRUSSP_HAS_CUDA_EP 1
+#include <cuda_provider_factory.h>
 #endif
 #include <TrussC.h>
 #include <string>
@@ -22,9 +25,9 @@ inline Ort::Env& getSharedOrtEnv() {
     return env;
 }
 
-// Shared CoreML cache directory (~/.trussc/onnx_cache)
+// Shared model cache directory (~/.trussc/onnx_cache)
 // Prevents ONNX Runtime from creating a new temp dir on every launch.
-inline const std::string& getCoreMLCacheDir() {
+inline const std::string& getOnnxCacheDir() {
     static std::string dir = [] {
         std::string home = getenv("HOME") ? getenv("HOME") : ".";
         std::string path = home + "/.trussc/onnx_cache";
@@ -47,9 +50,19 @@ public:
 #if defined(__APPLE__)
             // CoreML EP with cached model directory to avoid temp file leak
             opts.AppendExecutionProvider("CoreML", {
-                {kCoremlProviderOption_ModelCacheDirectory, getCoreMLCacheDir()}
+                {kCoremlProviderOption_ModelCacheDirectory, getOnnxCacheDir()}
             });
-            logNotice() << "[OnnxRunner] CoreML EP enabled (cache: " << getCoreMLCacheDir() << ")";
+            logNotice() << "[OnnxRunner] CoreML EP enabled (cache: " << getOnnxCacheDir() << ")";
+#elif defined(TRUSSP_HAS_CUDA_EP)
+            // CUDA EP for GPU inference on Linux
+            try {
+                OrtCUDAProviderOptions cudaOpts{};
+                cudaOpts.device_id = 0;
+                opts.AppendExecutionProviderCUDA(cudaOpts);
+                logNotice() << "[OnnxRunner] CUDA EP enabled";
+            } catch (...) {
+                logWarning() << "[OnnxRunner] CUDA EP not available, using CPU";
+            }
 #endif
 
             session_ = make_unique<Ort::Session>(getSharedOrtEnv(), modelPath.c_str(), opts);

@@ -18,7 +18,9 @@
 #include <deque>
 #include <condition_variable>
 #include <sys/stat.h>
+#ifdef __APPLE__
 #include <vecLib/vDSP.h>
+#endif
 
 using namespace std;
 using namespace tc;
@@ -1025,6 +1027,7 @@ public:
     }
 
     // Fully delete photos: local file + thumbnail + DB + memory
+    // In server mode, originals are preserved (only metadata/cache deleted).
     int deletePhotos(const vector<string>& ids) {
         int deleted = 0;
         for (const auto& id : ids) {
@@ -1034,7 +1037,10 @@ public:
             auto& photo = it->second;
 
             // Delete local RAW/image file + XMP sidecar (only if managed)
-            if (photo.isManaged && !photo.localPath.empty() && fs::exists(photo.localPath)) {
+            // In server mode, refuse to delete originals for safety
+            if (AppConfig::serverMode) {
+                logWarning() << "[Delete] Skipping original file in server mode: " << photo.localPath;
+            } else if (photo.isManaged && !photo.localPath.empty() && fs::exists(photo.localPath)) {
                 // Delete XMP sidecar
                 string xmpPath = xmpWritePath(photo.localPath);
                 if (!xmpPath.empty() && fs::exists(xmpPath)) {
@@ -1232,6 +1238,12 @@ public:
 
         for (auto& e : entries) {
             if (photos_.count(e.id)) continue;  // skip duplicates
+
+            // Apply path remap at import time (e.g. Mac paths → Linux paths)
+            // Remapped path is stored in DB — each machine has its own DB.
+            if (AppConfig::hasPathRemap()) {
+                e.localPath = AppConfig::remapPath(e.localPath);
+            }
 
             // Extract full EXIF from file (lens correction, creative style, etc.)
             if (!e.localPath.empty() && !e.isVideo && fs::exists(e.localPath)) {

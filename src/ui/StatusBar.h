@@ -5,7 +5,11 @@
 // =============================================================================
 
 #include <TrussC.h>
+#ifdef __APPLE__
 #include <mach/mach.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
 #include "FolderTree.h"  // for loadJapaneseFont
 using namespace std;
 using namespace tc;
@@ -112,15 +116,28 @@ private:
     float fps_ = 0;
     double ramGiB_ = 0;
 
-    // RAM measurement (macOS)
+    // RAM measurement
 public:
     static double measureRamGiB() {
+#ifdef __APPLE__
         mach_task_basic_info_data_t taskInfo;
         mach_msg_type_number_t infoCount = MACH_TASK_BASIC_INFO_COUNT;
         if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
                 (task_info_t)&taskInfo, &infoCount) == KERN_SUCCESS) {
             return taskInfo.resident_size / (1024.0 * 1024.0 * 1024.0);
         }
+#elif defined(__linux__)
+        // Read from /proc/self/statm (pages)
+        FILE* f = fopen("/proc/self/statm", "r");
+        if (f) {
+            long pages = 0;
+            if (fscanf(f, "%*ld %ld", &pages) == 1) {
+                fclose(f);
+                return pages * sysconf(_SC_PAGESIZE) / (1024.0 * 1024.0 * 1024.0);
+            }
+            fclose(f);
+        }
+#endif
         return 0;
     }
 };

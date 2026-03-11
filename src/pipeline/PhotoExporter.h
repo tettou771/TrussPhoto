@@ -22,8 +22,12 @@ struct ExportSettings {
 namespace PhotoExporter {
 
 // Metal readback: RGB10A2 sg_image -> Pixels U8 RGBA
-// Implemented in PhotoExporter.mm (Metal API)
+// Implemented in PhotoExporter.mm (Metal API, macOS only)
+#ifdef __APPLE__
 bool readFboPixels(sg_image fboImg, int w, int h, Pixels& outPixels);
+#else
+inline bool readFboPixels(sg_image, int, int, Pixels&) { return false; }
+#endif
 
 // Area-averaging downscale (U8 RGBA)
 // Each output pixel averages ALL source pixels in the corresponding region.

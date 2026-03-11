@@ -25,6 +25,8 @@
 #include "SmartPreview.h"
 #include "PhotoExporter.h"
 #include "PhotoEntry.h"
+#include "DevelopPipelineCPU.h"
+#include "Lut3DCPU.h"
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -88,16 +90,21 @@ public:
         profileManager_.setProfileDir(dir);
     }
 
+    void setCpuMode(bool v) { cpuMode_ = v; }
+    bool isCpuMode() const { return cpuMode_; }
+
     void start() {
         if (running_) return;
         running_ = true;
 
-        // Initialize dedicated develop shader (must be on main thread)
-        exportShader_.load();
+        // Initialize dedicated develop shader (must be on main thread, GPU only)
+        if (!cpuMode_) {
+            exportShader_.load();
+        }
 
         loaderThread_ = thread([this]() { loaderFunc(); });
         saverThread_ = thread([this]() { saverFunc(); });
-        logNotice() << "[ExportQueue] Started";
+        logNotice() << "[ExportQueue] Started (cpuMode=" << cpuMode_ << ")";
     }
 
     void stop() {
@@ -148,8 +155,9 @@ public:
         }
 
         // 2. Process one loaded job (GPU render + readback)
+        //    In CPU mode, loader sends directly to saver — no GPU stage needed.
         ExportLoaderResult loaded;
-        if (loadedQueue_.tryReceive(loaded)) {
+        if (!cpuMode_ && loadedQueue_.tryReceive(loaded)) {
             processOneJob(loaded);
             didWork = true;
         }
@@ -169,10 +177,16 @@ public:
     }
 
 private:
+    bool cpuMode_ = false;
+
     DevelopShader exportShader_;
     CameraProfileManager profileManager_;
     Lut3D profileLut_;
     string currentProfilePath_;
+
+    // CPU mode LUT cache (used by loader thread)
+    Lut3DCPU cpuLut_;
+    string cpuLutPath_;
 
     thread loaderThread_;
     thread saverThread_;
@@ -259,7 +273,49 @@ private:
             }
 
             result.success = true;
-            loadedQueue_.send(std::move(result));
+
+            if (cpuMode_) {
+                // CPU mode: apply lens correction + develop + toU8 here,
+                // then send directly to saver queue (skip GPU stage)
+                if (result.lensReady) {
+                    result.lensCorrector.apply(result.sourcePixels);
+                }
+
+                // Load/cache CPU LUT
+                string cubePath = profileManager_.findProfile(
+                    job.entry.camera, job.entry.creativeStyle);
+                const Lut3DCPU* lutPtr = nullptr;
+                if (!cubePath.empty()) {
+                    if (cubePath != cpuLutPath_) {
+                        if (cpuLut_.load(cubePath)) {
+                            cpuLutPath_ = cubePath;
+                        } else {
+                            cpuLutPath_.clear();
+                        }
+                    }
+                    if (cpuLut_.isLoaded() && cpuLutPath_ == cubePath) {
+                        lutPtr = &cpuLut_;
+                    }
+                }
+
+                // CPU develop (in-place F32)
+                DevelopPipelineCPU::develop(result.sourcePixels, job.entry,
+                    job.entry.asShotTemp, job.entry.asShotTint, lutPtr);
+
+                // F32 → U8
+                Pixels u8Pixels;
+                DevelopPipelineCPU::toU8(result.sourcePixels, u8Pixels);
+
+                // Send to saver
+                ExportSaverJob saverJob;
+                saverJob.job = std::move(job);
+                saverJob.fboW = u8Pixels.getWidth();
+                saverJob.fboH = u8Pixels.getHeight();
+                saverJob.fboPixels = std::move(u8Pixels);
+                saverQueue_.send(std::move(saverJob));
+            } else {
+                loadedQueue_.send(std::move(result));
+            }
         }
     }
 
