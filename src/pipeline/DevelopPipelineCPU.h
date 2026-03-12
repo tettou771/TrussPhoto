@@ -23,6 +23,7 @@
 #include <TrussC.h>
 #include "WhiteBalance.h"
 #include "Lut3DCPU.h"
+#include "DcpProfile.h"
 #include "PhotoEntry.h"
 #include <cmath>
 #include <algorithm>
@@ -45,7 +46,8 @@ inline void processRows(float* data, int w, int yStart, int yEnd,
                         float contrast, float blacks, float whites,
                         float highlights, float shadows,
                         float saturation, float vibrance,
-                        float lutBlend, const Lut3DCPU* lut) {
+                        float lutBlend, const Lut3DCPU* lut,
+                        const DcpProfile* dcp = nullptr) {
 
     for (int y = yStart; y < yEnd; y++) {
         for (int x = 0; x < w; x++) {
@@ -185,8 +187,14 @@ inline void processRows(float* data, int w, int yStart, int yEnd,
                 b = gray + (b - gray) * factor;
             }
 
-            // 11. LUT
-            if (lut && lutBlend > 0.0f) {
+            // 11. LUT (.cube) or DCP LookTable (HSV)
+            if (dcp && dcp->hasLook()) {
+                float lr = r, lg = g, lb = b;
+                dcp->applyLookTable(lr, lg, lb);
+                r = r * (1.0f - lutBlend) + lr * lutBlend;
+                g = g * (1.0f - lutBlend) + lg * lutBlend;
+                b = b * (1.0f - lutBlend) + lb * lutBlend;
+            } else if (lut && lutBlend > 0.0f) {
                 float lr = r, lg = g, lb = b;
                 lut->apply(lr, lg, lb);
                 r = r * (1.0f - lutBlend) + lr * lutBlend;
@@ -202,10 +210,12 @@ inline void processRows(float* data, int w, int yStart, int yEnd,
 }
 
 // Main API: develop F32 RGBA pixels in-place
-// Lens correction should be applied before calling this.
+// Lens correction and DCP color pipeline should be applied before calling this.
+// If dcp is provided, its LookTable replaces the .cube LUT.
 inline void develop(Pixels& pixels, const PhotoEntry& entry,
                     float asShotTemp, float asShotTint,
-                    const Lut3DCPU* lut = nullptr, float lutBlend = 1.0f) {
+                    const Lut3DCPU* lut = nullptr, float lutBlend = 1.0f,
+                    const DcpProfile* dcp = nullptr) {
 
     int w = pixels.getWidth();
     int h = pixels.getHeight();
@@ -232,7 +242,7 @@ inline void develop(Pixels& pixels, const PhotoEntry& entry,
             entry.devContrast, entry.devBlacks, entry.devWhites,
             entry.devHighlights, entry.devShadows,
             entry.devSaturation, entry.devVibrance,
-            lutBlend, lut);
+            lutBlend, lut, dcp);
     }
     for (auto& t : threads) t.join();
 }

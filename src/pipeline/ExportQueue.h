@@ -188,6 +188,10 @@ private:
     Lut3DCPU cpuLut_;
     string cpuLutPath_;
 
+    // DCP profile cache (used by loader thread in CPU mode)
+    DcpProfile cpuDcp_;
+    string cpuDcpPath_;
+
     thread loaderThread_;
     thread saverThread_;
 
@@ -223,7 +227,14 @@ private:
             // Fallback to RAW
             if (!loaded && !job.rawPath.empty() && fs::exists(job.rawPath)) {
                 if (job.entry.isRaw) {
-                    loaded = RawLoader::loadFloat(job.rawPath, result.sourcePixels);
+                    // Check if DCP profile exists — load raw camera RGB if so
+                    bool useRawColor = false;
+                    if (cpuMode_) {
+                        auto pi = profileManager_.findProfileInfo(
+                            job.entry.camera, job.entry.creativeStyle);
+                        useRawColor = (pi.type == ProfileType::DCP);
+                    }
+                    loaded = RawLoader::loadFloat(job.rawPath, result.sourcePixels, useRawColor);
                 } else {
                     // JPEG/HEIC: load as U8 then convert to F32
                     Pixels u8;
@@ -275,32 +286,52 @@ private:
             result.success = true;
 
             if (cpuMode_) {
-                // CPU mode: apply lens correction + develop + toU8 here,
+                // CPU mode: apply lens correction + DCP + develop + toU8 here,
                 // then send directly to saver queue (skip GPU stage)
                 if (result.lensReady) {
                     result.lensCorrector.apply(result.sourcePixels);
                 }
 
-                // Load/cache CPU LUT
-                string cubePath = profileManager_.findProfile(
+                // Load/cache profile (.dcp or .cube)
+                auto profileInfo = profileManager_.findProfileInfo(
                     job.entry.camera, job.entry.creativeStyle);
                 const Lut3DCPU* lutPtr = nullptr;
-                if (!cubePath.empty()) {
-                    if (cubePath != cpuLutPath_) {
-                        if (cpuLut_.load(cubePath)) {
-                            cpuLutPath_ = cubePath;
+                const DcpProfile* dcpPtr = nullptr;
+
+                if (profileInfo.type == ProfileType::DCP) {
+                    if (profileInfo.path != cpuDcpPath_) {
+                        if (cpuDcp_.load(profileInfo.path)) {
+                            cpuDcpPath_ = profileInfo.path;
+                        } else {
+                            cpuDcpPath_.clear();
+                        }
+                    }
+                    if (!cpuDcpPath_.empty() && cpuDcpPath_ == profileInfo.path) {
+                        // Apply DCP color pipeline (ForwardMatrix + ToneCurve + gamma)
+                        // Note: source must be loaded with rawColorSpace=true for DCP
+                        cpuDcp_.applyColorPipeline(
+                            result.sourcePixels.getDataF32(),
+                            result.sourcePixels.getWidth(),
+                            result.sourcePixels.getHeight(),
+                            job.entry.asShotTemp);
+                        dcpPtr = &cpuDcp_;
+                    }
+                } else if (profileInfo.type == ProfileType::CubeLUT) {
+                    if (profileInfo.path != cpuLutPath_) {
+                        if (cpuLut_.load(profileInfo.path)) {
+                            cpuLutPath_ = profileInfo.path;
                         } else {
                             cpuLutPath_.clear();
                         }
                     }
-                    if (cpuLut_.isLoaded() && cpuLutPath_ == cubePath) {
+                    if (cpuLut_.isLoaded() && cpuLutPath_ == profileInfo.path) {
                         lutPtr = &cpuLut_;
                     }
                 }
 
                 // CPU develop (in-place F32)
                 DevelopPipelineCPU::develop(result.sourcePixels, job.entry,
-                    job.entry.asShotTemp, job.entry.asShotTint, lutPtr);
+                    job.entry.asShotTemp, job.entry.asShotTint, lutPtr, 1.0f, dcpPtr);
 
                 // F32 → U8
                 Pixels u8Pixels;

@@ -15,6 +15,7 @@
 #include "ui/PhotoGrid.h"
 #include "ui/MetadataPanel.h"
 #include "pipeline/CameraProfileManager.h"
+#include "pipeline/DcpProfile.h"
 #include "pipeline/LensCorrector.h"
 #include "pipeline/DevelopShader.h"
 #include "pipeline/WhiteBalance.h"
@@ -206,9 +207,25 @@ public:
                     lensCorrector_.reset();
 
                     if (rawLoadThread_.joinable()) rawLoadThread_.join();
-                    rawLoadThread_ = thread([this, index, path]() {
+
+                    // Determine if DCP profile needs raw camera RGB
+                    bool useRawColor = (currentProfileType_ == ProfileType::DCP &&
+                                        dcpProfile_.hasForwardMatrix1);
+                    float dcpColorTemp = entry->asShotTemp > 0 ? entry->asShotTemp : 5500.0f;
+
+                    rawLoadThread_ = thread([this, index, path, useRawColor, dcpColorTemp]() {
                         Pixels loadedPixels;
-                        if (RawLoader::loadFloat(path, loadedPixels)) {
+                        if (RawLoader::loadFloat(path, loadedPixels, useRawColor)) {
+                            // Apply DCP color pipeline on background thread
+                            // (ForwardMatrix + ToneCurve + sRGB gamma)
+                            if (useRawColor) {
+                                dcpProfile_.applyColorPipeline(
+                                    loadedPixels.getDataF32(),
+                                    loadedPixels.getWidth(),
+                                    loadedPixels.getHeight(),
+                                    dcpColorTemp);
+                            }
+
                             lock_guard<mutex> lock(rawLoadMutex_);
                             pendingRawPixels_ = std::move(loadedPixels);
                             int pw = pendingRawPixels_.getWidth();
@@ -818,6 +835,9 @@ public:
                 .profileEnabled = profileEnabled_,
                 .profileBlend = profileBlend_,
                 .hasProfile = hasProfileLut_,
+                .profileType = (currentProfileType_ == ProfileType::DCP)
+                    ? ProfileType_t::DCP : (currentProfileType_ == ProfileType::CubeLUT)
+                    ? ProfileType_t::CubeLUT : ProfileType_t::None,
                 .lensEnabled = lensEnabled_,
                 .hasLensData = lensCorrector_.isReady(),
                 .isSmartPreview = isSmartPreview_,
@@ -965,9 +985,11 @@ private:
     Pixels pendingRawPixels_;
     mutex rawLoadMutex_;
 
-    // Camera profile (LUT)
+    // Camera profile (LUT or DCP)
     CameraProfileManager profileManager_;
-    lut::Lut3D profileLut_;
+    lut::Lut3D profileLut_;       // GPU .cube LUT
+    DcpProfile dcpProfile_;       // DCP profile (CPU)
+    ProfileType currentProfileType_ = ProfileType::None;
     bool hasProfileLut_ = false;
     bool profileEnabled_ = true;
     float profileBlend_ = 1.0f;
@@ -1083,7 +1105,9 @@ private:
         displayW_ = displayH_ = 0;
 
         hasProfileLut_ = false;
+        currentProfileType_ = ProfileType::None;
         profileLut_.clear();
+        dcpProfile_ = DcpProfile();
         currentProfilePath_.clear();
         developShader_.clearLut();
         developShader_.clearLensData();
@@ -1283,29 +1307,60 @@ private:
     }
 
     void loadProfileForEntry(const PhotoEntry& entry) {
-        string cubePath = profileManager_.findProfile(entry.camera, entry.creativeStyle);
-        if (cubePath.empty() || cubePath == currentProfilePath_) {
-            if (cubePath.empty()) {
+        auto info = profileManager_.findProfileInfo(entry.camera, entry.creativeStyle);
+
+        if (info.path.empty() || info.path == currentProfilePath_) {
+            if (info.path.empty()) {
                 hasProfileLut_ = false;
+                currentProfileType_ = ProfileType::None;
                 currentProfilePath_.clear();
                 developShader_.clearLut();
             }
             return;
         }
 
-        if (profileLut_.load(cubePath)) {
-            hasProfileLut_ = true;
-            currentProfilePath_ = cubePath;
-            developShader_.setLut(profileLut_);
-            developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
-            needsFboRender_ = true;
-            logNotice() << "[Profile] Loaded: " << cubePath;
-        } else {
-            hasProfileLut_ = false;
-            currentProfilePath_.clear();
-            developShader_.clearLut();
-            needsFboRender_ = true;
-            logWarning() << "[Profile] Failed to load: " << cubePath;
+        if (info.type == ProfileType::DCP) {
+            // DCP profile: LookTable will be applied via GPU .cube LUT path
+            // (ForwardMatrix + ToneCurve are applied on CPU during RAW load)
+            if (dcpProfile_.load(info.path)) {
+                currentProfilePath_ = info.path;
+                currentProfileType_ = ProfileType::DCP;
+
+                // If DCP has a LookTable, convert to .cube-compatible GPU LUT
+                // For now, mark as having profile for indicator purposes
+                // The LookTable is applied on CPU in the RAW load thread
+                hasProfileLut_ = dcpProfile_.hasLook();
+
+                // DCP LookTable can't be directly used as GPU 3D texture
+                // (it's in HSV space, not RGB). Clear any previous .cube LUT.
+                developShader_.clearLut();
+                needsFboRender_ = true;
+                logNotice() << "[Profile] Loaded DCP: " << dcpProfile_.profileName;
+            } else {
+                hasProfileLut_ = false;
+                currentProfileType_ = ProfileType::None;
+                currentProfilePath_.clear();
+                developShader_.clearLut();
+                needsFboRender_ = true;
+            }
+        } else if (info.type == ProfileType::CubeLUT) {
+            // .cube LUT: apply via GPU shader as before
+            if (profileLut_.load(info.path)) {
+                hasProfileLut_ = true;
+                currentProfileType_ = ProfileType::CubeLUT;
+                currentProfilePath_ = info.path;
+                developShader_.setLut(profileLut_);
+                developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+                needsFboRender_ = true;
+                logNotice() << "[Profile] Loaded cube: " << info.path;
+            } else {
+                hasProfileLut_ = false;
+                currentProfileType_ = ProfileType::None;
+                currentProfilePath_.clear();
+                developShader_.clearLut();
+                needsFboRender_ = true;
+                logWarning() << "[Profile] Failed to load: " << info.path;
+            }
         }
     }
 };

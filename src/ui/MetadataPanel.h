@@ -22,11 +22,16 @@ struct OverlayRect {
     float lineWidth = 1.0f;
 };
 
+// Profile type enum (also defined in CameraProfileManager.h, duplicated
+// here to avoid circular include — MetadataPanel is a UI header)
+enum class ProfileType_t { None, DCP, CubeLUT };
+
 struct ViewInfo {
     float zoom = 1.0f;
     bool profileEnabled = false;
     float profileBlend = 1.0f;
     bool hasProfile = false;
+    ProfileType_t profileType = ProfileType_t::None;
     bool lensEnabled = false;
     bool hasLensData = false;
     bool isSmartPreview = false;
@@ -570,9 +575,14 @@ private:
             drawValue(format("Zoom: {:.0f}%", vi.zoom * 100), y);
 
             if (vi.hasProfile) {
-                string profileStr = format("Profile: {} {:.0f}%",
-                    vi.profileEnabled ? "ON" : "OFF", vi.profileBlend * 100);
-                drawValue(profileStr, y, Color(0.5f, 0.75f, 0.5f));
+                string typeStr = (vi.profileType == ProfileType_t::DCP) ? "DCP" : "LUT";
+                string profileStr = format("Profile: {} {} {:.0f}%",
+                    vi.profileEnabled ? "ON" : "OFF", typeStr, vi.profileBlend * 100);
+                // White = DCP, Cyan = .cube LUT, Green = legacy
+                Color profileColor = (vi.profileType == ProfileType_t::DCP)
+                    ? Color(0.9f, 0.9f, 0.9f)
+                    : Color(0.4f, 0.7f, 0.8f);
+                drawValue(profileStr, y, profileColor);
             }
 
             if (vi.hasLensData) {

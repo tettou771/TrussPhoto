@@ -1,16 +1,18 @@
 #pragma once
 
 // =============================================================================
-// CameraProfileManager - Manages camera color profiles (.cube LUT files)
+// CameraProfileManager - Manages camera color profiles (.dcp and .cube files)
 // =============================================================================
 // Profile directory structure:
 //   ~/.trussc/profiles/
-//     Sony_ILCE-7CM2/
-//       Standard.cube      <- Creative Style name
-//       Vivid.cube
-//       _default.cube      <- Fallback when style is unknown
+//     Sony ILCE-7CM2/           <- Camera model name (spaces preserved)
+//       Camera ST.dcp           <- DCP profile (preferred)
+//       Standard.cube           <- .cube LUT (fallback)
+//       _default.cube           <- Fallback when style is unknown
 //     SIGMA_BF/
 //       Standard.cube
+//
+// Priority: .dcp > .cube (DCP has camera-specific color science)
 // =============================================================================
 
 #include <TrussC.h>
@@ -21,6 +23,13 @@ using namespace tc;
 
 namespace fs = std::filesystem;
 
+enum class ProfileType { None, DCP, CubeLUT };
+
+struct ProfileInfo {
+    string path;
+    ProfileType type = ProfileType::None;
+};
+
 class CameraProfileManager {
 public:
     // Set the profile root directory and scan for profiles
@@ -29,7 +38,7 @@ public:
         scanProfiles();
     }
 
-    // Scan profileDir_ for .cube files
+    // Scan profileDir_ for .dcp and .cube files
     void scanProfiles() {
         profiles_.clear();
         if (profileDir_.empty() || !fs::exists(profileDir_)) return;
@@ -41,23 +50,37 @@ public:
             for (const auto& file : fs::directory_iterator(cameraDir.path())) {
                 if (!file.is_regular_file()) continue;
                 string ext = file.path().extension().string();
-                if (ext != ".cube" && ext != ".CUBE") continue;
+
+                ProfileType type = ProfileType::None;
+                if (ext == ".dcp" || ext == ".DCP") type = ProfileType::DCP;
+                else if (ext == ".cube" || ext == ".CUBE") type = ProfileType::CubeLUT;
+                else continue;
 
                 string styleName = file.path().stem().string();
                 string key = cameraKey + "/" + styleName;
-                profiles_[key] = file.path().string();
+
+                // DCP takes priority over .cube with same name
+                auto it = profiles_.find(key);
+                if (it == profiles_.end() || type == ProfileType::DCP) {
+                    profiles_[key] = {file.path().string(), type};
+                }
             }
         }
 
         if (!profiles_.empty()) {
-            logNotice() << "[ProfileManager] Found " << profiles_.size() << " profiles";
+            int dcpCount = 0, cubeCount = 0;
+            for (auto& [k, v] : profiles_) {
+                if (v.type == ProfileType::DCP) dcpCount++;
+                else cubeCount++;
+            }
+            logNotice() << "[ProfileManager] Found " << profiles_.size()
+                        << " profiles (" << dcpCount << " DCP, " << cubeCount << " cube)";
         }
     }
 
-    // Find profile .cube path for a given camera model and creative style
-    // Camera model should match directory name exactly (from Exif.Image.Model)
-    // Search order: exact style match -> _default -> empty
-    string findProfile(const string& cameraModel, const string& style = "") const {
+    // Find profile for a given camera model and creative style
+    // Returns path and type. Search order: exact style → _default → empty
+    ProfileInfo findProfileInfo(const string& cameraModel, const string& style = "") const {
         string cameraKey = sanitize(cameraModel);
 
         // 1. Try exact style match
@@ -72,12 +95,17 @@ public:
             if (it != profiles_.end()) return it->second;
         }
 
-        return "";
+        return {"", ProfileType::None};
+    }
+
+    // Legacy API: returns path string (backward compatible)
+    string findProfile(const string& cameraModel, const string& style = "") const {
+        return findProfileInfo(cameraModel, style).path;
     }
 
     bool hasProfile(const string& cameraModel) const {
         string cameraKey = sanitize(cameraModel);
-        for (const auto& [key, path] : profiles_) {
+        for (const auto& [key, info] : profiles_) {
             if (key.substr(0, cameraKey.size()) == cameraKey &&
                 key.size() > cameraKey.size() && key[cameraKey.size()] == '/') {
                 return true;
@@ -90,10 +118,9 @@ public:
 
 private:
     string profileDir_;
-    unordered_map<string, string> profiles_;  // "CameraKey/StyleName" -> path
+    unordered_map<string, ProfileInfo> profiles_;  // "CameraKey/StyleName" -> info
 
     // Sanitize camera model name for directory matching
-    // Spaces are preserved to match directory names exactly
     static string sanitize(const string& name) {
         return name;
     }
