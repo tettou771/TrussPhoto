@@ -86,6 +86,11 @@ struct PhotoEntry {
     // Lens correction (JSON: Sony EXIF spline, DNG polynomial, or Fuji MakerNote)
     string lensCorrectionParams;
 
+    // Camera RGB → XYZ D50 color matrix (JSON: 9 floats, row-major 3x3)
+    // Used as fallback when no DCP profile is available for this camera.
+    // Extracted from LibRaw's cam_xyz, stored on first RAW decode.
+    string camColorMatrix;
+
     // Additional shooting info (available without RAW file)
     string exposureTime;       // "1/125" etc (human-readable string)
     float exposureBias = 0;    // EV
@@ -443,6 +448,7 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"asShotTemp", e.asShotTemp},
         {"asShotTint", e.asShotTint},
         {"lensCorrectionParams", e.lensCorrectionParams},
+        {"camColorMatrix", e.camColorMatrix},
         {"exposureTime", e.exposureTime},
         {"exposureBias", e.exposureBias},
         {"orientation", e.orientation},
@@ -522,6 +528,7 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.asShotTint = j.value("asShotTint", 0.0f);
 
     e.lensCorrectionParams = j.value("lensCorrectionParams", string(""));
+    e.camColorMatrix = j.value("camColorMatrix", string(""));
     e.exposureTime = j.value("exposureTime", string(""));
     e.exposureBias = j.value("exposureBias", 0.0f);
     e.orientation = j.value("orientation", 1);

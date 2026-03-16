@@ -90,7 +90,7 @@ public:
         }
         JxlEncoderSetParallelRunner(enc, JxlResizableParallelRunner, runner);
 
-        // Basic info: float16 with XYB transform
+        // Basic info: float16, preserve original profile (camera RGB linear)
         JxlBasicInfo info;
         JxlEncoderInitBasicInfo(&info);
         info.xsize = dstW;
@@ -100,7 +100,7 @@ public:
         info.num_color_channels = 3;
         info.num_extra_channels = 0;
         info.alpha_bits = 0;
-        info.uses_original_profile = JXL_FALSE; // Enable XYB transform
+        info.uses_original_profile = JXL_TRUE; // Preserve camera RGB (no XYB transform)
 
         if (JxlEncoderSetBasicInfo(enc, &info) != JXL_ENC_SUCCESS) {
             logWarning() << "[SmartPreview] Failed to set basic info";
@@ -109,9 +109,9 @@ public:
             return false;
         }
 
-        // Tell encoder the input is sRGB (gamma-encoded from LibRaw)
+        // Tag as linear RGB (camera color space, not display-ready)
         JxlColorEncoding colorEnc;
-        JxlColorEncodingSetToSRGB(&colorEnc, JXL_FALSE);
+        JxlColorEncodingSetToLinearSRGB(&colorEnc, JXL_FALSE);
         JxlEncoderSetColorEncoding(enc, &colorEnc);
 
         // Frame settings: lossy with configurable distance

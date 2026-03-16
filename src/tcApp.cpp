@@ -769,7 +769,9 @@ void tcApp::setup() {
     }
 
     // 10. SingleView init (camera profiles, LUT shader, lens correction)
-    viewManager_->singleView()->init(getDataPath("profiles"));
+    // Primary: ~/.trussc/profiles/ (user DCP/cube), fallback: bin/data/profiles/ (bundled cube)
+    viewManager_->singleView()->init(profileDir);
+    viewManager_->singleView()->addProfileDir(getDataPath("profiles"));
 
     // Sync DevelopPanel sliders when photo changes
     viewManager_->singleView()->onDevelopRestored = [this](float exp, float temperature, float tint,

@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 19;
+    static constexpr int SCHEMA_VERSION = 20;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -108,7 +108,8 @@ public:
                 "  dev_vibrance        REAL NOT NULL DEFAULT 0.0,"
                 "  dev_saturation      REAL NOT NULL DEFAULT 0.0,"
                 "  as_shot_temp        REAL NOT NULL DEFAULT 0.0,"
-                "  as_shot_tint        REAL NOT NULL DEFAULT 0.0"
+                "  as_shot_tint        REAL NOT NULL DEFAULT 0.0,"
+                "  cam_color_matrix   TEXT NOT NULL DEFAULT ''"
                 ")"
             );
             if (!ok) return false;
@@ -426,8 +427,19 @@ public:
             }
             // Reset old relative slider values (0 = "use as-shot", will be populated by backfill)
             db_.exec("UPDATE photos SET dev_temperature=0, dev_tint=0");
-            db_.setSchemaVersion(SCHEMA_VERSION);
+            version = 19;
+            db_.setSchemaVersion(version);
             logNotice() << "[PhotoDatabase] Migrated v18 -> v19 (absolute WB + as-shot fields)";
+        }
+
+        // v19 -> v20: add cam_color_matrix (camera RGB → XYZ, fallback for DCP)
+        if (version == 19) {
+            if (!db_.exec("ALTER TABLE photos ADD COLUMN cam_color_matrix TEXT NOT NULL DEFAULT ''")) {
+                logError() << "[PhotoDatabase] Migration v19->v20 failed";
+                return false;
+            }
+            db_.setSchemaVersion(SCHEMA_VERSION);
+            logNotice() << "[PhotoDatabase] Migrated v19 -> v20 (cam_color_matrix)";
         }
 
         return true;
@@ -649,8 +661,9 @@ public:
             "lens_correction_params=?11, exposure_time=?12, exposure_bias=?13, "
             "orientation=?14, white_balance=?15, focal_length_35mm=?16, "
             "offset_time=?17, body_serial=?18, lens_serial=?19, "
-            "subject_distance=?20, subsec_time_original=?21, companion_files=?22 "
-            "WHERE id=?23");
+            "subject_distance=?20, subsec_time_original=?21, companion_files=?22, "
+            "cam_color_matrix=?23 "
+            "WHERE id=?24");
         if (!stmt.valid()) return false;
         stmt.bind(1, e.width);
         stmt.bind(2, e.height);
@@ -674,7 +687,17 @@ public:
         stmt.bind(20, (double)e.subjectDistance);
         stmt.bind(21, e.subsecTimeOriginal);
         stmt.bind(22, e.companionFiles);
-        stmt.bind(23, e.id);
+        stmt.bind(23, e.camColorMatrix);
+        stmt.bind(24, e.id);
+        return stmt.execute();
+    }
+
+    bool updateCamColorMatrix(const string& id, const string& matrix) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET cam_color_matrix=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, matrix);
+        stmt.bind(2, id);
         return stmt.execute();
     }
 
@@ -786,7 +809,8 @@ public:
             "as_shot_temp, as_shot_tint, "
             "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
             "user_angle, user_rotation90, "
-            "user_persp_v, user_persp_h, user_shear "
+            "user_persp_v, user_persp_h, user_shear, "
+            "cam_color_matrix "
             "FROM photos"
         );
         if (!stmt.valid()) return result;
@@ -866,6 +890,7 @@ public:
             e.userPerspV         = (float)stmt.getDouble(70);
             e.userPerspH         = (float)stmt.getDouble(71);
             e.userShear          = (float)stmt.getDouble(72);
+            e.camColorMatrix     = stmt.getText(73);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -1620,11 +1645,11 @@ private:
             "as_shot_temp, as_shot_tint, "
             "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
             "user_angle, user_rotation90, "
-            "user_persp_v, user_persp_h, user_shear) "
+            "user_persp_v, user_persp_h, user_shear, cam_color_matrix) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
             "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,"
-            "?56,?57,?58,?59,?60,?61,?62,?63,?64,?65,?66,?67,?68,?69,?70,?71,?72,?73)";
+            "?56,?57,?58,?59,?60,?61,?62,?63,?64,?65,?66,?67,?68,?69,?70,?71,?72,?73,?74)";
     }
 
     static void bindEntry(Database::Statement& stmt, const PhotoEntry& e) {
@@ -1701,5 +1726,6 @@ private:
         stmt.bind(71, (double)e.userPerspV);
         stmt.bind(72, (double)e.userPerspH);
         stmt.bind(73, (double)e.userShear);
+        stmt.bind(74, e.camColorMatrix);
     }
 };

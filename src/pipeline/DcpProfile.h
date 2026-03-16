@@ -130,6 +130,74 @@ public:
         for (auto& t : threads) t.join();
     }
 
+    // ---- Apply fallback matrix (cam_xyz from LibRaw) when no DCP available ----
+    // Converts camera RGB → XYZ D50 → linear sRGB → sRGB gamma
+    // camXyz: 3x3 row-major camera → XYZ matrix (from LibRaw's cam_xyz)
+    static void applyFallbackMatrix(float* data, int w, int h, const float camXyz[9]) {
+        // XYZ D50 → linear sRGB
+        static const float xyzToSrgb[9] = {
+             3.1338561f, -1.6168667f, -0.4906146f,
+            -0.9787684f,  1.9161415f,  0.0334540f,
+             0.0719453f, -0.1921862f,  1.1002053f,
+        };
+
+        // Combined: camera RGB → XYZ D50 → linear sRGB
+        float combined[9];
+        matMul3x3(xyzToSrgb, camXyz, combined);
+
+        int numThreads = clamp((int)thread::hardware_concurrency(), 1, 16);
+        int rowsPerThread = (h + numThreads - 1) / numThreads;
+        vector<thread> threads;
+
+        for (int t = 0; t < numThreads; t++) {
+            int yStart = t * rowsPerThread;
+            int yEnd = min(yStart + rowsPerThread, h);
+            if (yStart >= yEnd) break;
+
+            threads.emplace_back([=]() {
+                for (int y = yStart; y < yEnd; y++) {
+                    for (int x = 0; x < w; x++) {
+                        int idx = (y * w + x) * 4;
+                        float r = data[idx], g = data[idx+1], b = data[idx+2];
+
+                        // Camera RGB → linear sRGB
+                        float lr = combined[0]*r + combined[1]*g + combined[2]*b;
+                        float lg = combined[3]*r + combined[4]*g + combined[5]*b;
+                        float lb = combined[6]*r + combined[7]*g + combined[8]*b;
+
+                        // sRGB gamma
+                        data[idx]   = srgbGamma(max(0.0f, lr));
+                        data[idx+1] = srgbGamma(max(0.0f, lg));
+                        data[idx+2] = srgbGamma(max(0.0f, lb));
+                    }
+                }
+            });
+        }
+        for (auto& t : threads) t.join();
+    }
+
+    // Parse cam_xyz matrix from JSON string "[0.1, 0.2, ...]" (9 floats)
+    static bool parseCamXyz(const string& json, float out[9]) {
+        if (json.empty()) return false;
+        try {
+            // Simple parser for "[f,f,f,f,f,f,f,f,f]"
+            size_t i = 0;
+            int idx = 0;
+            while (i < json.size() && idx < 9) {
+                if (json[i] == '-' || json[i] == '.' || (json[i] >= '0' && json[i] <= '9')) {
+                    size_t end;
+                    out[idx++] = stof(json.substr(i), &end);
+                    i += end;
+                } else {
+                    i++;
+                }
+            }
+            return idx == 9;
+        } catch (...) {
+            return false;
+        }
+    }
+
     // ---- Apply LookTable (HSV 3D LUT) to sRGB pixel ----
     // Call at the same position as .cube LUT (after develop, in sRGB gamma space)
 

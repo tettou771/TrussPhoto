@@ -820,6 +820,14 @@ public:
         return true;
     }
 
+    bool updateCamColorMatrix(const string& id, const string& matrix) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        it->second.camColorMatrix = matrix;
+        db_.updateCamColorMatrix(id, matrix);
+        return true;
+    }
+
     // --- Folder tree ---
 
     // Folder info for tree display

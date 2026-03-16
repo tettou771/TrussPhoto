@@ -80,6 +80,77 @@ public:
         developShader_.load();
     }
 
+    // Add additional profile directory (e.g. bundled bin/data/profiles)
+    void addProfileDir(const string& dir) {
+        profileManager_.addProfileDir(dir);
+    }
+
+    // Reload current image (e.g. after DCP profile toggle)
+    void reloadCurrentImage() {
+        if (selectedIndex_ >= 0) show(selectedIndex_);
+    }
+
+    // Reload RAW only (without resetting SP/UI) for DCP toggle
+    void reloadRawWithCurrentSettings() {
+        if (selectedIndex_ < 0 || !ctx_) return;
+        const string& photoId = ctx_->grid->getPhotoId(selectedIndex_);
+        auto* entry = ctx_->provider->getPhoto(photoId);
+        if (!entry || entry->localPath.empty()) {
+            logWarning() << "[DCP] reloadRaw: no entry or no localPath";
+            return;
+        }
+
+        string path = entry->localPath;
+        int index = selectedIndex_;
+        string camMatrix = entry->camColorMatrix;
+        float colorTemp = entry->asShotTemp > 0 ? entry->asShotTemp : 5500.0f;
+        bool hasDcp = (currentProfileType_ == ProfileType::DCP &&
+                       dcpProfile_.hasForwardMatrix1);
+        bool profOn = profileEnabled_;
+
+        logNotice() << "[DCP] reloadRaw: profOn=" << profOn
+                    << " hasDcp=" << hasDcp << " path=" << path;
+
+        rawLoadInProgress_ = true;
+        rawLoadCompleted_ = false;
+        rawLoadTargetIndex_ = index;
+
+        if (rawLoadThread_.joinable()) rawLoadThread_.join();
+        rawLoadThread_ = thread([this, index, path, camMatrix, colorTemp, hasDcp, profOn]() {
+            Pixels loadedPixels;
+            if (RawLoader::loadFloat(path, loadedPixels, true)) {
+                // Apply color pipeline: DCP or fallback cam_xyz
+                if (profOn && hasDcp) {
+                    dcpProfile_.applyColorPipeline(
+                        loadedPixels.getDataF32(),
+                        loadedPixels.getWidth(),
+                        loadedPixels.getHeight(), colorTemp);
+                    logNotice() << "[DCP] applyColorPipeline done";
+                } else {
+                    float camXyz[9];
+                    if (DcpProfile::parseCamXyz(camMatrix, camXyz)) {
+                        DcpProfile::applyFallbackMatrix(
+                            loadedPixels.getDataF32(),
+                            loadedPixels.getWidth(),
+                            loadedPixels.getHeight(), camXyz);
+                        logNotice() << "[DCP] fallback cam_xyz applied";
+                    }
+                }
+
+                lock_guard<mutex> lock(rawLoadMutex_);
+                pendingRawPixels_ = std::move(loadedPixels);
+                int pw = pendingRawPixels_.getWidth();
+                int ph = pendingRawPixels_.getHeight();
+                lensCorrector_.setupFromExif(path, pw, ph);
+                rawLoadCompleted_ = true;
+                logNotice() << "[DCP] RAW load completed: " << pw << "x" << ph;
+            } else {
+                logWarning() << "[DCP] RAW load FAILED: " << path;
+            }
+            rawLoadInProgress_ = false;
+        });
+    }
+
     // Check if a profile exists for a given camera/style combo
     bool hasProfileFor(const string& camera, const string& style) const {
         return !profileManager_.findProfile(camera, style).empty();
@@ -208,22 +279,62 @@ public:
 
                     if (rawLoadThread_.joinable()) rawLoadThread_.join();
 
-                    // Determine if DCP profile needs raw camera RGB
-                    bool useRawColor = (currentProfileType_ == ProfileType::DCP &&
-                                        dcpProfile_.hasForwardMatrix1);
-                    float dcpColorTemp = entry->asShotTemp > 0 ? entry->asShotTemp : 5500.0f;
+                    // Always load as camera RGB — color pipeline applied after
+                    string camMatrix = entry->camColorMatrix;
+                    float colorTemp = entry->asShotTemp > 0 ? entry->asShotTemp : 5500.0f;
+                    bool hasDcp = (currentProfileType_ == ProfileType::DCP &&
+                                   dcpProfile_.hasForwardMatrix1);
+                    bool profOn = profileEnabled_;
 
-                    rawLoadThread_ = thread([this, index, path, useRawColor, dcpColorTemp]() {
+                    // Capture photoId for SP generation on background thread
+                    string spId = photoId;
+                    bool needsSp = !provider.hasSmartPreview(photoId);
+
+                    rawLoadThread_ = thread([this, index, path, camMatrix, colorTemp, hasDcp, profOn, spId, needsSp]() {
                         Pixels loadedPixels;
-                        if (RawLoader::loadFloat(path, loadedPixels, useRawColor)) {
-                            // Apply DCP color pipeline on background thread
-                            // (ForwardMatrix + ToneCurve + sRGB gamma)
-                            if (useRawColor) {
+                        float camXyzOut[9] = {};
+                        if (RawLoader::loadFloat(path, loadedPixels, true, camXyzOut)) {
+                            // Save cam_xyz matrix to DB if not already stored
+                            if (camMatrix.empty()) {
+                                string matJson = "[";
+                                for (int i = 0; i < 9; i++) {
+                                    if (i > 0) matJson += ",";
+                                    matJson += to_string(camXyzOut[i]);
+                                }
+                                matJson += "]";
+                                ctx_->provider->updateCamColorMatrix(spId, matJson);
+                            }
+
+                            // Generate SP from camera RGB BEFORE color conversion
+                            if (needsSp) {
+                                ctx_->provider->generateSmartPreview(spId, loadedPixels);
+                            }
+
+                            // Apply color pipeline: DCP or fallback cam_xyz
+                            // Use extracted matrix if no stored one
+                            string effectiveMatrix = camMatrix;
+                            if (effectiveMatrix.empty()) {
+                                effectiveMatrix = "[";
+                                for (int i = 0; i < 9; i++) {
+                                    if (i > 0) effectiveMatrix += ",";
+                                    effectiveMatrix += to_string(camXyzOut[i]);
+                                }
+                                effectiveMatrix += "]";
+                            }
+
+                            if (profOn && hasDcp) {
                                 dcpProfile_.applyColorPipeline(
                                     loadedPixels.getDataF32(),
                                     loadedPixels.getWidth(),
-                                    loadedPixels.getHeight(),
-                                    dcpColorTemp);
+                                    loadedPixels.getHeight(), colorTemp);
+                            } else {
+                                float camXyz[9];
+                                if (DcpProfile::parseCamXyz(effectiveMatrix, camXyz)) {
+                                    DcpProfile::applyFallbackMatrix(
+                                        loadedPixels.getDataF32(),
+                                        loadedPixels.getWidth(),
+                                        loadedPixels.getHeight(), camXyz);
+                                }
                             }
 
                             lock_guard<mutex> lock(rawLoadMutex_);
@@ -247,10 +358,13 @@ public:
             if (ctx_->redraw) ctx_->redraw(1);
         }
 
-        // Fallback: try smart preview
+        // Fallback: try smart preview (camera RGB — needs color pipeline)
         if (!loaded && provider.hasSmartPreview(photoId)) {
             Pixels spPixels;
             if (provider.loadSmartPreview(photoId, spPixels)) {
+                // Apply DCP or fallback color matrix to camera RGB SP
+                applyColorPipelineToPixels(spPixels, *entry);
+
                 rawPixels_ = std::move(spPixels);
                 if (!entry->lensCorrectionParams.empty()) {
                     lensCorrector_.setupFromJson(entry->lensCorrectionParams,
@@ -356,10 +470,7 @@ public:
                     }
                 }
 
-                // Generate smart preview (CPU lens correction, background)
-                if (!ctx_->provider->hasSmartPreview(spId)) {
-                    ctx_->provider->generateSmartPreview(spId, rawPixels_);
-                }
+                // SP is now generated on background thread before color conversion
 
                 updateViewInfo();
                 if (ctx_->redraw) ctx_->redraw(1);
@@ -604,11 +715,26 @@ public:
             return true;
         }
         if (key == 'P' || key == 'p') {
-            if (hasProfileLut_) {
+            if (hasProfileLut_ || currentProfileType_ == ProfileType::DCP) {
                 profileEnabled_ = !profileEnabled_;
-                developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
-                needsFboRender_ = true;
+                if (currentProfileType_ == ProfileType::DCP) {
+                    // DCP color pipeline is baked into pixels — reload RAW only
+                    // Only works if RAW file is accessible
+                    const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
+                    auto* ent = ctx_->provider->getPhoto(pid);
+                    if (ent && !ent->localPath.empty() && fs::exists(ent->localPath)) {
+                        reloadRawWithCurrentSettings();
+                    } else {
+                        logWarning() << "[Profile] Cannot toggle DCP: RAW not available";
+                        profileEnabled_ = !profileEnabled_;  // revert
+                    }
+                } else {
+                    developShader_.setLutBlend(profileEnabled_ ? profileBlend_ : 0.0f);
+                    needsFboRender_ = true;
+                }
                 logNotice() << "[Profile] " << (profileEnabled_ ? "ON" : "OFF");
+                updateViewInfo();
+                redraw();
             }
             return true;
         }
@@ -1127,6 +1253,40 @@ private:
     }
 
     // Apply NR to rawPixels_, upload as intermediate texture, setup develop shader
+    // Apply DCP or fallback color matrix to camera RGB pixels (in-place)
+    // Used for both SP display and RAW display
+    void applyColorPipelineToPixels(Pixels& pixels, const PhotoEntry& entry) {
+        if (!profileEnabled_) {
+            // Profile disabled — apply fallback matrix (LibRaw's cam_xyz)
+            float camXyz[9];
+            if (DcpProfile::parseCamXyz(entry.camColorMatrix, camXyz)) {
+                DcpProfile::applyFallbackMatrix(
+                    pixels.getDataF32(), pixels.getWidth(), pixels.getHeight(), camXyz);
+                logNotice() << "[DCP] Applied fallback cam_xyz matrix";
+            } else {
+                logWarning() << "[DCP] No camColorMatrix, displaying raw camera RGB";
+            }
+            return;
+        }
+
+        if (currentProfileType_ == ProfileType::DCP && dcpProfile_.hasForwardMatrix1) {
+            float colorTemp = entry.asShotTemp > 0 ? entry.asShotTemp : 5500.0f;
+            dcpProfile_.applyColorPipeline(
+                pixels.getDataF32(), pixels.getWidth(), pixels.getHeight(), colorTemp);
+            logNotice() << "[DCP] Applied DCP color pipeline";
+        } else {
+            // No DCP — use fallback cam_xyz matrix
+            float camXyz[9];
+            if (DcpProfile::parseCamXyz(entry.camColorMatrix, camXyz)) {
+                DcpProfile::applyFallbackMatrix(
+                    pixels.getDataF32(), pixels.getWidth(), pixels.getHeight(), camXyz);
+                logNotice() << "[DCP] Applied fallback cam_xyz matrix";
+            } else {
+                logWarning() << "[DCP] No color pipeline available, displaying raw camera RGB";
+            }
+        }
+    }
+
     void setupIntermediateFromRaw() {
         int srcW = rawPixels_.getWidth();
         int srcH = rawPixels_.getHeight();
@@ -1335,6 +1495,7 @@ private:
                 // (it's in HSV space, not RGB). Clear any previous .cube LUT.
                 developShader_.clearLut();
                 needsFboRender_ = true;
+                redraw();
                 logNotice() << "[Profile] Loaded DCP: " << dcpProfile_.profileName;
             } else {
                 hasProfileLut_ = false;
