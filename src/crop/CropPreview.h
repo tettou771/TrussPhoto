@@ -63,7 +63,7 @@ public:
             setColor(1, 1, 1);
             sgl_enable_texture();
             sgl_texture(view_, sampler_);
-            Color col = getDefaultContext().getColor();
+            Color col = getColor();
             sgl_begin_triangles();
             sgl_c4f(col.r, col.g, col.b, col.a);
 

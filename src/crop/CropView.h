@@ -115,25 +115,29 @@ public:
         addChild(panel_);
     }
 
-    void setSingleView(shared_ptr<SingleView> sv) {
+    // Called when entering crop mode from SingleView.
+    // Re-acquires EVERYTHING borrowed from the source view on every entry —
+    // no state from a previous crop session may survive into this one except
+    // the photo's persisted crop values. Returns false if the source view is
+    // not ready (caller should back out of crop mode).
+    bool enterCrop(shared_ptr<SingleView> sv) {
+        if (!sv || !sv->hasFbo()) return false;
+        if (!ctx_) return false;
         singleView_ = sv;
-    }
-
-    // Called when entering crop mode from SingleView
-    void enterCrop() {
-        if (!singleView_ || !singleView_->hasFbo()) return;
-        if (!ctx_) return;
         initRotateCursor();
 
-        // Borrow FBO handles
-        fboView_ = singleView_->fboView();
-        fboSampler_ = singleView_->fboSampler();
-        fboW_ = singleView_->displayWidth();
-        fboH_ = singleView_->displayHeight();
-        if (fboW_ <= 0 || fboH_ <= 0) {
-            fboW_ = singleView_->fboWidth();
-            fboH_ = singleView_->fboHeight();
+        // Reset interaction state from any previous session
+        dragMode_ = DragMode::None;
+        viewPanDragging_ = false;
+
+        // Acquire source dimensions (GPU handles are queried per-frame in draw)
+        int srcW = 0, srcH = 0;
+        if (!queryFboDims(srcW, srcH)) {
+            singleView_ = nullptr;
+            return false;
         }
+        fboW_ = srcW;
+        fboH_ = srcH;
         originalAspect_ = (float)fboW_ / max(1, fboH_);
 
         // Load current crop + rotation + perspective from entry
@@ -182,6 +186,11 @@ public:
         initialCrop_ = { cropX_, cropY_, cropW_, cropH_, angle_, rotation90_,
                          perspV_, perspH_, shear_ };
         undoStack_.clear();
+
+        // Seed the screen-space BB rect so hit-testing is valid even before
+        // the first draw of this session (draw() recomputes it every frame)
+        bbRect_ = predictBBRect();
+        return true;
     }
 
     // Save crop + rotation + perspective to DB (Done / Enter)
@@ -296,8 +305,11 @@ public:
 
         panel_->setRect(imgAreaW, 0, panelW, h);
 
-        // Image area: fit rotated bounding box
-        if (fboW_ <= 0 || fboH_ <= 0) return;
+        // Source FBO: re-check dims and fetch GPU handles fresh every frame
+        // (SingleView may recreate its FBO mid-session; never draw stale)
+        if (!refreshSourceDims()) return;
+        sg_view fboView = singleView_->fboView();
+        sg_sampler fboSampler = singleView_->fboSampler();
 
         float padding = 40;
         float availW = imgAreaW - padding * 2;
@@ -343,8 +355,8 @@ public:
 
             setColor(0.3f, 0.3f, 0.3f);
             sgl_enable_texture();
-            sgl_texture(fboView_, fboSampler_);
-            Color col = getDefaultContext().getColor();
+            sgl_texture(fboView, fboSampler);
+            Color col = getColor();
             sgl_begin_quads();
             sgl_c4f(col.r, col.g, col.b, col.a);
             sgl_v2f_t2f(imgX, imgY, 0, 0);
@@ -361,8 +373,8 @@ public:
             float cosR = cos(totalRot), sinR = sin(totalRot);
             setColor(0.3f, 0.3f, 0.3f);
             sgl_enable_texture();
-            sgl_texture(fboView_, fboSampler_);
-            Color col = getDefaultContext().getColor();
+            sgl_texture(fboView, fboSampler);
+            Color col = getColor();
 
             auto srcToScreen = [&](float u, float v) -> pair<float,float> {
                 auto [wu, wv] = tmpEntry.forwardWarp(u, v);
@@ -432,8 +444,8 @@ public:
 
             setColor(1, 1, 1);
             sgl_enable_texture();
-            sgl_texture(fboView_, fboSampler_);
-            Color col = getDefaultContext().getColor();
+            sgl_texture(fboView, fboSampler);
+            Color col = getColor();
             sgl_begin_quads();
             sgl_c4f(col.r, col.g, col.b, col.a);
             sgl_v2f_t2f(cx, cy, u_tl_x, u_tl_y);
@@ -447,8 +459,8 @@ public:
             int tessN = 16;
             setColor(1, 1, 1);
             sgl_enable_texture();
-            sgl_texture(fboView_, fboSampler_);
-            Color col = getDefaultContext().getColor();
+            sgl_texture(fboView, fboSampler);
+            Color col = getColor();
 
             sgl_begin_triangles();
             sgl_c4f(col.r, col.g, col.b, col.a);
@@ -524,7 +536,7 @@ public:
         auto [u_bl_x, u_bl_y] = screenToUV(cx, cy + ch);
         int outputW = (int)round(bbW_ * cropW_);
         int outputH = (int)round(bbH_ * cropH_);
-        panel_->setPreviewInfo(fboView_, fboSampler_,
+        panel_->setPreviewInfo(fboView, fboSampler,
                                u_tl_x, u_tl_y, u_tr_x, u_tr_y,
                                u_br_x, u_br_y, u_bl_x, u_bl_y,
                                outputW, outputH);
@@ -542,6 +554,9 @@ protected:
             return true;
         }
         if (button != 0) return false;
+
+        // Guard against a mid-session FBO size change before hit-testing
+        if (!refreshSourceDims()) return false;
 
         // Crop rect in screen coords
         float cx = bbRect_.x + cropX_ * bbRect_.w;
@@ -976,6 +991,8 @@ protected:
     }
 
     bool onMouseScroll(Vec2 pos, Vec2 scroll) override {
+        if (!refreshSourceDims()) return false;
+
         // View zoom: scroll changes magnification, not crop parameters
         float factor = 1.0f + scroll.y * 0.05f;
         factor = clamp(factor, 0.8f, 1.25f);
@@ -1021,9 +1038,10 @@ private:
     EventListener focalListener_, centerizeListener_;
     EventListener panelDoneListener_, panelCancelListener_;
 
-    // Borrowed FBO handles
-    sg_view fboView_ = {};
-    sg_sampler fboSampler_ = {};
+    // Source FBO dimensions. GPU view/sampler handles are NOT cached — they
+    // are queried from SingleView at point of use, because SingleView may
+    // recreate its develop FBO mid-session (e.g. after an async RAW reload)
+    // which would leave a copied sg_view dangling.
     int fboW_ = 0, fboH_ = 0;
     float originalAspect_ = 1.0f;
 
@@ -1139,6 +1157,36 @@ private:
         bbW_ = w;
         bbH_ = h;
         bbAspect_ = bbW_ / max(1.0f, bbH_);
+    }
+
+    // Query current source dimensions from SingleView (display size preferred,
+    // falls back to raw FBO size). Returns false if unavailable.
+    bool queryFboDims(int& w, int& h) const {
+        if (!singleView_ || !singleView_->hasFbo()) return false;
+        w = singleView_->displayWidth();
+        h = singleView_->displayHeight();
+        if (w <= 0 || h <= 0) {
+            w = singleView_->fboWidth();
+            h = singleView_->fboHeight();
+        }
+        return (w > 0 && h > 0);
+    }
+
+    // Re-query source dimensions; if the FBO was recreated at a different
+    // size mid-session, recompute crop geometry instead of using stale values.
+    // Returns false if the source FBO is not available.
+    bool refreshSourceDims() {
+        int w = 0, h = 0;
+        if (!queryFboDims(w, h)) return false;
+        if (w != fboW_ || h != fboH_) {
+            fboW_ = w;
+            fboH_ = h;
+            originalAspect_ = (float)fboW_ / max(1, fboH_);
+            updateBoundingBox();
+            constrainCropToBounds();
+            bbRect_ = predictBBRect();
+        }
+        return true;
     }
 
     // Predict screen-space BB rect from current bbW_/bbH_ (same formula as draw())

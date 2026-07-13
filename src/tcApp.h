@@ -165,8 +165,18 @@ private:
     void relinkMissingPhotos();
     void consolidateLibrary();
     void updateLayout();
+    void applyModeLayout();
     void rebuildFolderTree();
     void updateMetadataPanel();
+
+    // Effective pane widths derived from the current mode. Transitions never
+    // force the animated values; layout derives what is actually shown.
+    float effectiveLeftPaneWidth() const {
+        return viewMode() == ViewMode::Grid ? leftPaneWidth_ : 0;
+    }
+    float effectiveRightPaneWidth() const {
+        return viewMode() == ViewMode::Crop ? 0 : rightPaneWidth_;
+    }
 
     // Geo search (Nominatim)
     struct GeoSearchResult {

@@ -368,10 +368,7 @@ void tcApp::setup() {
     };
     mapView->onPinDoubleClick = [this](int index, const string& photoId) {
         viewManager_->showFullImage(index);
-        if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-        leftPaneWidth_ = 0;
-        leftTween_.finish();
-        updateLayout();
+        applyModeLayout();
     };
     mapView->onRedraw = [this]() { redraw(); };
     mapView->cmdDownRef = &cmdDown_;
@@ -405,10 +402,7 @@ void tcApp::setup() {
         for (int i = 0; i < (int)g->getPhotoIdCount(); i++) {
             if (g->getPhotoId(i) == photoId) {
                 viewManager_->showFullImage(i);
-                if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-                leftPaneWidth_ = 0;
-                leftTween_.finish();
-                updateLayout();
+                applyModeLayout();
                 return;
             }
         }
@@ -444,10 +438,7 @@ void tcApp::setup() {
         for (int i = 0; i < (int)g->getPhotoIdCount(); i++) {
             if (g->getPhotoId(i) == photoId) {
                 viewManager_->showFullImage(i);
-                if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-                leftPaneWidth_ = 0;
-                leftTween_.finish();
-                updateLayout();
+                applyModeLayout();
                 return;
             }
         }
@@ -483,6 +474,13 @@ void tcApp::setup() {
     // Set metadataPanel in ViewContext after creation
     viewCtx_.metadataPanel = metadataPanel_;
     viewManager_->setContext(viewCtx_);
+
+    // Crop exit: Done/Cancel buttons, Enter and ESC all fire doneEvent.
+    // Wired once here — panel visibility is derived by updateLayout().
+    cropDoneListener_ = viewManager_->cropView()->doneEvent.listen([this]() {
+        viewManager_->switchTo(ViewMode::Single);
+        applyModeLayout();
+    });
 
     // 5e. Create pane toggle buttons
     leftToggle_ = make_shared<PaneToggle>();
@@ -543,10 +541,7 @@ void tcApp::setup() {
         } else if (isDoubleClick) {
             g->clearSelection();
             viewManager_->showFullImage(index);
-            if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-            leftPaneWidth_ = 0;
-            leftTween_.finish();
-            updateLayout();
+            applyModeLayout();
         } else {
             g->clearSelection();
             g->toggleSelection(index);
@@ -647,6 +642,11 @@ void tcApp::setup() {
     statusBar_->setPhotoCount(provider_.getCount());
 
     // 8. MCP tools
+    // Input-injection tools (mouse/key) for MCP automation — opt-in in TrussC
+    if (const char* mcpEnv = getenv("TRUSSC_MCP"); mcpEnv && string(mcpEnv) == "1") {
+        mcp::registerDebuggerTools();
+    }
+
     mcp::tool("load_folder", "Load a folder containing images")
         .arg<string>("path", "Path to folder")
         .bind([this](const string& path) {
@@ -1050,8 +1050,8 @@ void tcApp::draw() {
     if (viewMode() == ViewMode::Grid) {
         // Show hint if no images
         if (provider_.getCount() == 0) {
-            float leftW = leftPaneWidth_;
-            float rightW = rightPaneWidth_;
+            float leftW = effectiveLeftPaneWidth();
+            float rightW = effectiveRightPaneWidth();
             float contentW = getWindowWidth() - leftW - rightW;
             float centerX = leftW + contentW * 0.5f;
 
@@ -1066,8 +1066,8 @@ void tcApp::draw() {
     // Model download / loading progress
     if (provider_.isEmbedderInitializing()) {
         pushStyle();
-        float leftW = leftPaneWidth_;
-        float rightW = rightPaneWidth_;
+        float leftW = effectiveLeftPaneWidth();
+        float rightW = effectiveRightPaneWidth();
         float contentW = getWindowWidth() - leftW - rightW;
         float centerX = leftW + contentW * 0.5f;
         float centerY = getWindowHeight() * 0.5f;
@@ -1123,40 +1123,28 @@ void tcApp::keyPressed(int key) {
 
         if (key == SAPP_KEYCODE_ESCAPE) {
             // ESC: go back to previous view
-            // (Developed thumbnail is generated in SingleView::endView)
-            // Hide develop panel if visible
-            if (showDevelop_) {
-                showDevelop_ = false;
-                if (developPanel_) developPanel_->setActive(false);
-                if (metadataPanel_) metadataPanel_->setActive(true);
-            }
+            // (Developed thumbnail is generated in SingleView::endView.)
+            // showDevelop_ persists — layout derivation keeps the develop
+            // panel Single-only, and it restores on the next Single entry.
             viewManager_->goBack();
-            // Restore layout for target view
             auto active = viewManager_->activeView();
             if (active == ViewMode::Grid || active == ViewMode::People) {
-                if (active == ViewMode::Grid) {
-                    leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
-                    leftTween_.finish();
-                }
                 if (metadataPanel_) {
                     metadataPanel_->clearViewInfo();
                     updateMetadataPanel();
                 }
             }
-            updateLayout();
+            applyModeLayout();
         }
 
         if ((key == 'O' || key == 'o') && viewManager_->previousView() == ViewMode::People) {
             // O: go back to People view (with state restore)
             viewManager_->goBack();
-            leftPaneWidth_ = 0;
-            leftTween_.finish();
             if (metadataPanel_) {
                 metadataPanel_->clearViewInfo();
                 metadataPanel_->clearThumbnail();
             }
-            updateLayout();
-            redraw();
+            applyModeLayout();
             return;
         }
 
@@ -1167,8 +1155,6 @@ void tcApp::keyPressed(int key) {
                 // Now enter related
                 viewManager_->relatedView()->setCenter(photoId, provider_);
                 viewManager_->switchTo(ViewMode::Related);
-                leftPaneWidth_ = 0;
-                leftTween_.finish();
                 if (metadataPanel_) {
                     auto* entry = provider_.getPhoto(photoId);
                     metadataPanel_->setPhoto(entry);
@@ -1177,38 +1163,30 @@ void tcApp::keyPressed(int key) {
                     metadataPanel_->clearViewInfo();
                     metadataPanel_->clearThumbnail();
                 }
-                updateLayout();
+                applyModeLayout();
             }
         }
 
         if (key == 'D' || key == 'd') {
+            // Toggle develop vs metadata panel (visibility derived in updateLayout)
             showDevelop_ = !showDevelop_;
-            if (showDevelop_) {
-                // Show develop panel, hide metadata panel
-                if (developPanel_) {
-                    developPanel_->setActive(true);
-                    developPanel_->setNrEnabled(singleView->isRawImage());
-                    // Restore slider values from current photo
-                    string photoId = singleView->currentPhotoId();
-                    auto* entry = provider_.getPhoto(photoId);
-                    if (entry) {
-                        float temp = (entry->devTemperature > 0) ? entry->devTemperature
-                                     : (entry->asShotTemp > 0) ? entry->asShotTemp : 5500.0f;
-                        developPanel_->setAsShotDefaults(entry->asShotTemp, entry->asShotTint);
-                        developPanel_->setValues(entry->devExposure, temp,
-                                                 entry->devTint,
-                                                 entry->devContrast, entry->devHighlights,
-                                                 entry->devShadows, entry->devWhites,
-                                                 entry->devBlacks,
-                                                 entry->devVibrance, entry->devSaturation,
-                                                 entry->chromaDenoise, entry->lumaDenoise);
-                    }
+            if (showDevelop_ && developPanel_) {
+                developPanel_->setNrEnabled(singleView->isRawImage());
+                // Restore slider values from current photo
+                string photoId = singleView->currentPhotoId();
+                auto* entry = provider_.getPhoto(photoId);
+                if (entry) {
+                    float temp = (entry->devTemperature > 0) ? entry->devTemperature
+                                 : (entry->asShotTemp > 0) ? entry->asShotTemp : 5500.0f;
+                    developPanel_->setAsShotDefaults(entry->asShotTemp, entry->asShotTint);
+                    developPanel_->setValues(entry->devExposure, temp,
+                                             entry->devTint,
+                                             entry->devContrast, entry->devHighlights,
+                                             entry->devShadows, entry->devWhites,
+                                             entry->devBlacks,
+                                             entry->devVibrance, entry->devSaturation,
+                                             entry->chromaDenoise, entry->lumaDenoise);
                 }
-                if (metadataPanel_) metadataPanel_->setActive(false);
-            } else {
-                // Hide develop panel, show metadata panel
-                if (developPanel_) developPanel_->setActive(false);
-                if (metadataPanel_) metadataPanel_->setActive(true);
             }
             updateLayout();
         }
@@ -1218,30 +1196,15 @@ void tcApp::keyPressed(int key) {
         }
 
         if ((key == 'R' || key == 'r') && singleView->hasFbo() && !singleView->isVideo()) {
-            // Enter crop mode
+            // Enter crop mode. switchTo suspends Single (keeps its FBO alive);
+            // enterCrop re-acquires everything it borrows for this session.
             auto cv = viewManager_->cropView();
-            cropDoneListener_ = cv->doneEvent.listen([this]() {
-                // Return to single view
-                // (Developed thumbnail will be generated when leaving SingleView)
-                viewManager_->switchTo(ViewMode::Single);
-                if (showDevelop_) {
-                    if (developPanel_) developPanel_->setActive(true);
-                    if (metadataPanel_) metadataPanel_->setActive(false);
-                } else {
-                    if (metadataPanel_) metadataPanel_->setActive(true);
-                }
-                updateLayout();
-            });
             viewManager_->switchTo(ViewMode::Crop);
-            cv->enterCrop();
-            // Hide metadata/develop panels (CropView has its own panel)
-            if (metadataPanel_) metadataPanel_->setActive(false);
-            if (developPanel_) developPanel_->setActive(false);
-            rightPaneWidth_ = 0;
-            rightTween_.finish();
-            leftPaneWidth_ = 0;
-            leftTween_.finish();
-            updateLayout();
+            if (!cv->enterCrop(singleView)) {
+                // Source FBO not ready — back out of crop mode
+                viewManager_->switchTo(ViewMode::Single);
+            }
+            applyModeLayout();
         }
 
         // Update metadata panel with current state
@@ -1264,14 +1227,12 @@ void tcApp::keyPressed(int key) {
         if (key == SAPP_KEYCODE_ESCAPE) {
             if (!peopleView->hasSelection() && !peopleView->isNameEditing()) {
                 viewManager_->switchTo(ViewMode::Grid);
-                leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
-                leftTween_.finish();
                 if (metadataPanel_) {
                     metadataPanel_->clearViewInfo();
                     metadataPanel_->clearThumbnail();
                     updateMetadataPanel();
                 }
-                updateLayout();
+                applyModeLayout();
             }
         }
     } else if (viewMode() == ViewMode::Map) {
@@ -1374,9 +1335,6 @@ void tcApp::keyPressed(int key) {
                 if (!ids.empty() && provider_.getCachedEmbedding(ids[0])) {
                     viewManager_->relatedView()->setCenter(ids[0], provider_);
                     viewManager_->switchTo(ViewMode::Related);
-                    if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-                    leftPaneWidth_ = 0;
-                    leftTween_.finish();
                     if (metadataPanel_) {
                         auto* entry = provider_.getPhoto(ids[0]);
                         metadataPanel_->setPhoto(entry);
@@ -1385,7 +1343,7 @@ void tcApp::keyPressed(int key) {
                         metadataPanel_->clearViewInfo();
                         metadataPanel_->clearThumbnail();
                     }
-                    updateLayout();
+                    applyModeLayout();
                 }
             }
         } else if (key == 'D' || key == 'd') {
@@ -1397,10 +1355,7 @@ void tcApp::keyPressed(int key) {
                         if (g->getPhotoId(i) == ids[0]) {
                             g->clearSelection();
                             viewManager_->showFullImage(i);
-                            if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-                            leftPaneWidth_ = 0;
-                            leftTween_.finish();
-                            updateLayout();
+                            applyModeLayout();
                             break;
                         }
                     }
@@ -1426,41 +1381,34 @@ void tcApp::keyPressed(int key) {
     if (key == 'G' || key == 'g') {
         if (viewMode() != ViewMode::Grid) {
             viewManager_->switchTo(ViewMode::Grid);
-            leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
-            leftTween_.finish();
             if (metadataPanel_) {
                 metadataPanel_->clearViewInfo();
                 metadataPanel_->clearThumbnail();
                 updateMetadataPanel();
             }
-            updateLayout();
+            applyModeLayout();
         }
     }
     if (key == 'O' || key == 'o') {
         if (viewMode() == ViewMode::People) {
             viewManager_->switchTo(ViewMode::Grid);
-            leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
-            leftTween_.finish();
             if (metadataPanel_) {
                 metadataPanel_->clearViewInfo();
                 metadataPanel_->clearThumbnail();
                 updateMetadataPanel();
             }
-            updateLayout();
+            applyModeLayout();
         } else if (viewMode() == ViewMode::Grid) {
             if (!peopleView->hasState()) {
                 peopleView->populate(provider_);
             }
             viewManager_->switchTo(ViewMode::People);
-            if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-            leftPaneWidth_ = 0;
-            leftTween_.finish();
             if (metadataPanel_) {
                 metadataPanel_->setPhoto(nullptr);
                 metadataPanel_->clearViewInfo();
                 metadataPanel_->clearThumbnail();
             }
-            updateLayout();
+            applyModeLayout();
         }
     }
     if (key == 'M' || key == 'm') {
@@ -1507,14 +1455,11 @@ void tcApp::keyPressed(int key) {
                 mapView->fitBounds();
             }
 
-            if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-            leftPaneWidth_ = 0;
-            leftTween_.finish();
             if (metadataPanel_) {
                 metadataPanel_->clearViewInfo();
                 metadataPanel_->clearThumbnail();
             }
-            updateLayout();
+            applyModeLayout();
         }
     }
     if ((key == 'F' || key == 'f') && cmdDown_) {
@@ -1696,14 +1641,11 @@ void tcApp::filesDropped(const vector<string>& files) {
             mapView->setPhotos(photos, ids, provider_);
             viewManager_->switchTo(ViewMode::Map);
 
-            if (searchBar_ && searchBar_->isActive()) searchBar_->deactivate();
-            leftPaneWidth_ = 0;
-            leftTween_.finish();
             if (metadataPanel_) {
                 metadataPanel_->clearViewInfo();
                 metadataPanel_->clearThumbnail();
             }
-            updateLayout();
+            applyModeLayout();
         }
         mapView->fitGpxBounds();
 
@@ -1826,9 +1768,7 @@ void tcApp::relinkMissingPhotos() {
 
         provider_.relinkPhoto(photoId, result.filePath);
         viewManager_->showFullImage(singleView->selectedIndex());
-        leftPaneWidth_ = 0;
-        leftTween_.finish();
-        updateLayout();
+        applyModeLayout();
     } else {
         provider_.validateLibrary();
 
@@ -1906,10 +1846,12 @@ void tcApp::updateLayout() {
     float contentY = searchH;
     float contentH = h - searchH;
 
-    // Animated pane widths (slide in/out)
+    // Pane widths derived from mode + animated user-toggle values:
+    // left pane only exists in Grid, Crop hides the right pane entirely.
+    bool inSingle = viewMode() == ViewMode::Single;
     bool leftInGrid = inGrid && (folderTree_ || collectionTree_);
-    float leftW = leftInGrid ? leftPaneWidth_ : 0;
-    float rightW = rightPaneWidth_;
+    float leftW = leftInGrid ? effectiveLeftPaneWidth() : 0;
+    float rightW = effectiveRightPaneWidth();
 
     // Center content
     float contentX = leftW;
@@ -1945,18 +1887,18 @@ void tcApp::updateLayout() {
         viewManager_->layoutViews();
     }
 
-    // MetadataPanel (hidden when develop panel is shown)
+    // Right-pane panels, derived: develop panel only in Single with
+    // showDevelop_, metadata panel otherwise (exclusive pair). Crop has
+    // rightW == 0 so both deactivate.
+    bool devActive = rightW > 0 && inSingle && showDevelop_;
+    bool metaActive = rightW > 0 && !devActive;
     if (metadataPanel_) {
-        bool rightActive = rightPaneWidth_ > 0 && !showDevelop_;
-        metadataPanel_->setActive(rightActive);
-        if (rightActive) {
+        metadataPanel_->setActive(metaActive);
+        if (metaActive) {
             metadataPanel_->setRect(w - rightW, contentY, metadataWidth_, contentH);
         }
     }
-
-    // DevelopPanel (exclusive with metadata panel)
     if (developPanel_) {
-        bool devActive = rightPaneWidth_ > 0 && showDevelop_;
         developPanel_->setActive(devActive);
         if (devActive) {
             developPanel_->setRect(w - rightW, contentY, metadataWidth_, contentH);
@@ -1983,6 +1925,22 @@ void tcApp::updateLayout() {
         if (toggleX > w - 12) toggleX = w - 12;
         rightToggle_->setRect(toggleX, contentY + contentH / 2 - 15, 12, 30);
     }
+}
+
+// Run after every mode transition. Pane widths are never forced by
+// transitions — updateLayout() derives effective widths from the mode —
+// so this only needs to settle animations and mode-dependent chrome.
+void tcApp::applyModeLayout() {
+    // Mode changes are instant: snap any in-flight pane animation to its
+    // target (the complete listener applies the final width).
+    if (leftTween_.isPlaying()) leftTween_.finish();
+    if (rightTween_.isPlaying()) rightTween_.finish();
+
+    if (viewMode() != ViewMode::Grid && searchBar_ && searchBar_->isActive()) {
+        searchBar_->deactivate();
+    }
+    updateLayout();
+    redraw();
 }
 
 void tcApp::rebuildFolderTree() {

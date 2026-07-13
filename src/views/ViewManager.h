@@ -30,7 +30,6 @@ public:
         , peopleView_(make_shared<PeopleView>())
         , cropView_(make_shared<CropView>())
     {
-        cropView_->setSingleView(singleView_);
     }
 
     ViewMode activeView() const { return active_; }
@@ -38,17 +37,31 @@ public:
 
     void setContext(ViewContext ctx) { ctx_ = ctx; }
 
-    // Core transition: switch to target view mode
+    // Deactivation policy: which source views keep their state when leaving.
+    // - People always suspends (face clusters are expensive to rebuild)
+    // - Single suspends only when entering Crop (crop borrows its develop FBO)
+    // - Everything else fully ends
+    static bool shouldSuspend(ViewMode from, ViewMode to) {
+        if (from == ViewMode::People) return true;
+        if (from == ViewMode::Single && to == ViewMode::Crop) return true;
+        return false;
+    }
+
+    // Core transition: the ONLY mode-change mechanism.
     void switchTo(ViewMode target) {
         if (target == active_) return;
-        previous_ = active_;
+
+        // Crop is an overlay on Single: transitions into/out of it must not
+        // rewrite history, so ESC from Single still returns to where the
+        // user actually came from (e.g. People) after a crop round-trip.
+        if (target != ViewMode::Crop && active_ != ViewMode::Crop) {
+            previous_ = active_;
+        }
 
         // Deactivate current view
         auto* prev = containerFor(active_);
         if (prev) {
-            // People/Single use suspend (preserves state), others use endView
-            if (active_ == ViewMode::People) prev->suspendView();
-            else if (active_ == ViewMode::Single && target == ViewMode::Crop) prev->suspendView();
+            if (shouldSuspend(active_, target)) prev->suspendView();
             else prev->endView();
             static_cast<RectNode*>(prev)->setActive(false);
         }
@@ -78,11 +91,18 @@ public:
         }
     }
 
-    // Shortcut: open single image view
+    // Open single image view: prepare SingleView, then delegate the actual
+    // mode change to switchTo() so there is exactly one transition path.
     void showFullImage(int index) {
         if (!singleView_) return;
 
-        // Prepare context
+        if (active_ == ViewMode::Single) {
+            // Already in Single: just switch photo
+            singleView_->show(index);
+            if (ctx_.redraw) ctx_.redraw(1);
+            return;
+        }
+
         singleView_->beginView(ctx_);
         singleView_->show(index);
 
@@ -91,20 +111,9 @@ public:
             return;
         }
 
-        // Deactivate current view
-        auto* prev = containerFor(active_);
-        if (prev) {
-            if (active_ == ViewMode::People) prev->suspendView();
-            else prev->endView();
-            static_cast<RectNode*>(prev)->setActive(false);
-        }
-
-        previous_ = active_;
-        active_ = ViewMode::Single;
-        singleView_->setActive(true);
-        singleView_->setRect(0, 0, getWidth(), getHeight());
-
-        if (ctx_.redraw) ctx_.redraw(1);
+        // selectedIndex >= 0 makes hasState() true, so switchTo will not
+        // call beginView again — it just deactivates prev and activates us.
+        switchTo(ViewMode::Single);
     }
 
     // View accessors
