@@ -258,9 +258,11 @@ JsonStorage.h で `using namespace std;` を使うと `tc::map`（TrussCのマ�
 初期の tcxHttp ラッパーは `CATCHALL_ROUTE` で全ルートを動的に処理していたが、POST body が空になるバグがあった。
 → tcxHttp を tcxCrow にリネームし、Crow の `CROW_ROUTE` マクロを直接使う薄いヘルパーレイヤーに変更。
 
-### MCP テスト方法
-macOS の bash は 3.x で `coproc` 未対応。zsh の coproc で試したが、MCP初期化ハンドシェイク（`initialize` メソッド）が必要な可能性があり、単純な tool call だけでは動かなかった。
-→ **MCP テストは GUI から直接操作するか、初期化シーケンスを含むスクリプトを用意する必要がある**（要調査）
+### MCP テスト方法（2026-07 解決済み）
+TrussC の MCP トランスポートは **HTTP**（stdio ではない）。`TRUSSC_MCP=1` + `TRUSSC_MCP_PORT=<port>` で起動し、`POST /mcp` に JSON-RPC 2.0 を送る（`initialize` → `tools/call`）。
+- マウス/キー注入ツールはオプトイン: `TRUSSC_MCP=1` 時に `mcp::registerDebuggerTools()` を呼ぶ（tcApp.cpp で登録済み）
+- Python ドライバの実例: クロップ再入の自動UIテストで実績あり（grid選択→シングル→R→クロップ→Enter→再入→DB書き込み検証まで自動化できた）
+- マウスドラッグ注入ツールはまだ無い。ドラッグ必須の操作はDB状態の検証で代替する
 
 ### PhotoEntry へのフィールド追加
 PhotoEntry にフィールドを追加した場合:
@@ -417,12 +419,11 @@ Profile: ON 100%
 
 ## テスト用データ
 
+`testPictures/`（SONY ARW 14枚）は削除済みで**もう存在しない**（2026-07 確認）。
+現存するテスト用 RAW:
 ```
-/Users/toru/Nextcloud/Make/TrussC/testPictures/
-├── 7C201750.ARW  (41MB)
-├── 7C201751.ARW  (41MB)
-├── ...
-└── 7C201765.ARW  (38MB)   # 14枚のSONY ILCE-7CM2 ARW
+/Users/toru/Nextcloud/Projects/2026/2026-02-12_TrussPhoto/calibration_Sigma_BF/
+└── (Sigma BF DNG — calibrait/, gradient/, gradient2/)
 ```
 
 ## 今後の予定
