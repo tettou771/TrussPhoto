@@ -55,8 +55,14 @@ struct PhotoEntry {
 
     // Develop settings (LR import)
     string developSettings;  // LR develop settings text blob
+    int64_t developUpdatedAt = 0; // develop snapshot updatedAt (ms epoch, single field for sync LWW)
     bool isManaged = true;   // true=originals/ managed, false=external reference
     bool faceScanned = false; // true=insightface detection has been run
+
+    // --- Sync / replication (Phase A) ---
+    int64_t deletedAt = 0;   // tombstone (ms epoch, 0 = alive)
+    int64_t serverSeq = 0;   // server-assigned change sequence (monotonic)
+    string checksum;         // xxhash64 of original file (hex, filled in Phase C)
 
     // GPS (0 = not available, use hasGps() to check)
     double latitude = 0;     // decimal degrees, positive=N
@@ -432,6 +438,10 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"longitude", e.longitude},
         {"altitude", e.altitude},
         {"developSettings", e.developSettings},
+        {"developUpdatedAt", e.developUpdatedAt},
+        {"deletedAt", e.deletedAt},
+        {"serverSeq", e.serverSeq},
+        {"checksum", e.checksum},
         {"isManaged", e.isManaged},
         {"chromaDenoise", e.chromaDenoise},
         {"lumaDenoise", e.lumaDenoise},
@@ -511,6 +521,10 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.altitude = j.value("altitude", 0.0);
 
     e.developSettings = j.value("developSettings", string(""));
+    e.developUpdatedAt = j.value("developUpdatedAt", (int64_t)0);
+    e.deletedAt = j.value("deletedAt", (int64_t)0);
+    e.serverSeq = j.value("serverSeq", (int64_t)0);
+    e.checksum = j.value("checksum", string(""));
     e.isManaged = j.value("isManaged", true);
     e.chromaDenoise = j.value("chromaDenoise", 0.5f);
     e.lumaDenoise = j.value("lumaDenoise", 0.0f);
@@ -558,4 +572,93 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     if (e.syncState == SyncState::Syncing) {
         e.syncState = SyncState::LocalOnly;
     }
+}
+
+// =============================================================================
+// Sync protocol (Phase A) - the wire format for the change feed / push endpoint
+// =============================================================================
+// Only the subset of fields involved in field-level LWW replication is sent.
+// Develop is treated as ONE field (developSettings text blob + developUpdatedAt).
+
+inline nlohmann::json syncRowJson(const PhotoEntry& e) {
+    return nlohmann::json{
+        {"id", e.id},
+        {"filename", e.filename},
+        {"fileSize", e.fileSize},
+        {"rating", e.rating},
+        {"ratingUpdatedAt", e.ratingUpdatedAt},
+        {"colorLabel", e.colorLabel},
+        {"colorLabelUpdatedAt", e.colorLabelUpdatedAt},
+        {"flag", e.flag},
+        {"flagUpdatedAt", e.flagUpdatedAt},
+        {"memo", e.memo},
+        {"memoUpdatedAt", e.memoUpdatedAt},
+        {"tags", e.tags},
+        {"tagsUpdatedAt", e.tagsUpdatedAt},
+        {"developSettings", e.developSettings},
+        {"developUpdatedAt", e.developUpdatedAt},
+        {"deletedAt", e.deletedAt},
+        {"serverSeq", e.serverSeq}
+    };
+}
+
+// Field-level last-write-wins merge of a remote sync row into a local entry.
+// Compares each field's updatedAt; newer wins. develop is a single field.
+// Does NOT touch serverSeq or deletedAt (the caller handles those explicitly).
+// Returns true if any field changed.
+inline bool mergeSyncFieldsLWW(PhotoEntry& e, const nlohmann::json& c) {
+    bool changed = false;
+    auto ts = [&](const char* k) { return c.value(k, (int64_t)0); };
+
+    if (ts("ratingUpdatedAt") > e.ratingUpdatedAt) {
+        e.rating = c.value("rating", e.rating);
+        e.ratingUpdatedAt = ts("ratingUpdatedAt");
+        changed = true;
+    }
+    if (ts("colorLabelUpdatedAt") > e.colorLabelUpdatedAt) {
+        e.colorLabel = c.value("colorLabel", e.colorLabel);
+        e.colorLabelUpdatedAt = ts("colorLabelUpdatedAt");
+        changed = true;
+    }
+    if (ts("flagUpdatedAt") > e.flagUpdatedAt) {
+        e.flag = c.value("flag", e.flag);
+        e.flagUpdatedAt = ts("flagUpdatedAt");
+        changed = true;
+    }
+    if (ts("memoUpdatedAt") > e.memoUpdatedAt) {
+        e.memo = c.value("memo", e.memo);
+        e.memoUpdatedAt = ts("memoUpdatedAt");
+        changed = true;
+    }
+    if (ts("tagsUpdatedAt") > e.tagsUpdatedAt) {
+        e.tags = c.value("tags", e.tags);
+        e.tagsUpdatedAt = ts("tagsUpdatedAt");
+        changed = true;
+    }
+    if (ts("developUpdatedAt") > e.developUpdatedAt) {
+        e.developSettings = c.value("developSettings", e.developSettings);
+        e.developUpdatedAt = ts("developUpdatedAt");
+        changed = true;
+    }
+    return changed;
+}
+
+// Force-apply all sync fields (used when a brand-new entry arrives from a peer).
+inline void applySyncFieldsForce(PhotoEntry& e, const nlohmann::json& c) {
+    e.filename = c.value("filename", e.filename);
+    e.fileSize = c.value("fileSize", e.fileSize);
+    e.rating = c.value("rating", 0);
+    e.ratingUpdatedAt = c.value("ratingUpdatedAt", (int64_t)0);
+    e.colorLabel = c.value("colorLabel", string(""));
+    e.colorLabelUpdatedAt = c.value("colorLabelUpdatedAt", (int64_t)0);
+    e.flag = c.value("flag", 0);
+    e.flagUpdatedAt = c.value("flagUpdatedAt", (int64_t)0);
+    e.memo = c.value("memo", string(""));
+    e.memoUpdatedAt = c.value("memoUpdatedAt", (int64_t)0);
+    e.tags = c.value("tags", string(""));
+    e.tagsUpdatedAt = c.value("tagsUpdatedAt", (int64_t)0);
+    e.developSettings = c.value("developSettings", string(""));
+    e.developUpdatedAt = c.value("developUpdatedAt", (int64_t)0);
+    e.deletedAt = c.value("deletedAt", (int64_t)0);
+    e.serverSeq = c.value("serverSeq", (int64_t)0);
 }

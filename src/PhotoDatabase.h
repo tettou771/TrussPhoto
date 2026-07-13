@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 20;
+    static constexpr int SCHEMA_VERSION = 21;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -109,7 +109,11 @@ public:
                 "  dev_saturation      REAL NOT NULL DEFAULT 0.0,"
                 "  as_shot_temp        REAL NOT NULL DEFAULT 0.0,"
                 "  as_shot_tint        REAL NOT NULL DEFAULT 0.0,"
-                "  cam_color_matrix   TEXT NOT NULL DEFAULT ''"
+                "  cam_color_matrix   TEXT NOT NULL DEFAULT '',"
+                "  deleted_at          INTEGER NOT NULL DEFAULT 0,"
+                "  server_seq          INTEGER NOT NULL DEFAULT 0,"
+                "  checksum            TEXT NOT NULL DEFAULT '',"
+                "  develop_updated_at  INTEGER NOT NULL DEFAULT 0"
                 ")"
             );
             if (!ok) return false;
@@ -117,6 +121,10 @@ public:
             ok = db_.exec("CREATE INDEX IF NOT EXISTS idx_photos_sync_state ON photos(sync_state)");
             if (!ok) return false;
 
+            ok = db_.exec("CREATE INDEX IF NOT EXISTS idx_photos_server_seq ON photos(server_seq)");
+            if (!ok) return false;
+
+            if (!createSyncStateTable()) return false;
             if (!createEmbeddingsTable()) return false;
             if (!createFaceTables()) return false;
             if (!createCollectionTables()) return false;
@@ -438,8 +446,37 @@ public:
                 logError() << "[PhotoDatabase] Migration v19->v20 failed";
                 return false;
             }
-            db_.setSchemaVersion(SCHEMA_VERSION);
+            version = 20;
+            db_.setSchemaVersion(version);
             logNotice() << "[PhotoDatabase] Migrated v19 -> v20 (cam_color_matrix)";
+        }
+
+        // v20 -> v21: sync/replication columns (tombstone, server_seq, checksum,
+        // develop_updated_at) + client-side sync_state table
+        if (version == 20) {
+            const char* alters[] = {
+                "ALTER TABLE photos ADD COLUMN deleted_at INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN server_seq INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE photos ADD COLUMN checksum TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE photos ADD COLUMN develop_updated_at INTEGER NOT NULL DEFAULT 0",
+            };
+            for (const auto& sql : alters) {
+                if (!db_.exec(sql)) {
+                    logError() << "[PhotoDatabase] Migration v20->v21 failed: " << sql;
+                    return false;
+                }
+            }
+            if (!db_.exec("CREATE INDEX IF NOT EXISTS idx_photos_server_seq ON photos(server_seq)")) {
+                logError() << "[PhotoDatabase] Migration v20->v21 failed (index)";
+                return false;
+            }
+            if (!createSyncStateTable()) {
+                logError() << "[PhotoDatabase] Migration v20->v21 failed (sync_state)";
+                return false;
+            }
+            version = 21;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v20 -> v21 (sync/replication)";
         }
 
         return true;
@@ -457,6 +494,79 @@ public:
 
     bool updatePhoto(const PhotoEntry& e) {
         return insertPhoto(e); // INSERT OR REPLACE
+    }
+
+    // --- Sync / replication (Phase A) ---
+
+    // Persist a full entry while atomically assigning a fresh monotonic server_seq.
+    // Used server-side when a row actually changes (push merge / mutation endpoints).
+    // The MAX(server_seq)+1 read and the write share the write lock so concurrent
+    // Crow worker threads cannot collide on the same sequence number.
+    bool updatePhotoWithNewSeq(PhotoEntry& e) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        int64_t seq = 1;
+        {
+            auto q = db_.prepare("SELECT COALESCE(MAX(server_seq),0)+1 FROM photos");
+            if (q.valid() && q.step()) seq = q.getInt64(0);
+        }
+        e.serverSeq = seq;
+        auto stmt = db_.prepare(insertSql());
+        if (!stmt.valid()) return false;
+        bindEntry(stmt, e);
+        return stmt.execute();
+    }
+
+    // Load changed rows for the change feed: server_seq > since, ascending, capped.
+    vector<PhotoEntry> loadChangedSince(int64_t since, int limit) {
+        vector<PhotoEntry> result;
+        auto stmt = db_.prepare(string(selectColumns()) +
+            " FROM photos WHERE server_seq > ?1 ORDER BY server_seq ASC LIMIT ?2");
+        if (!stmt.valid()) return result;
+        stmt.bind(1, since);
+        stmt.bind(2, limit);
+        while (stmt.step()) {
+            result.push_back(extractPhotoRow(stmt));
+        }
+        return result;
+    }
+
+    // Stamp the develop snapshot timestamp (all develop columns share one updatedAt).
+    bool updateDevelopUpdatedAt(const string& id, int64_t updatedAt) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET develop_updated_at=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, updatedAt);
+        stmt.bind(2, id);
+        return stmt.execute();
+    }
+
+    // Mark a photo as a tombstone (delete propagated via the change feed).
+    bool updateDeletedAt(const string& id, int64_t deletedAt) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare("UPDATE photos SET deleted_at=?1 WHERE id=?2");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, deletedAt);
+        stmt.bind(2, id);
+        return stmt.execute();
+    }
+
+    // sync_state key/value store (client cursor + last push timestamp)
+    string getSyncState(const string& key, const string& def = "") {
+        auto stmt = db_.prepare("SELECT value FROM sync_state WHERE key=?1");
+        if (!stmt.valid()) return def;
+        stmt.bind(1, key);
+        if (stmt.step()) return stmt.getText(0);
+        return def;
+    }
+
+    bool setSyncState(const string& key, const string& value) {
+        lock_guard<mutex> lock(db_.writeMutex());
+        auto stmt = db_.prepare(
+            "INSERT OR REPLACE INTO sync_state (key, value) VALUES (?1, ?2)");
+        if (!stmt.valid()) return false;
+        stmt.bind(1, key);
+        stmt.bind(2, value);
+        return stmt.execute();
     }
 
     bool updateSyncState(const string& id, SyncState state) {
@@ -791,7 +901,18 @@ public:
 
     vector<PhotoEntry> loadAll() {
         vector<PhotoEntry> result;
-        auto stmt = db_.prepare(
+        auto stmt = db_.prepare(string(selectColumns()) + " FROM photos");
+        if (!stmt.valid()) return result;
+
+        while (stmt.step()) {
+            result.push_back(extractPhotoRow(stmt));
+        }
+        return result;
+    }
+
+    // Shared SELECT column list (order must match extractPhotoRow's indices).
+    static const char* selectColumns() {
+        return
             "SELECT id, filename, file_size, date_time_original, local_path, "
             "local_thumbnail_path, smart_preview_path, "
             "camera_make, camera, lens, lens_make, "
@@ -810,12 +931,11 @@ public:
             "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
             "user_angle, user_rotation90, "
             "user_persp_v, user_persp_h, user_shear, "
-            "cam_color_matrix "
-            "FROM photos"
-        );
-        if (!stmt.valid()) return result;
+            "cam_color_matrix, "
+            "deleted_at, server_seq, checksum, develop_updated_at";
+    }
 
-        while (stmt.step()) {
+    static PhotoEntry extractPhotoRow(Database::Statement& stmt) {
             PhotoEntry e;
             e.id                 = stmt.getText(0);
             e.filename           = stmt.getText(1);
@@ -891,15 +1011,17 @@ public:
             e.userPerspH         = (float)stmt.getDouble(71);
             e.userShear          = (float)stmt.getDouble(72);
             e.camColorMatrix     = stmt.getText(73);
+            e.deletedAt          = stmt.getInt64(74);
+            e.serverSeq          = stmt.getInt64(75);
+            e.checksum           = stmt.getText(76);
+            e.developUpdatedAt   = stmt.getInt64(77);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
                 e.syncState = SyncState::LocalOnly;
             }
 
-            result.push_back(std::move(e));
-        }
-        return result;
+            return e;
     }
 
     // --- Embeddings ---
@@ -1550,6 +1672,14 @@ public:
 private:
     Database db_;
 
+    bool createSyncStateTable() {
+        return db_.exec(
+            "CREATE TABLE IF NOT EXISTS sync_state ("
+            "  key   TEXT PRIMARY KEY,"
+            "  value TEXT"
+            ")");
+    }
+
     bool createEmbeddingsTable() {
         return db_.exec(
             "CREATE TABLE IF NOT EXISTS embeddings ("
@@ -1645,11 +1775,13 @@ private:
             "as_shot_temp, as_shot_tint, "
             "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
             "user_angle, user_rotation90, "
-            "user_persp_v, user_persp_h, user_shear, cam_color_matrix) "
+            "user_persp_v, user_persp_h, user_shear, cam_color_matrix, "
+            "deleted_at, server_seq, checksum, develop_updated_at) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
             "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,"
-            "?56,?57,?58,?59,?60,?61,?62,?63,?64,?65,?66,?67,?68,?69,?70,?71,?72,?73,?74)";
+            "?56,?57,?58,?59,?60,?61,?62,?63,?64,?65,?66,?67,?68,?69,?70,?71,?72,?73,?74,"
+            "?75,?76,?77,?78)";
     }
 
     static void bindEntry(Database::Statement& stmt, const PhotoEntry& e) {
@@ -1727,5 +1859,9 @@ private:
         stmt.bind(72, (double)e.userPerspH);
         stmt.bind(73, (double)e.userShear);
         stmt.bind(74, e.camColorMatrix);
+        stmt.bind(75, e.deletedAt);
+        stmt.bind(76, e.serverSeq);
+        stmt.bind(77, e.checksum);
+        stmt.bind(78, e.developUpdatedAt);
     }
 };

@@ -55,6 +55,10 @@ void tcApp::setup() {
     provider_.setServerUrl(catalogSettings_.serverUrl);
     provider_.setApiKey(catalogSettings_.apiKey);
 
+    // Configure the replication engine (empty serverUrl = local-only, no-op)
+    syncEngine_.setup(&provider_);
+    syncEngine_.configure(catalogSettings_.serverUrl, catalogSettings_.apiKey);
+
     // 6. Load library (instant display from previous session)
     bool hasLibrary = provider_.loadLibrary();
     provider_.loadCollections();
@@ -854,7 +858,7 @@ void tcApp::update() {
 
         if (syncThread_.joinable()) syncThread_.join();
         syncThread_ = thread([this]() {
-            provider_.syncWithServer();
+            syncEngine_.sync();
             syncInProgress_ = false;
             syncCompleted_ = true;
         });
@@ -863,6 +867,8 @@ void tcApp::update() {
     // Process sync completion on main thread
     if (syncCompleted_) {
         syncCompleted_ = false;
+        // Apply pulled changes (field-level LWW + tombstones) on the main thread.
+        syncEngine_.processResults();
         enqueueLocalOnlyPhotos();
 
         // Update status bar after sync

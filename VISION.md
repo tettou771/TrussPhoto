@@ -1,5 +1,9 @@
 # TrussPhoto Vision
 
+> **Note (2026-07):** サーバ/クライアント同期の設計は [ARCHITECTURE_SYNC.md](ARCHITECTURE_SYNC.md) が正。
+> 本書の「アプリケーションアーキテクチャ」「マルチクライアント同期」節の細部はそちらで更新されている
+> （--remote モードは廃案、PhotoApi 抽象レイヤーは不採用、WASM クライアントはスコープ外）。
+
 ## コンセプト
 
 TrussPhotoは「写真と向き合う方法を多様化する」アプリ。

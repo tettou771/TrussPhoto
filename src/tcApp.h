@@ -24,6 +24,7 @@
 #include "UploadQueue.h"
 #include "ServerConfig.h"
 #include "PhotoServer.h"
+#include "sync/SyncEngine.h"
 #include "pipeline/LrcatImporter.h"
 #include "pipeline/ExportQueue.h"
 using namespace std;
@@ -78,6 +79,7 @@ private:
 
     // Server / sync
     UploadQueue uploadQueue_;
+    SyncEngine syncEngine_;
     bool needsServerSync_ = false;
     atomic<bool> syncInProgress_{false};
     atomic<bool> syncCompleted_{false};

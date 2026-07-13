@@ -445,57 +445,177 @@ public:
         startCopyThread();
     }
 
-    // --- Server sync ---
+    // --- Server sync (Phase A: driven by SyncEngine) ---
+    //
+    // The change-feed / field-level-LWW / tombstone protocol lives in
+    // src/sync/SyncEngine.h. PhotoProvider exposes narrow seams below:
+    //  - db()                    : sync_state cursor + change-feed queries
+    //  - collectDirtyForPush()   : gather locally-dirty rows (read-only, bg thread)
+    //  - applyPulledChanges()    : merge server changes into map+DB (MAIN thread)
+    //  - applyServerPush()       : server-side merge of a client push (server mode)
+    //  - buildChanges()          : server-side change feed (server mode)
 
-    void syncWithServer() {
-        if (!isServerReachable()) return;
+    PhotoDatabase& db() { return db_; }
 
-        auto res = client_.get("/api/photos");
-        if (!res.ok()) return;
+    // Gather rows whose any field/tombstone advanced past `sincePushAt` (read-only).
+    // Safe to call from the sync background thread (does not mutate the map).
+    vector<nlohmann::json> collectDirtyForPush(int64_t sincePushAt) {
+        vector<nlohmann::json> rows;
+        for (const auto& [id, photo] : photos_) {
+            int64_t maxTs = max({photo.ratingUpdatedAt, photo.colorLabelUpdatedAt,
+                                 photo.flagUpdatedAt, photo.memoUpdatedAt,
+                                 photo.tagsUpdatedAt, photo.developUpdatedAt,
+                                 photo.deletedAt});
+            if (maxTs > sincePushAt) {
+                rows.push_back(syncRowJson(photo));
+            }
+        }
+        return rows;
+    }
 
-        // Collect server-side IDs
-        unordered_set<string> serverIds;
-        auto data = res.json();
-        vector<PhotoEntry> newServerPhotos;
+    // MAIN-THREAD apply of pulled changes: field-level LWW + tombstones + presence.
+    // `serverIds` = ids the server holds an original for (from GET /api/photos);
+    // used only for LocalOnly<->Synced<->ServerOnly badge reconciliation.
+    // Tombstoned entries (deleted_at>0) are never resurrected by presence logic.
+    // Returns the number of entries changed (0 = nothing to redraw).
+    int applyPulledChanges(const vector<nlohmann::json>& changes,
+                           const unordered_set<string>& serverIds,
+                           bool haveServerIds,
+                           int64_t cursor) {
+        int changed = 0;
 
-        for (const auto& p : data["photos"]) {
-            string id = p.value("id", string(""));
+        for (const auto& c : changes) {
+            string id = c.value("id", string(""));
             if (id.empty()) continue;
-            serverIds.insert(id);
 
-            if (photos_.count(id)) {
-                auto& state = photos_[id].syncState;
-                if (state == SyncState::LocalOnly) {
-                    state = SyncState::Synced;
-                    db_.updateSyncState(id, state);
-                } else if (state == SyncState::Missing) {
-                    state = SyncState::ServerOnly;
-                    db_.updateSyncState(id, state);
+            auto it = photos_.find(id);
+            if (it == photos_.end()) {
+                // Brand-new entry from a peer (catalog row; may be a tombstone)
+                PhotoEntry e;
+                e.id = id;
+                applySyncFieldsForce(e, c);
+                e.syncState = (e.deletedAt > 0) ? SyncState::LocalOnly
+                                                : SyncState::ServerOnly;
+                photos_[id] = e;
+                db_.updatePhoto(e);
+                changed++;
+                continue;
+            }
+
+            PhotoEntry& e = it->second;
+            bool rowChanged = mergeSyncFieldsLWW(e, c);
+
+            // serverSeq is server-authored: adopt the highest seen
+            int64_t remoteSeq = c.value("serverSeq", (int64_t)0);
+            if (remoteSeq > e.serverSeq) { e.serverSeq = remoteSeq; rowChanged = true; }
+
+            // Tombstone: newer deletion wins
+            int64_t remoteDel = c.value("deletedAt", (int64_t)0);
+            if (remoteDel > e.deletedAt) {
+                e.deletedAt = remoteDel;
+                purgeLocalPayload(e); // remove thumb + SP caches (NOT the original)
+                if (!e.localPath.empty()) {
+                    logNotice() << "[Sync] Tombstone received; keeping original (Phase C policy): "
+                                << e.localPath;
                 }
-            } else {
-                PhotoEntry photo;
-                photo.id = id;
-                photo.filename = p.value("filename", string(""));
-                photo.fileSize = p.value("fileSize", (uintmax_t)0);
-                photo.width = p.value("width", 0);
-                photo.height = p.value("height", 0);
-                photo.syncState = SyncState::ServerOnly;
-                photos_[id] = photo;
-                newServerPhotos.push_back(photo);
+                rowChanged = true;
+            }
+
+            if (rowChanged) { db_.updatePhoto(e); changed++; }
+        }
+
+        // Presence reconciliation (badge states), skipping tombstones.
+        if (haveServerIds) {
+            for (auto& [id, photo] : photos_) {
+                if (photo.deletedAt > 0) continue; // never touch/resurrect tombstones
+                if (serverIds.count(id)) {
+                    if (photo.syncState == SyncState::LocalOnly) {
+                        photo.syncState = SyncState::Synced;
+                        db_.updateSyncState(id, photo.syncState);
+                        changed++;
+                    } else if (photo.syncState == SyncState::Missing) {
+                        photo.syncState = SyncState::ServerOnly;
+                        db_.updateSyncState(id, photo.syncState);
+                        changed++;
+                    }
+                } else {
+                    if (photo.syncState == SyncState::Synced) {
+                        photo.syncState = SyncState::LocalOnly;
+                        db_.updateSyncState(id, photo.syncState);
+                        changed++;
+                    }
+                }
             }
         }
 
-        if (!newServerPhotos.empty()) {
-            db_.insertPhotos(newServerPhotos);
-        }
+        db_.setSyncState("pull_cursor", to_string(cursor));
+        return changed;
+    }
 
-        // Revert Synced photos not found on server back to LocalOnly
-        for (auto& [id, photo] : photos_) {
-            if (photo.syncState == SyncState::Synced && !serverIds.count(id)) {
-                photo.syncState = SyncState::LocalOnly;
-                db_.updateSyncState(id, photo.syncState);
+    // SERVER-SIDE merge of a client push (server mode; runs on a Crow worker thread,
+    // mirroring the existing PATCH-metadata handler's direct mutation of the map).
+    // Field-level LWW; any row that actually changes gets a fresh monotonic server_seq.
+    void applyServerPush(const nlohmann::json& rows) {
+        if (!rows.is_array()) return;
+        for (const auto& c : rows) {
+            string id = c.value("id", string(""));
+            if (id.empty()) continue;
+
+            auto it = photos_.find(id);
+            if (it == photos_.end()) {
+                // Unknown id -> metadata-only catalog row (no original payload yet).
+                PhotoEntry e;
+                e.id = id;
+                applySyncFieldsForce(e, c);
+                e.syncState = SyncState::ServerOnly; // server has no original for it
+                db_.updatePhotoWithNewSeq(e);        // assigns fresh server_seq
+                photos_[id] = e;
+                continue;
             }
+
+            PhotoEntry& e = it->second;
+            bool rowChanged = mergeSyncFieldsLWW(e, c);
+            int64_t remoteDel = c.value("deletedAt", (int64_t)0);
+            if (remoteDel > e.deletedAt) { e.deletedAt = remoteDel; rowChanged = true; }
+            if (rowChanged) db_.updatePhotoWithNewSeq(e); // bumps server_seq + persists
         }
+    }
+
+    // SERVER-SIDE change feed: rows with server_seq > since, ascending, paged.
+    nlohmann::json buildChanges(int64_t since, int limit) {
+        auto rows = db_.loadChangedSince(since, limit);
+        nlohmann::json changes = nlohmann::json::array();
+        int64_t maxSeq = since;
+        for (const auto& e : rows) {
+            changes.push_back(syncRowJson(e));
+            if (e.serverSeq > maxSeq) maxSeq = e.serverSeq;
+        }
+        return nlohmann::json{
+            {"changes", changes},
+            {"maxSeq", maxSeq},
+            {"hasMore", (int)rows.size() >= limit}
+        };
+    }
+
+    // Assign a fresh server_seq to a single row after a server-side mutation
+    // (PATCH metadata / import / delete). Server mode only.
+    void bumpServerSeq(const string& id) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return;
+        db_.updatePhotoWithNewSeq(it->second);
+    }
+
+    // Remove cache-tier payloads (thumbnail + smart preview) for a tombstoned entry.
+    // The authoritative original is intentionally left in place in Phase A.
+    void purgeLocalPayload(PhotoEntry& photo) {
+        if (!photo.localThumbnailPath.empty() && fs::exists(photo.localThumbnailPath)) {
+            try { fs::remove(photo.localThumbnailPath); } catch (...) {}
+        }
+        if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) {
+            try { fs::remove(photo.localSmartPreviewPath); } catch (...) {}
+        }
+        photo.localThumbnailPath.clear();
+        photo.localSmartPreviewPath.clear();
     }
 
     // Restore a Missing photo to LocalOnly (when file becomes accessible again)
@@ -708,7 +828,16 @@ public:
         it->second.chromaDenoise = chroma;
         it->second.lumaDenoise = luma;
         db_.updateDenoise(id, chroma, luma);
+        touchDevelop(it->second);
         return true;
+    }
+
+    // Stamp the develop snapshot timestamp (the whole develop edit state is one
+    // sync field). Call from every user-driven develop edit path.
+    void touchDevelop(PhotoEntry& photo) {
+        auto ts = nowMs();
+        photo.developUpdatedAt = ts;
+        db_.updateDevelopUpdatedAt(photo.id, ts);
     }
 
     bool setDevelop(const string& id, float exposure, float temperature, float tint,
@@ -733,6 +862,7 @@ public:
         db_.updateDevelop(id, exposure, temperature, tint,
                           contrast, highlights, shadows, whites, blacks,
                           vibrance, saturation, chroma, luma);
+        touchDevelop(it->second);
         return true;
     }
 
@@ -744,6 +874,7 @@ public:
         it->second.userCropW = w;
         it->second.userCropH = h;
         db_.updateUserCrop(id, x, y, w, h);
+        touchDevelop(it->second);
         return true;
     }
 
@@ -753,6 +884,7 @@ public:
         it->second.userAngle = angle;
         it->second.userRotation90 = rot90;
         db_.updateUserRotation(id, angle, rot90);
+        touchDevelop(it->second);
         return true;
     }
 
@@ -763,6 +895,7 @@ public:
         it->second.userPerspH = perspH;
         it->second.userShear = shear;
         db_.updateUserPerspective(id, perspV, perspH, shear);
+        touchDevelop(it->second);
         return true;
     }
 
@@ -1072,10 +1205,15 @@ public:
                 try { fs::remove(photo.localSmartPreviewPath); } catch (...) {}
             }
 
-            // Delete embeddings, DB entry, and memory
+            // Tombstone instead of physical delete: keep the row (deleted_at>0) so the
+            // deletion propagates through the change feed and is never resurrected by
+            // presence reconciliation. Local payload/embeddings are still removed above.
             db_.deleteEmbeddings(id);
-            db_.deletePhoto(id);
-            photos_.erase(it);
+            auto ts = nowMs();
+            photo.deletedAt = ts;
+            photo.localThumbnailPath.clear();
+            photo.localSmartPreviewPath.clear();
+            db_.updateDeletedAt(id, ts);
             deleted++;
         }
         return deleted;
@@ -1211,6 +1349,8 @@ public:
         vector<string> ids;
         ids.reserve(photos_.size());
         for (const auto& [id, photo] : photos_) {
+            // Filter out tombstoned (deleted) entries
+            if (photo.deletedAt > 0) continue;
             // Filter out non-primary stacked entries
             if (!photo.stackId.empty() && !photo.stackPrimary) continue;
             ids.push_back(id);
@@ -1230,6 +1370,7 @@ public:
     vector<pair<string, string>> getLocalOnlyPhotos() const {
         vector<pair<string, string>> result;
         for (const auto& [id, photo] : photos_) {
+            if (photo.deletedAt > 0) continue;
             if (photo.syncState == SyncState::LocalOnly && !photo.localPath.empty()) {
                 result.push_back({id, photo.localPath});
             }
