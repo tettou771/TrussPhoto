@@ -91,7 +91,8 @@ private:
     Tween<float> rightTween_;
     float leftPaneWidth_ = 220;
     float rightPaneWidth_ = 260;
-    double lastTime_ = 0;
+    EventListener leftTweenDoneListener_;
+    EventListener rightTweenDoneListener_;
 
     // Background pipeline flags
     bool spQueued_ = false;

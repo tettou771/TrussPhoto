@@ -499,8 +499,17 @@ void tcApp::setup() {
         rightTween_.from(from).to(to).duration(0.2f).ease(EaseType::Cubic, EaseMode::Out).start();
     });
 
-    // Initialize tween state
-    lastTime_ = getElapsedTime();
+    // Apply final pane width when tweens complete (update loop only polls isPlaying)
+    leftTweenDoneListener_ = leftTween_.complete->listen([this]() {
+        leftPaneWidth_ = leftTween_.getValue();
+        updateLayout();
+        redraw();
+    });
+    rightTweenDoneListener_ = rightTween_.complete->listen([this]() {
+        rightPaneWidth_ = rightTween_.getValue();
+        updateLayout();
+        redraw();
+    });
     leftPaneWidth_ = showSidebar_ ? sidebarWidth_ : 0;
     rightPaneWidth_ = showMetadata_ ? metadataWidth_ : 0;
 
@@ -820,20 +829,14 @@ void tcApp::update() {
         return;
     }
 
-    // Animate pane tweens
+    // Animate pane tweens (Tween self-updates via events().update)
     {
-        double now = getElapsedTime();
-        float dt = (float)(now - lastTime_);
-        lastTime_ = now;
-
         bool animating = false;
         if (leftTween_.isPlaying()) {
-            leftTween_.update(dt);
             leftPaneWidth_ = leftTween_.getValue();
             animating = true;
         }
         if (rightTween_.isPlaying()) {
-            rightTween_.update(dt);
             rightPaneWidth_ = rightTween_.getValue();
             animating = true;
         }

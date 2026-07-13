@@ -179,11 +179,6 @@ public:
 
         // Phase 1: Fade-out departing nodes
         if (fadeOutPhase_) {
-            auto now = chrono::steady_clock::now();
-            float dt = chrono::duration<float>(now - lastAnimTime_).count();
-            lastAnimTime_ = now;
-            fadeOutProgress_.update(dt);
-
             float t = fadeOutProgress_.getValue();
             for (auto& fn : fadingOutNodes_) {
                 fn->fadeAlpha = 1.0f - t;
@@ -207,11 +202,6 @@ public:
 
         // Phase 2: Morphing animation
         if (animating_) {
-            auto now = chrono::steady_clock::now();
-            float dt = chrono::duration<float>(now - lastAnimTime_).count();
-            lastAnimTime_ = now;
-            animProgress_.update(dt);
-
             float t = animProgress_.getValue();
 
             // Interpolate positions + fade-in new items
@@ -550,7 +540,6 @@ private:
     Tween<float> animProgress_;
     unordered_map<string, AnimSnapshot> animOldSnapshots_;
     bool animating_ = false;
-    chrono::steady_clock::time_point lastAnimTime_;
 
     // History chain (oldest first)
     vector<string> history_;
@@ -584,7 +573,6 @@ private:
         // Start fade-out tween
         fadeOutProgress_.from(0).to(1).duration(FADE_DURATION)
             .ease(EaseType::Cubic, EaseMode::InOut).start();
-        lastAnimTime_ = chrono::steady_clock::now();
         fadeOutPhase_ = true;
     }
 
@@ -667,7 +655,6 @@ private:
             }
             animProgress_.from(0).to(1).duration(0.4f)
                 .ease(EaseType::Cubic, EaseMode::InOut).start();
-            lastAnimTime_ = chrono::steady_clock::now();
             animating_ = true;
         }
 
