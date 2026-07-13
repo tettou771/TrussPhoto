@@ -269,6 +269,10 @@ public:
                     isRawImage_ = true;
                     loaded = true;
 
+                    // Load DCP profile BEFORE starting RAW thread
+                    // (cleanupState resets currentProfileType_, so load it here)
+                    loadProfileForEntry(*entry);
+
                     // Step 2: Start full-size load in background
                     string path = entry->localPath;
 
@@ -294,7 +298,9 @@ public:
                         Pixels loadedPixels;
                         float camXyzOut[9] = {};
                         if (RawLoader::loadFloat(path, loadedPixels, true, camXyzOut)) {
-                            // Save cam_xyz matrix to DB if not already stored
+                            // Save cam_xyz matrix to DB if not already stored.
+                            // parseCamXyz also rejects degenerate (all-zero) matrices,
+                            // so we never persist a matrix that would black out the image.
                             if (camMatrix.empty()) {
                                 string matJson = "[";
                                 for (int i = 0; i < 9; i++) {
@@ -302,7 +308,10 @@ public:
                                     matJson += to_string(camXyzOut[i]);
                                 }
                                 matJson += "]";
-                                ctx_->provider->updateCamColorMatrix(spId, matJson);
+                                float check[9];
+                                if (DcpProfile::parseCamXyz(matJson, check)) {
+                                    ctx_->provider->updateCamColorMatrix(spId, matJson);
+                                }
                             }
 
                             // Generate SP from camera RGB BEFORE color conversion
@@ -626,7 +635,7 @@ public:
                 setColor(1.0f, 1.0f, 1.0f);
                 sgl_enable_texture();
                 sgl_texture(texView, texSampler);
-                Color col = getDefaultContext().getColor();
+                Color col = getColor();
                 sgl_begin_quads();
                 sgl_c4f(col.r, col.g, col.b, col.a);
                 sgl_v2f_t2f(x, y, u0, v0);
@@ -641,7 +650,7 @@ public:
                 setColor(1.0f, 1.0f, 1.0f);
                 sgl_enable_texture();
                 sgl_texture(texView, texSampler);
-                Color col = getDefaultContext().getColor();
+                Color col = getColor();
 
                 sgl_begin_triangles();
                 sgl_c4f(col.r, col.g, col.b, col.a);
@@ -1165,7 +1174,7 @@ private:
                          float u0 = 0, float v0 = 0, float u1 = 1, float v1 = 1) {
         sgl_enable_texture();
         sgl_texture(view, sampler);
-        Color col = getDefaultContext().getColor();
+        Color col = getColor();
         sgl_begin_quads();
         sgl_c4f(col.r, col.g, col.b, col.a);
         sgl_v2f_t2f(x, y, u0, v0);
@@ -1353,6 +1362,9 @@ private:
             asShotTemp_ = 5500.0f;  // fallback to daylight
         }
 
+        // DCP pipeline: camera WB is baked by LibRaw, ForwardMatrix handles color.
+        // GPU WB should be neutral unless user explicitly adjusts temperature/tint.
+        // Skip WB correction when temperature matches as-shot (no user adjustment).
         float targetK = temperature_;
         if (targetK < 2000.0f) targetK = 2000.0f;
         if (targetK > 12000.0f) targetK = 12000.0f;

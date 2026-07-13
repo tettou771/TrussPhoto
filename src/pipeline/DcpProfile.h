@@ -192,7 +192,12 @@ public:
                     i++;
                 }
             }
-            return idx == 9;
+            if (idx != 9) return false;
+            // Reject degenerate (all-zero) matrices: LibRaw leaves cam_xyz
+            // zeroed for some DNGs, and applying it would black out the image.
+            float absSum = 0;
+            for (int k = 0; k < 9; k++) absSum += fabsf(out[k]);
+            return absSum > 1e-6f;
         } catch (...) {
             return false;
         }
