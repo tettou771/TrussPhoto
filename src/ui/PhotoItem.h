@@ -378,6 +378,13 @@ public:
     int getStackSize() const { return stackBadge_->getCount(); }
     bool isStacked() const { return stackBadge_->getCount() > 1; }
 
+    // Linked-text bubble (photos with attached Obsidian memos)
+    void setMemoBubble(const string& text, int count) {
+        memoText_ = text;
+        memoCount_ = count;
+    }
+    bool hasMemo() const { return memoCount_ > 0; }
+
     void rebindAndLoad(int dataIndex, const string& label, SyncState syncState,
                        bool selected, bool isVideo, Font* font, int stackSize = 0) {
         // Cancel pending load for old data
@@ -391,6 +398,11 @@ public:
         setSelected(selected);
         setIsVideo(isVideo);
         setStackSize(stackSize);
+        // Reset memo-bubble state on recycle (grid sets it again via setMemoBubble)
+        memoText_.clear();
+        memoCount_ = 0;
+        showBubble_ = false;
+        hoverStart_ = -1;
         label_->bgColor = isVideo ? Color(0.08f, 0.14f, 0.18f) : Color(0.12f, 0.12f, 0.14f);
         thumbnail_->clearImage();
 
@@ -400,8 +412,21 @@ public:
     }
     
     void update() override {
-        if (pastMouseOver != isMouseOver()) {
-            pastMouseOver = isMouseOver();
+        bool over = isMouseOver();
+        if (pastMouseOver != over) {
+            pastMouseOver = over;
+            if (over) {
+                hoverStart_ = getElapsedTimef();
+            } else {
+                hoverStart_ = -1;
+                if (showBubble_) showBubble_ = false;
+            }
+            redraw();
+        }
+        // Reveal memo bubble after 0.5s of hover
+        if (over && hasMemo() && !showBubble_ && hoverStart_ >= 0 &&
+            getElapsedTimef() - hoverStart_ >= 0.5f) {
+            showBubble_ = true;
             redraw();
         }
     }
@@ -463,6 +488,41 @@ public:
             noFill();
             drawRect(0, 0, getWidth(), getHeight());
         }
+
+        // Memo bubble icon (top-left) for photos with linked Obsidian notes
+        if (hasMemo()) {
+            float ix = 5, iy = 5, iw = 15, ih = 11;
+            setColor(0.98f, 0.85f, 0.30f, 0.95f);  // warm yellow speech bubble
+            fill();
+            drawRect(ix, iy, iw, ih);
+            drawTriangle(ix + 3, iy + ih, ix + 3, iy + ih + 4, ix + 8, iy + ih);
+            if (memoCount_ > 1 && label_->font) {
+                setColor(0.15f, 0.12f, 0.0f);
+                label_->font->drawString(to_string(memoCount_),
+                    ix + iw * 0.5f, iy + ih * 0.5f,
+                    Direction::Center, Direction::Center);
+            }
+        }
+
+        // Hover bubble: rounded-ish cushion with the (truncated) memo text
+        if (showBubble_ && !memoText_.empty() && label_->font) {
+            auto lines = wrapText(truncateCp(memoText_, 200), 22);
+            const float pad = 6, lineH = 14, bw = 200;
+            float bh = pad * 2 + lineH * (float)lines.size();
+            float bx = getWidth() * 0.5f - bw * 0.5f;
+            float by = 22;
+            if (bx < 2) bx = 2;
+            setColor(0.08f, 0.08f, 0.10f, 0.94f);
+            fill();
+            drawRect(bx, by, bw, bh);
+            setColor(0.9f, 0.9f, 0.92f);
+            float ty = by + pad + lineH * 0.5f;
+            for (const auto& ln : lines) {
+                label_->font->drawString(ln, bx + pad, ty,
+                    Direction::Left, Direction::Center);
+                ty += lineH;
+            }
+        }
     }
 
     void setSelected(bool selected) { isSelected_ = selected; }
@@ -505,6 +565,36 @@ protected:
     }
 
 private:
+    // Truncate to maxCp Unicode codepoints (UTF-8 aware), append … if cut.
+    static string truncateCp(const string& s, int maxCp) {
+        int cp = 0; size_t i = 0;
+        while (i < s.size() && cp < maxCp) {
+            unsigned char c = (unsigned char)s[i];
+            int adv = (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+            i += adv; cp++;
+        }
+        if (i < s.size()) return s.substr(0, i) + "…";
+        return s;
+    }
+
+    // Wrap into lines of at most `cols` codepoints; honors existing newlines.
+    static vector<string> wrapText(const string& s, int cols) {
+        vector<string> lines;
+        string cur; int c = 0; size_t i = 0;
+        while (i < s.size()) {
+            unsigned char ch = (unsigned char)s[i];
+            int adv = (ch < 0x80) ? 1 : (ch < 0xE0) ? 2 : (ch < 0xF0) ? 3 : 4;
+            string g = s.substr(i, adv);
+            i += adv;
+            if (g == "\n") { lines.push_back(cur); cur.clear(); c = 0; continue; }
+            cur += g; c++;
+            if (c >= cols) { lines.push_back(cur); cur.clear(); c = 0; }
+        }
+        if (!cur.empty()) lines.push_back(cur);
+        if (lines.empty()) lines.push_back("");
+        return lines;
+    }
+
     int entryIndex_ = -1;
     ThumbnailNode::Ptr thumbnail_;
     LabelNode::Ptr label_;
@@ -514,6 +604,10 @@ private:
     bool isVideo_ = false;
     bool clipMatch_ = false;
     bool pastMouseOver = false;
+    string memoText_;
+    int memoCount_ = 0;
+    float hoverStart_ = -1;
+    bool showBubble_ = false;
     LoadState loadState_ = LoadState::Unloaded;
     SyncState syncState_ = SyncState::LocalOnly;
 };

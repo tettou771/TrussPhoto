@@ -34,6 +34,7 @@ struct PhotoEntry {
     int height = 0;
     bool isRaw = false;
     bool isVideo = false;
+    int entryType = 0;           // 0=media (photo/video), 1=text (Obsidian memo)
     string creativeStyle;
     float focalLength = 0;
     float aperture = 0;
@@ -70,6 +71,7 @@ struct PhotoEntry {
     double altitude = 0;     // meters above sea level
 
     bool hasGps() const { return latitude != 0 || longitude != 0; }
+    bool isText() const { return entryType == 1; }
 
     // Develop settings (per-photo)
     float chromaDenoise = 0.5f;  // 0-1, chroma noise reduction strength
@@ -419,6 +421,7 @@ inline void to_json(nlohmann::json& j, const PhotoEntry& e) {
         {"height", e.height},
         {"isRaw", e.isRaw},
         {"isVideo", e.isVideo},
+        {"entryType", e.entryType},
         {"creativeStyle", e.creativeStyle},
         {"focalLength", e.focalLength},
         {"aperture", e.aperture},
@@ -500,6 +503,7 @@ inline void from_json(const nlohmann::json& j, PhotoEntry& e) {
     e.height = j.value("height", 0);
     e.isRaw = j.value("isRaw", false);
     e.isVideo = j.value("isVideo", false);
+    e.entryType = j.value("entryType", 0);
     e.creativeStyle = j.value("creativeStyle", string(""));
     e.focalLength = j.value("focalLength", 0.0f);
     e.aperture = j.value("aperture", 0.0f);
@@ -598,7 +602,8 @@ inline nlohmann::json syncRowJson(const PhotoEntry& e) {
         {"developSettings", e.developSettings},
         {"developUpdatedAt", e.developUpdatedAt},
         {"deletedAt", e.deletedAt},
-        {"serverSeq", e.serverSeq}
+        {"serverSeq", e.serverSeq},
+        {"entryType", e.entryType}
     };
 }
 
@@ -661,4 +666,5 @@ inline void applySyncFieldsForce(PhotoEntry& e, const nlohmann::json& c) {
     e.developUpdatedAt = c.value("developUpdatedAt", (int64_t)0);
     e.deletedAt = c.value("deletedAt", (int64_t)0);
     e.serverSeq = c.value("serverSeq", (int64_t)0);
+    e.entryType = c.value("entryType", 0);   // creation-time constant (media/text)
 }

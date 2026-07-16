@@ -10,6 +10,7 @@
 //   --choose-catalog        : Force catalog selection dialog on launch
 //   --raw-dir PATH          : Override RAW storage path (formerly --library-dir)
 //   --import-lrcat PATH     : Import from Lightroom Classic catalog (.lrcat)
+//   --import-obsidian PATH  : Import text memos from an Obsidian vault folder
 //   --generate-thumbnails   : Generate missing thumbnails on startup (server mode)
 //   --generate-sp           : Generate missing smart previews on startup (server mode)
 //   --consolidate           : Consolidate library on startup (copy originals)
@@ -30,6 +31,7 @@ inline int serverPort = 18730;
 inline string catalogDir;
 inline string rawDir;
 inline string importLrcatPath;
+inline string importObsidianPath;
 inline bool generateThumbnails = false;
 inline bool generateSP = false;
 inline bool consolidate = false;
@@ -53,6 +55,8 @@ inline void parse(int argc, char* argv[]) {
             rawDir = argv[++i];
         } else if (arg == "--import-lrcat" && i + 1 < argc) {
             importLrcatPath = argv[++i];
+        } else if (arg == "--import-obsidian" && i + 1 < argc) {
+            importObsidianPath = argv[++i];
         } else if (arg == "--generate-thumbnails") {
             generateThumbnails = true;
         } else if (arg == "--generate-sp") {

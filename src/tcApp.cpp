@@ -1,4 +1,6 @@
 #include "tcApp.h"
+#include "pipeline/ObsidianImporter.h"
+#include <algorithm>
 
 void tcApp::setup() {
     // 0. Ensure OS bootstrap directory exists
@@ -93,6 +95,21 @@ void tcApp::setup() {
 
     // 6c. Backfill develop parameters from LR text blob (one-time)
     provider_.backfillDevelopSettings();
+
+    // 6d. Import Obsidian text memos (CLI --import-obsidian + configured vault folders)
+    if (!AppConfig::importObsidianPath.empty()) {
+        auto& v = catalogSettings_.memoImportPaths;
+        if (find(v.begin(), v.end(), AppConfig::importObsidianPath) == v.end()) {
+            v.push_back(AppConfig::importObsidianPath);
+            catalogSettings_.save();
+        }
+    }
+    if (!catalogSettings_.memoImportPaths.empty()) {
+        auto memoRes = ObsidianImporter::importPaths(provider_, catalogSettings_.memoImportPaths);
+        if (memoRes.added > 0 || memoRes.updated > 0) hasLibrary = true;
+    }
+    // Build photo<->text links from whatever text entries are now loaded
+    provider_.rebuildTextLinks();
 
     // 7. Save bootstrap (remember catalog path for next launch)
     bootstrap_.lastCatalogPath = catalogPath_;
@@ -785,6 +802,31 @@ void tcApp::setup() {
             };
         });
 
+    mcp::tool("import_obsidian", "Import Obsidian text memos from a vault folder (or configured folders)")
+        .arg<string>("path", "Vault folder to import (optional; added to catalog config)", false)
+        .bind([this](const json& args) {
+            if (args.contains("path") && !args["path"].get<string>().empty()) {
+                string p = args["path"].get<string>();
+                auto& v = catalogSettings_.memoImportPaths;
+                if (find(v.begin(), v.end(), p) == v.end()) {
+                    v.push_back(p);
+                    catalogSettings_.save();
+                }
+            }
+            auto res = ObsidianImporter::importPaths(provider_, catalogSettings_.memoImportPaths);
+            provider_.rebuildTextLinks();
+            provider_.embedMissingTextEntries();
+            if (grid()) grid()->populate(provider_);
+            redraw();
+            return json{
+                {"status", "ok"},
+                {"scanned", res.scanned},
+                {"added", res.added},
+                {"updated", res.updated},
+                {"count", (int)provider_.getCount()}
+            };
+        });
+
     // 9. CLIP embedder (async: downloads model in background if needed)
     provider_.initEmbedder(AppPaths::modelsDir());
 
@@ -957,6 +999,14 @@ void tcApp::update() {
         if (queued > 0) {
             logNotice() << "[CLIP] Queued " << queued << " photos for embedding";
         }
+    }
+
+    // Embed text entries once the SigLIP2 text encoder is ready (independent of
+    // the image embedder). Text embeddings join findSimilar / searchByText.
+    if (provider_.isTextEncoderReady() && !textEmbeddingsDone_) {
+        textEmbeddingsDone_ = true;
+        int n = provider_.embedMissingTextEntries();
+        if (n > 0) logNotice() << "[TextEmbed] " << n << " text entries embedded";
     }
 
     // Unload vision model after all embeddings are generated (free ~340MB)
@@ -1456,6 +1506,13 @@ void tcApp::keyPressed(int key) {
                 if (e) photos.push_back(*e);
                 else photos.push_back(PhotoEntry{});
             }
+            // Also drop pins for text (memo) entries that carry GPS
+            for (auto& [tid, te] : provider_.photos()) {
+                if (te.isText() && te.hasGps() && te.deletedAt == 0) {
+                    ids.push_back(tid);
+                    photos.push_back(te);
+                }
+            }
             mapView->setPhotos(photos, ids, provider_);
 
             // Determine which photo to center on
@@ -1659,6 +1716,13 @@ void tcApp::filesDropped(const vector<string>& files) {
                 auto* e = provider_.getPhoto(id);
                 if (e) photos.push_back(*e);
                 else photos.push_back(PhotoEntry{});
+            }
+            // Also drop pins for text (memo) entries that carry GPS
+            for (auto& [tid, te] : provider_.photos()) {
+                if (te.isText() && te.hasGps() && te.deletedAt == 0) {
+                    ids.push_back(tid);
+                    photos.push_back(te);
+                }
             }
             mapView->setPhotos(photos, ids, provider_);
             viewManager_->switchTo(ViewMode::Map);

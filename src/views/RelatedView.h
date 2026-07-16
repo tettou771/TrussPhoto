@@ -862,6 +862,9 @@ private:
 
         for (const auto& sr : similar) {
             if (timelineIds.count(sr.photoId)) continue;
+            // Text (memo) entries have no thumbnail; RelatedView text cards are
+            // deferred, so skip them here (they still surface in search + map).
+            if (auto* p = provider.getPhoto(sr.photoId); p && p->isText()) continue;
 
             float clipContrib = sr.score * 0.70f;
             float faceBonus = provider.sharesPerson(centerId_, sr.photoId) ? 0.15f : 0.0f;

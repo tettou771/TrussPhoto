@@ -101,6 +101,7 @@ private:
     bool embeddingsQueued_ = false;
     bool wbBackfillQueued_ = false;
     bool visionModelUnloaded_ = false;
+    bool textEmbeddingsDone_ = false;
 
     // Background export queue
     ExportQueue exportQueue_;

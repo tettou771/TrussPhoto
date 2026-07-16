@@ -255,7 +255,8 @@ public:
         selectedPinIds_.clear();
         for (size_t i = 0; i < photos.size(); i++) {
             if (photos[i].hasGps()) {
-                pins_.push_back({photos[i].latitude, photos[i].longitude, (int)i, ids[i]});
+                pins_.push_back({photos[i].latitude, photos[i].longitude,
+                                 (int)i, ids[i], photos[i].isText()});
             }
         }
         clusterZoom_ = -999;
@@ -1026,6 +1027,7 @@ private:
         double lat, lon;
         int photoIndex;
         string photoId;
+        bool isText = false;   // text (Obsidian memo) entry -> distinct pin color
     };
     vector<Pin> pins_;
 
@@ -1263,8 +1265,12 @@ private:
         fill();
         drawCircle(sx + 1, sy + 1, r);
 
-        // Pin body (orange)
-        setColor(PIN_COLOR);
+        // Pin body — text (memo) entries use a distinct gold pin
+        bool textPin = (cluster.count == 1 &&
+                        cluster.firstPinIdx >= 0 &&
+                        cluster.firstPinIdx < (int)pins_.size() &&
+                        pins_[cluster.firstPinIdx].isText);
+        setColor(textPin ? Color(0.98f, 0.80f, 0.20f) : PIN_COLOR);
         fill();
         drawCircle(sx, sy, r);
 

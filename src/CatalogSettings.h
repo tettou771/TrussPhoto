@@ -19,6 +19,7 @@ public:
     string rawStoragePath;   // Where to store RAW originals (empty = catalog/originals/)
     string serverUrl;
     string apiKey;           // API key for server authentication
+    vector<string> memoImportPaths;  // Obsidian vault folders to import text memos from
 
     // Load from catalog.json
     bool load(const string& path) {
@@ -34,6 +35,12 @@ public:
             rawStoragePath = j.value("rawStoragePath", string(""));
             serverUrl = j.value("serverUrl", string(""));
             apiKey = j.value("apiKey", string(""));
+            memoImportPaths.clear();
+            if (j.contains("memoImportPaths") && j["memoImportPaths"].is_array()) {
+                for (const auto& p : j["memoImportPaths"]) {
+                    if (p.is_string()) memoImportPaths.push_back(p.get<string>());
+                }
+            }
             return true;
         } catch (...) {
             return false;
@@ -46,7 +53,8 @@ public:
         nlohmann::json j = {
             {"rawStoragePath", rawStoragePath},
             {"serverUrl", serverUrl},
-            {"apiKey", apiKey}
+            {"apiKey", apiKey},
+            {"memoImportPaths", memoImportPaths}
         };
         ofstream file(settingsPath_);
         if (file) {

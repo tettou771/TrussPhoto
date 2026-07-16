@@ -495,7 +495,10 @@ public:
                 PhotoEntry e;
                 e.id = id;
                 applySyncFieldsForce(e, c);
+                // Text entries carry their full content in the row (no original
+                // payload), so a synced one is complete -> Synced, not ServerOnly.
                 e.syncState = (e.deletedAt > 0) ? SyncState::LocalOnly
+                            : e.isText()        ? SyncState::Synced
                                                 : SyncState::ServerOnly;
                 photos_[id] = e;
                 db_.updatePhoto(e);
@@ -568,7 +571,9 @@ public:
                 PhotoEntry e;
                 e.id = id;
                 applySyncFieldsForce(e, c);
-                e.syncState = SyncState::ServerOnly; // server has no original for it
+                // Text entries are self-contained (content lives in the row);
+                // media rows have no original payload yet -> ServerOnly.
+                e.syncState = e.isText() ? SyncState::Synced : SyncState::ServerOnly;
                 db_.updatePhotoWithNewSeq(e);        // assigns fresh server_seq
                 photos_[id] = e;
                 continue;
@@ -1357,6 +1362,8 @@ public:
         vector<string> ids;
         ids.reserve(photos_.size());
         for (const auto& [id, photo] : photos_) {
+            // Text entries are never shown as grid tiles (surfaced via linked photos)
+            if (photo.isText()) continue;
             // Filter out tombstoned (deleted) entries
             if (photo.deletedAt > 0) continue;
             // Filter out non-primary stacked entries
@@ -1419,6 +1426,96 @@ public:
         logNotice() << "[PhotoProvider] importReferences: " << added
                     << " added (total: " << photos_.size() << ")";
         return added;
+    }
+
+    // --- Text entries (Obsidian memos) ---
+
+    // Find an existing text entry by filename. Matching is by filename (not id)
+    // because Obsidian edits change the file size, and id embeds the size.
+    PhotoEntry* findTextEntryByFilename(const string& filename) {
+        for (auto& [id, e] : photos_) {
+            if (e.isText() && e.filename == filename) return &e;
+        }
+        return nullptr;
+    }
+
+    // Insert a brand-new text entry (no EXIF/XMP; localPath = vault .md path).
+    bool addTextEntry(const PhotoEntry& e) {
+        if (e.id.empty() || photos_.count(e.id)) return false;
+        photos_[e.id] = e;
+        db_.insertPhoto(e);
+        return true;
+    }
+
+    // Update an existing text entry's content in place, bumping memoUpdatedAt so
+    // the change rides the sync feed. Never writes to disk (the vault is external
+    // and read-only for us). Returns true if any field changed.
+    bool updateTextEntryContent(PhotoEntry& e, const string& memo, const string& tags,
+                                double lat, double lon, const string& dateTime,
+                                const string& localPath) {
+        bool changed = (e.memo != memo) || (e.tags != tags) ||
+                       (e.latitude != lat) || (e.longitude != lon) ||
+                       (e.dateTimeOriginal != dateTime) || (e.localPath != localPath);
+        auto ts = nowMs();
+        if (e.memo != memo) { e.memo = memo; e.memoUpdatedAt = ts; }
+        if (e.tags != tags) { e.tags = tags; e.tagsUpdatedAt = ts; }
+        e.latitude = lat;
+        e.longitude = lon;
+        e.dateTimeOriginal = dateTime;
+        e.localPath = localPath;
+        if (changed) db_.updatePhoto(e);
+        return changed;
+    }
+
+    // --- Photo <-> Text links (derived, in-memory; not persisted) ---
+
+    // Rebuild links: each text entry is linked to media entries taken within
+    // ±30 min. If both carry GPS and are >2 km apart, the pair is excluded.
+    void rebuildTextLinks() {
+        linkedTexts_.clear();
+        linkedPhotos_.clear();
+        // Snapshot media entries with a parseable timestamp once.
+        struct M { const string* id; int64_t t; const PhotoEntry* e; };
+        vector<M> media;
+        media.reserve(photos_.size());
+        for (auto& [pid, pent] : photos_) {
+            if (pent.isText()) continue;
+            int64_t pt = PhotoEntry::parseDateTimeOriginal(pent.dateTimeOriginal);
+            if (pt == 0) continue;
+            media.push_back({&pid, pt, &pent});
+        }
+        int linked = 0;
+        for (auto& [tid, tent] : photos_) {
+            if (!tent.isText()) continue;
+            int64_t tt = PhotoEntry::parseDateTimeOriginal(tent.dateTimeOriginal);
+            if (tt == 0) continue;
+            bool any = false;
+            for (const auto& m : media) {
+                if (llabs(m.t - tt) > 1800) continue;  // ±30 min
+                if (tent.hasGps() && m.e->hasGps()) {
+                    double d = haversine(tent.latitude, tent.longitude,
+                                         m.e->latitude, m.e->longitude);
+                    if (d > 2.0) continue;             // >2 km apart -> not the same moment
+                }
+                linkedTexts_[*m.id].push_back(tid);
+                linkedPhotos_[tid].push_back(*m.id);
+                any = true;
+            }
+            if (any) linked++;
+        }
+        logNotice() << "[TextLinks] " << linked << " texts linked to photos";
+    }
+
+    // Texts linked to a photo (nullptr if none)
+    const vector<string>* getLinkedTexts(const string& photoId) const {
+        auto it = linkedTexts_.find(photoId);
+        return it != linkedTexts_.end() ? &it->second : nullptr;
+    }
+
+    // Photos linked to a text (nullptr if none)
+    const vector<string>* getLinkedPhotos(const string& textId) const {
+        auto it = linkedPhotos_.find(textId);
+        return it != linkedPhotos_.end() ? &it->second : nullptr;
     }
 
     // --- Faces ---
@@ -1545,6 +1642,19 @@ public:
         };
 
         vector<string> result;
+        unordered_set<string> seen;
+        // Emit a photo id once. Text-entry matches are promoted to their linked
+        // photos (an unlinked text hit surfaces only on the map, not the grid).
+        auto emit = [&](const PhotoEntry& photo, const string& id) {
+            if (photo.isText()) {
+                auto lp = linkedPhotos_.find(id);
+                if (lp == linkedPhotos_.end()) return;
+                for (const auto& pid : lp->second)
+                    if (seen.insert(pid).second) result.push_back(pid);
+            } else {
+                if (seen.insert(id).second) result.push_back(id);
+            }
+        };
         for (const auto& [id, photo] : photos_) {
             if (contains(fs::path(photo.filename).stem().string()) ||
                 contains(photo.camera) || contains(photo.cameraMake) ||
@@ -1552,7 +1662,7 @@ public:
                 contains(photo.memo) || contains(photo.colorLabel) ||
                 contains(photo.creativeStyle) || contains(photo.dateTimeOriginal) ||
                 contains(photo.tags)) {
-                result.push_back(id);
+                emit(photo, id);
                 continue;
             }
             // Check person names
@@ -1560,7 +1670,7 @@ public:
             if (it != faceNameCache_.end()) {
                 for (const auto& name : it->second) {
                     if (contains(name)) {
-                        result.push_back(id);
+                        emit(photo, id);
                         break;
                     }
                 }
@@ -2558,18 +2668,47 @@ public:
         clipEmbedder_.unload();
     }
 
-    // Load all image embeddings from DB into memory cache
+    // Load all embeddings from DB into memory cache.
+    // Media entries use source="image", text entries use source="text"
+    // (both live in the shared SigLIP2 space, so they are mutually comparable).
+    // Iterates photos_ directly because getSortedIds() now hides text entries.
     void loadEmbeddingCache() {
-        auto ids = getSortedIds();
         int loaded = 0;
-        for (const auto& id : ids) {
-            auto vec = db_.getEmbedding(id, clipEmbedder_.MODEL_NAME);
+        for (const auto& [id, photo] : photos_) {
+            const char* src = photo.isText() ? "text" : "image";
+            auto vec = db_.getEmbedding(id, clipEmbedder_.MODEL_NAME, src);
             if (!vec.empty()) {
                 embeddingCache_[id] = std::move(vec);
                 loaded++;
             }
         }
         logNotice() << "[EmbeddingCache] Loaded " << loaded << " embeddings";
+    }
+
+    // Compute + store the embedding for one text entry (synchronous SigLIP2 text encode).
+    bool embedTextEntry(const string& id) {
+        if (!textEncoder_.isReady()) return false;
+        auto it = photos_.find(id);
+        if (it == photos_.end() || !it->second.isText()) return false;
+        if (it->second.memo.empty()) return false;
+        auto vec = textEncoder_.encode(it->second.memo);
+        if (vec.empty()) return false;
+        db_.insertEmbedding(id, clipEmbedder_.MODEL_NAME, "text", vec);
+        embeddingCache_[id] = vec;
+        return true;
+    }
+
+    // Embed every text entry that lacks a text embedding. Returns count embedded.
+    int embedMissingTextEntries() {
+        if (!textEncoder_.isReady()) return 0;
+        int n = 0;
+        for (auto& [id, photo] : photos_) {
+            if (!photo.isText() || photo.memo.empty()) continue;
+            if (db_.hasEmbedding(id, clipEmbedder_.MODEL_NAME, "text")) continue;
+            if (embedTextEntry(id)) n++;
+        }
+        if (n) logNotice() << "[EmbeddingCache] Embedded " << n << " text entries";
+        return n;
     }
 
     // Search result struct
@@ -2659,6 +2798,10 @@ public:
         vector<SearchResult> all;
         all.reserve(embeddingCache_.size());
         for (const auto& [id, imgEmb] : embeddingCache_) {
+            // Text entries can't be shown as grid tiles; skip them here.
+            // (Text -> photo promotion for the grid happens via searchByTextFields.)
+            auto pit = photos_.find(id);
+            if (pit != photos_.end() && pit->second.isText()) continue;
             float score = cosineSimilarity(textEmb, imgEmb);
             all.push_back({id, score});
         }
@@ -2705,7 +2848,8 @@ public:
         lock_guard<mutex> lock(embMutex_);
         for (const auto& id : ids) {
             auto it = photos_.find(id);
-            if (it != photos_.end() && it->second.isVideo) continue;
+            // Skip videos and text entries (text uses the SigLIP2 text encoder path)
+            if (it != photos_.end() && (it->second.isVideo || it->second.isText())) continue;
             pendingEmbeddings_.push_back(id);
         }
         startEmbeddingThread();
@@ -3088,6 +3232,10 @@ private:
     ClipEmbedder clipEmbedder_;
     ClipTextEncoder textEncoder_;
     unordered_map<string, vector<float>> embeddingCache_;
+
+    // Derived photo<->text links (rebuilt on load + after import; not persisted)
+    unordered_map<string, vector<string>> linkedTexts_;   // photoId -> textIds
+    unordered_map<string, vector<string>> linkedPhotos_;  // textId  -> photoIds
 
     // Face name cache (photo_id -> person names)
     unordered_map<string, vector<string>> faceNameCache_;
@@ -4429,6 +4577,7 @@ private:
 
     // Write XMP only if photo has a local path and is managed
     static void writeXmpSidecarIfLocal(const PhotoEntry& photo) {
+        if (photo.isText()) return;    // never write sidecars next to Obsidian notes
         if (photo.localPath.empty() || !fs::exists(photo.localPath)) return;
         if (!photo.isManaged) return;  // don't write XMP for external references
         writeXmpSidecar(photo.localPath, photo);

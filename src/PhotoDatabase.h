@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 
 class PhotoDatabase {
 public:
-    static constexpr int SCHEMA_VERSION = 21;
+    static constexpr int SCHEMA_VERSION = 22;
 
     bool open(const string& dbPath) {
         if (!db_.open(dbPath)) return false;
@@ -113,7 +113,8 @@ public:
                 "  deleted_at          INTEGER NOT NULL DEFAULT 0,"
                 "  server_seq          INTEGER NOT NULL DEFAULT 0,"
                 "  checksum            TEXT NOT NULL DEFAULT '',"
-                "  develop_updated_at  INTEGER NOT NULL DEFAULT 0"
+                "  develop_updated_at  INTEGER NOT NULL DEFAULT 0,"
+                "  entry_type          INTEGER NOT NULL DEFAULT 0"
                 ")"
             );
             if (!ok) return false;
@@ -477,6 +478,17 @@ public:
             version = 21;
             db_.setSchemaVersion(version);
             logNotice() << "[PhotoDatabase] Migrated v20 -> v21 (sync/replication)";
+        }
+
+        // v21 -> v22: add entry_type (0=media, 1=text/Obsidian memo)
+        if (version == 21) {
+            if (!db_.exec("ALTER TABLE photos ADD COLUMN entry_type INTEGER NOT NULL DEFAULT 0")) {
+                logError() << "[PhotoDatabase] Migration v21->v22 failed";
+                return false;
+            }
+            version = 22;
+            db_.setSchemaVersion(version);
+            logNotice() << "[PhotoDatabase] Migrated v21 -> v22 (entry_type)";
         }
 
         return true;
@@ -932,7 +944,7 @@ public:
             "user_angle, user_rotation90, "
             "user_persp_v, user_persp_h, user_shear, "
             "cam_color_matrix, "
-            "deleted_at, server_seq, checksum, develop_updated_at";
+            "deleted_at, server_seq, checksum, develop_updated_at, entry_type";
     }
 
     static PhotoEntry extractPhotoRow(Database::Statement& stmt) {
@@ -1015,6 +1027,7 @@ public:
             e.serverSeq          = stmt.getInt64(75);
             e.checksum           = stmt.getText(76);
             e.developUpdatedAt   = stmt.getInt64(77);
+            e.entryType          = stmt.getInt(78);
 
             // Syncing state doesn't survive restart
             if (e.syncState == SyncState::Syncing) {
@@ -1776,12 +1789,12 @@ private:
             "user_crop_x, user_crop_y, user_crop_w, user_crop_h, "
             "user_angle, user_rotation90, "
             "user_persp_v, user_persp_h, user_shear, cam_color_matrix, "
-            "deleted_at, server_seq, checksum, develop_updated_at) "
+            "deleted_at, server_seq, checksum, develop_updated_at, entry_type) "
             "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,"
             "?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,"
             "?37,?38,?39,?40,?41,?42,?43,?44,?45,?46,?47,?48,?49,?50,?51,?52,?53,?54,?55,"
             "?56,?57,?58,?59,?60,?61,?62,?63,?64,?65,?66,?67,?68,?69,?70,?71,?72,?73,?74,"
-            "?75,?76,?77,?78)";
+            "?75,?76,?77,?78,?79)";
     }
 
     static void bindEntry(Database::Statement& stmt, const PhotoEntry& e) {
@@ -1863,5 +1876,6 @@ private:
         stmt.bind(76, e.serverSeq);
         stmt.bind(77, e.checksum);
         stmt.bind(78, e.developUpdatedAt);
+        stmt.bind(79, e.entryType);
     }
 };

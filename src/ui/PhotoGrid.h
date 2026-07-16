@@ -360,6 +360,14 @@ protected:
         bool video = photo ? photo->isVideo : false;
         int stackSize = provider_->getStackSize(photoIds_[dataIdx]);
         item->rebindAndLoad(dataIdx, stem, sync, selected, video, &labelFont_, stackSize);
+
+        // Linked-text bubble: first linked memo (200-char preview) + count
+        if (auto* texts = provider_->getLinkedTexts(photoIds_[dataIdx])) {
+            if (!texts->empty()) {
+                const auto* memo = provider_->getPhoto((*texts)[0]);
+                item->setMemoBubble(memo ? memo->memo : string(), (int)texts->size());
+            }
+        }
     }
 
     void onUnbind(int dataIdx, ItemPtr& item) override {
