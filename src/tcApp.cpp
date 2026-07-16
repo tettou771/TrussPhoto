@@ -597,11 +597,23 @@ void tcApp::setup() {
     exportQueue_.setProfileDir(profileDir);
     exportQueue_.start();
     exportThumbnailReadyListener_ = exportQueue_.thumbnailReady.listen([this](string& pid) {
-        provider_.updateThumbnailPath(pid, provider_.getThumbnailCachePath(pid));
+        string thumbPath = provider_.getThumbnailCachePath(pid);
+        provider_.updateThumbnailPath(pid, thumbPath);
         auto g = grid();
         if (g) g->reloadItemThumbnail(pid);
+        // Phase B: distribute the edit-baked thumbnail to the server
+        if (catalogSettings_.hasServer() && !thumbPath.empty() && fs::exists(thumbPath)) {
+            uploadQueue_.enqueueThumbnail(pid, thumbPath);
+        }
         redraw();
     });
+
+    // Phase B: distribute locally generated smart previews to the server
+    provider_.onSmartPreviewGenerated = [this](const string& id, const string& spPath) {
+        if (catalogSettings_.hasServer() && !spPath.empty() && fs::exists(spPath)) {
+            uploadQueue_.enqueuePreview(id, spPath);
+        }
+    };
     exportDoneListener_ = exportQueue_.exportDone.listen([this](ExportResult& r) {
         if (r.type == ExportJobType::Jpeg) {
             if (r.success) {
@@ -649,7 +661,8 @@ void tcApp::setup() {
 
     mcp::tool("load_folder", "Load a folder containing images")
         .arg<string>("path", "Path to folder")
-        .bind([this](const string& path) {
+        .bind([this](const json& args) {
+            string path = args.at("path").get<string>();
             filesDropped({path});
             return json{
                 {"status", "ok"},
@@ -757,7 +770,8 @@ void tcApp::setup() {
 
     mcp::tool("relink_photos", "Find and relink missing photos from a folder")
         .arg<string>("folder", "Folder path to search for missing files")
-        .bind([this](const string& folder) {
+        .bind([this](const json& args) {
+            string folder = args.at("folder").get<string>();
             int missing = provider_.validateLibrary();
             int relinked = provider_.relinkFromFolder(folder);
             if (relinked > 0) {
@@ -821,6 +835,14 @@ void tcApp::update() {
 
         // ExportQueue: drain results (CPU mode)
         exportQueue_.processMainThread();
+
+        // Continuous derived-data generation: when idle, pick up any originals
+        // (e.g. freshly uploaded) that are still missing a thumbnail or SP.
+        static int genTick = 0;
+        if (++genTick % 5 == 0 && exportQueue_.isIdle() &&
+            !provider_.isSPGenerationRunning()) {
+            generateServerDerivedData();
+        }
 
         // Periodic progress logging
         if (!exportQueue_.isIdle()) {
@@ -1703,6 +1725,35 @@ void tcApp::enqueueLocalOnlyPhotos() {
     if (!localPhotos.empty()) {
         logNotice() << "Enqueued " << localPhotos.size() << " photos for upload";
     }
+}
+
+int tcApp::generateServerDerivedData() {
+    int queued = 0;
+
+    // 1. Thumbnails via ExportQueue (CPU mode) for photos with none cached.
+    // Snapshot copies: Crow threads may mutate photos_ concurrently.
+    for (auto& [entry, thumbPath] : provider_.copyEntriesNeedingThumbs()) {
+        ExportJobRequest req;
+        req.type = ExportJobType::Thumbnail;
+        req.photoId = entry.id;
+        req.outPath = thumbPath;
+        req.settings.maxEdge = THUMBNAIL_MAX_SIZE;
+        req.settings.quality = THUMBNAIL_JPEG_QUALITY;
+        req.entry = entry;
+        req.spPath = entry.localSmartPreviewPath;
+        req.rawPath = entry.localPath;
+        req.lensCorrectionParams = entry.lensCorrectionParams;
+        exportQueue_.enqueueThumbnail(req);
+        queued++;
+    }
+
+    // 2. Smart previews for photos with none (background SP pipeline).
+    queued += provider_.queueAllMissingSP();
+
+    if (queued > 0) {
+        logNotice() << "[Server] Generating derived data for " << queued << " items";
+    }
+    return queued;
 }
 
 void tcApp::configureServer(const string& url, const string& key) {

@@ -367,10 +367,17 @@ public:
             if (ctx_->redraw) ctx_->redraw(1);
         }
 
-        // Fallback: try smart preview (camera RGB — needs color pipeline)
-        if (!loaded && provider.hasSmartPreview(photoId)) {
+        // Fallback: try smart preview (camera RGB — needs color pipeline).
+        // For ServerOnly photos this downloads the SP (and, if the develop-
+        // critical color matrix is missing, the full metadata) from the server,
+        // so photos with no local original stay viewable and developable.
+        if (!loaded && provider.hasSmartPreviewAvailable(photoId)) {
+            if (entry->camColorMatrix.empty()) {
+                provider.fetchServerMetadata(photoId);
+                entry = provider.getPhoto(photoId); // refresh after metadata merge
+            }
             Pixels spPixels;
-            if (provider.loadSmartPreview(photoId, spPixels)) {
+            if (entry && provider.getSmartPreview(photoId, spPixels)) {
                 // Apply DCP or fallback color matrix to camera RGB SP
                 applyColorPipelineToPixels(spPixels, *entry);
 

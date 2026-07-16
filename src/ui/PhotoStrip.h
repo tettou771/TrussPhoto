@@ -533,7 +533,7 @@ private:
     }
 
     void processLoadResults() {
-        LoadResult result;
+        AsyncLoadResult result;
         bool any = false;
         while (loader_.tryGetResult(result)) {
             if (!result.success) continue;

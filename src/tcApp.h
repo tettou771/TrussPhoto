@@ -162,6 +162,9 @@ private:
     void enqueueLocalOnlyPhotos();
     void configureServer(const string& url, const string& key = "");
     void repairLibrary();
+    // Server mode: enqueue thumbnail + smart preview generation for photos that
+    // are missing them (picks up newly uploaded originals). Returns work queued.
+    int generateServerDerivedData();
     void relinkMissingPhotos();
     void consolidateLibrary();
     void updateLayout();

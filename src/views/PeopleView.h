@@ -1747,7 +1747,7 @@ private:
                 Pixels px;
                 bool loaded = false;
                 if (!task.thumbPath.empty() && fs::exists(task.thumbPath)) {
-                    loaded = px.load(task.thumbPath);
+                    loaded = px.load(task.thumbPath).ok();
                 }
                 if (loaded) {
                     lock_guard<mutex> lock(loadMutex_);

@@ -1,0 +1,4 @@
+*
+!.gitignore
+!run_e2e.py
+!smoke_ws2.py

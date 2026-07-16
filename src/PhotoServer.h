@@ -181,6 +181,91 @@ public:
             }, 201);
         });
 
+        // --- Upload original bytes (Phase B) ---
+        // Raw body + X-Filename header. Persisted under rawStoragePath, entry
+        // registered under the client-authoritative id, derived data generated
+        // by the server's continuous update loop.
+        TCX_CROW_ROUTE(app_, "/api/photos/<string>/original").methods("PUT"_method)
+        ([this](const ::crow::request& req, const string& id) {
+            if (!authorize(req)) return ::crow::response(401, "Unauthorized");
+
+            string filename = req.get_header_value("X-Filename");
+            if (filename.empty()) filename = id;
+
+            string err;
+            PhotoEntry stored;
+            if (!provider_->ingestOriginalBytes(id, filename, req.body, err, &stored)) {
+                logWarning() << "[PhotoServer] Ingest failed for " << id << ": " << err;
+                return ::crow::response(500, err);
+            }
+
+            // Assign a fresh server_seq so the new row appears in the change feed.
+            provider_->bumpServerSeq(id);
+
+            return tcx::crow::jsonResponse({
+                {"id", id},
+                {"filename", stored.filename},
+                {"width", stored.width},
+                {"height", stored.height},
+                {"message", "Original stored"}
+            }, 201);
+        });
+
+        // --- Smart preview download (Phase B) ---
+        // On-demand generation from the local original when missing.
+        TCX_CROW_ROUTE(app_, "/api/photos/<string>/preview")
+        ([this](const ::crow::request& req, const string& id) {
+            if (!authorize(req)) return ::crow::response(401, "Unauthorized");
+
+            if (!provider_->hasPhoto(id)) return ::crow::response(404, "Photo not found");
+
+            string spPath = provider_->ensureSmartPreview(id);
+            if (spPath.empty() || !fs::exists(spPath)) {
+                return ::crow::response(404, "Smart preview not available");
+            }
+
+            ifstream file(spPath, ios::binary | ios::ate);
+            if (!file) return ::crow::response(500, "Failed to read smart preview");
+            auto size = file.tellg();
+            file.seekg(0, ios::beg);
+            string buffer(size, '\0');
+            file.read(&buffer[0], size);
+
+            ::crow::response res(200, buffer);
+            res.set_header("Content-Type", "image/jxl");
+            return res;
+        });
+
+        // --- Smart preview upload (Phase B) ---
+        // Client-generated SP distribution. 204 when the server already has one.
+        TCX_CROW_ROUTE(app_, "/api/photos/<string>/preview").methods("PUT"_method)
+        ([this](const ::crow::request& req, const string& id) {
+            if (!authorize(req)) return ::crow::response(401, "Unauthorized");
+
+            if (!provider_->hasPhoto(id)) return ::crow::response(404, "Photo not found");
+            if (req.body.empty()) return ::crow::response(400, "Empty body");
+
+            if (provider_->saveSmartPreviewBytes(id, req.body)) {
+                return ::crow::response(201, "Smart preview stored");
+            }
+            return ::crow::response(204);
+        });
+
+        // --- Thumbnail upload (Phase B) ---
+        // Edit-baked thumbnail distribution (JPEG bytes).
+        TCX_CROW_ROUTE(app_, "/api/photos/<string>/thumbnail").methods("PUT"_method)
+        ([this](const ::crow::request& req, const string& id) {
+            if (!authorize(req)) return ::crow::response(401, "Unauthorized");
+
+            if (!provider_->hasPhoto(id)) return ::crow::response(404, "Photo not found");
+            if (req.body.empty()) return ::crow::response(400, "Empty body");
+
+            if (provider_->saveThumbnailBytes(id, req.body)) {
+                return ::crow::response(201, "Thumbnail stored");
+            }
+            return ::crow::response(500, "Failed to store thumbnail");
+        });
+
         // --- Update metadata ---
         TCX_CROW_ROUTE(app_, "/api/photos/<string>/metadata").methods("PATCH"_method)
         ([this](const ::crow::request& req, const string& id) {

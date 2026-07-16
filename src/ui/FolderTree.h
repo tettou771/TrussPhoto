@@ -19,7 +19,7 @@ inline bool loadJapaneseFont(Font& font, int size) {
     const char* jpFont = nullptr;
 #endif
     if (jpFont && font.load(jpFont, size)) return true;
-    return font.load(TC_FONT_SANS, size);
+    return font.load(TC_FONT_SANS, size).ok();
 }
 
 // =============================================================================

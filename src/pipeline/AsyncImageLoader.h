@@ -22,7 +22,7 @@ struct LoadRequest {
 };
 
 // Load result (Pixels, not Image - texture must be created on main thread)
-struct LoadResult {
+struct AsyncLoadResult {
     int id;
     Pixels pixels;
     bool success = false;
@@ -94,7 +94,7 @@ public:
     }
 
     // Check for completed loads (call from main thread in update)
-    bool tryGetResult(LoadResult& result) {
+    bool tryGetResult(AsyncLoadResult& result) {
         return resultChannel_.tryReceive(result);
     }
 
@@ -122,7 +122,7 @@ protected:
             }
 
             // Load image
-            LoadResult result;
+            AsyncLoadResult result;
             result.id = req.id;
 
             bool loaded = false;
@@ -140,7 +140,7 @@ protected:
                         loaded = RawLoader::load(req.path, result.pixels);
                     }
                 } else {
-                    loaded = result.pixels.load(req.path);
+                    loaded = result.pixels.load(req.path).ok();
                     if (loaded && req.maxSize > 0) {
                         int w = result.pixels.getWidth();
                         int h = result.pixels.getHeight();
@@ -161,7 +161,7 @@ protected:
 
 private:
     ThreadChannel<LoadRequest> requestChannel_;
-    ThreadChannel<LoadResult> resultChannel_;
+    ThreadChannel<AsyncLoadResult> resultChannel_;
     ThumbnailLoader customLoader_;
 
     mutex cancelMutex_;

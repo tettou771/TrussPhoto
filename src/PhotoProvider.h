@@ -16,6 +16,7 @@
 #include <fstream>
 #include <mutex>
 #include <deque>
+#include <functional>
 #include <condition_variable>
 #include <sys/stat.h>
 #ifdef __APPLE__
@@ -597,9 +598,16 @@ public:
         };
     }
 
+    // Thread-safe existence check for Crow handlers (server mode).
+    bool hasPhoto(const string& id) const {
+        lock_guard<mutex> lock(photosMutex_);
+        return photos_.count(id) > 0;
+    }
+
     // Assign a fresh server_seq to a single row after a server-side mutation
     // (PATCH metadata / import / delete). Server mode only.
     void bumpServerSeq(const string& id) {
+        lock_guard<mutex> lock(photosMutex_);
         auto it = photos_.find(id);
         if (it == photos_.end()) return;
         db_.updatePhotoWithNewSeq(it->second);
@@ -2058,11 +2066,14 @@ public:
     // Queue all photos without smart preview (RAW + JPEG)
     int queueAllMissingSP() {
         vector<string> ids;
-        for (const auto& [id, photo] : photos_) {
-            if (photo.isVideo) continue;
-            if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) continue;
-            if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
-            ids.push_back(id);
+        {
+            lock_guard<mutex> lock(photosMutex_);
+            for (const auto& [id, photo] : photos_) {
+                if (photo.isVideo) continue;
+                if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) continue;
+                if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
+                ids.push_back(id);
+            }
         }
         if (!ids.empty()) {
             queueSmartPreviewGeneration(ids);
@@ -2072,15 +2083,27 @@ public:
 
     // Process completed SP generation results (call from main thread)
     void processSPResults() {
-        lock_guard<mutex> lock(spMutex_);
-        for (const auto& result : completedSPGenerations_) {
-            auto it = photos_.find(result.photoId);
-            if (it != photos_.end() && !result.spPath.empty()) {
-                it->second.localSmartPreviewPath = result.spPath;
-                db_.updateSmartPreviewPath(result.photoId, result.spPath);
+        vector<SPResult> done;
+        {
+            lock_guard<mutex> lock(spMutex_);
+            done.swap(completedSPGenerations_);
+        }
+        vector<pair<string, string>> justGenerated;
+        {
+            lock_guard<mutex> lock(photosMutex_);
+            for (const auto& result : done) {
+                auto it = photos_.find(result.photoId);
+                if (it != photos_.end() && !result.spPath.empty()) {
+                    it->second.localSmartPreviewPath = result.spPath;
+                    db_.updateSmartPreviewPath(result.photoId, result.spPath);
+                    justGenerated.push_back({result.photoId, result.spPath});
+                }
             }
         }
-        completedSPGenerations_.clear();
+        // Notify listener outside the lock (used to enqueue SP upload to server)
+        if (onSmartPreviewGenerated) {
+            for (auto& [pid, sp] : justGenerated) onSmartPreviewGenerated(pid, sp);
+        }
     }
 
     bool isSPGenerationRunning() const { return spThreadRunning_; }
@@ -2090,6 +2113,285 @@ public:
     }
     int getSPCompletedCount() const { return spCompletedCount_; }
     int getSPTotalCount() const { return spTotalCount_; }
+
+    // =========================================================================
+    // Phase B: payload transfer (smart preview / thumbnail / original bytes)
+    // =========================================================================
+
+    // Invoked on the main thread from processSPResults() when a smart preview has
+    // just been generated locally (used to enqueue an SP upload to the server).
+    function<void(const string& id, const string& spPath)> onSmartPreviewGenerated;
+
+    // --- Client side: smart preview resolution ---
+
+    // True when a smart preview can be obtained: either a local file exists, or the
+    // photo has no local original (ServerOnly/Missing) but a reachable server that
+    // can serve/generate the SP.
+    bool hasSmartPreviewAvailable(const string& id) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        const auto& photo = it->second;
+        if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath))
+            return true;
+        bool noLocalOriginal = photo.localPath.empty() || !fs::exists(photo.localPath);
+        if (noLocalOriginal && isServerReachable()) return true;
+        return false;
+    }
+
+    // Resolve a smart preview to F32 pixels:
+    //   local SP file -> server GET /preview (download, cache to disk + DB) -> false
+    bool getSmartPreview(const string& id, Pixels& outF32) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        auto& photo = it->second;
+
+        // 1. Local smart preview
+        if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) {
+            if (SmartPreview::decode(photo.localSmartPreviewPath, outF32)) return true;
+        }
+
+        // 2. Server smart preview (download + cache)
+        if (isServerReachable()) {
+            auto res = client_.get("/api/photos/" + id + "/preview");
+            if (res.ok() && !res.body.empty()) {
+                string spPath = smartPreviewPath(photo);
+                if (!spPath.empty()) {
+                    fs::create_directories(fs::path(spPath).parent_path());
+                    ofstream f(spPath, ios::binary);
+                    if (f) {
+                        f.write(res.body.data(), (streamsize)res.body.size());
+                        f.close();
+                        photo.localSmartPreviewPath = spPath;
+                        db_.updateSmartPreviewPath(id, spPath);
+                        logNotice() << "[PhotoProvider] Downloaded smart preview: " << id
+                                    << " (" << res.body.size() << " bytes)";
+                        if (SmartPreview::decode(spPath, outF32)) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // Fetch full metadata for a photo from the server, filling develop/display
+    // fields that are empty locally. ServerOnly photos arrive from the photo list
+    // with only basic fields; the color pipeline needs camColorMatrix / dimensions.
+    bool fetchServerMetadata(const string& id) {
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        if (!isServerReachable()) return false;
+
+        auto res = client_.get("/api/photos/" + id);
+        if (!res.ok()) return false;
+        auto j = res.json();
+        if (!j.contains("id")) return false;
+
+        auto& photo = it->second;
+        if (photo.camColorMatrix.empty())
+            photo.camColorMatrix = j.value("camColorMatrix", string(""));
+        if (photo.lensCorrectionParams.empty())
+            photo.lensCorrectionParams = j.value("lensCorrectionParams", string(""));
+        if (photo.dateTimeOriginal.empty())
+            photo.dateTimeOriginal = j.value("dateTimeOriginal", string(""));
+        if (photo.camera.empty())        photo.camera = j.value("camera", string(""));
+        if (photo.creativeStyle.empty()) photo.creativeStyle = j.value("creativeStyle", string(""));
+        if (photo.width == 0)            photo.width = j.value("width", 0);
+        if (photo.height == 0)           photo.height = j.value("height", 0);
+        if (photo.asShotTemp == 0.0f)    photo.asShotTemp = j.value("asShotTemp", 0.0f);
+        if (photo.asShotTint == 0.0f)    photo.asShotTint = j.value("asShotTint", 0.0f);
+        db_.insertPhotos(vector<PhotoEntry>{photo});
+        return true;
+    }
+
+    // --- Server side: ingest / generate / store payloads ---
+
+    // Persist uploaded original bytes under rawStoragePath (dated subdir), extract
+    // metadata, and register the entry under the client-authoritative id
+    // (id == filename_filesize is preserved end to end). Idempotent: returns true
+    // immediately when the id already has a readable local original.
+    bool ingestOriginalBytes(const string& id, const string& filename,
+                             const string& bytes, string& outError,
+                             PhotoEntry* outEntry = nullptr) {
+        if (rawStoragePath_.empty()) { outError = "rawStoragePath not configured"; return false; }
+        if (bytes.empty()) { outError = "empty body"; return false; }
+
+        {
+            lock_guard<mutex> lock(photosMutex_);
+            auto existing = photos_.find(id);
+            if (existing != photos_.end() &&
+                !existing->second.localPath.empty() && fs::exists(existing->second.localPath)) {
+                if (outEntry) *outEntry = existing->second;
+                return true; // already have it
+            }
+        }
+
+        string fname = fs::path(filename).filename().string();
+        if (fname.empty()) fname = id;
+
+        // Stage to a temp file first so EXIF is available for the dated subdir
+        fs::create_directories(fs::path(rawStoragePath_));
+        fs::path staging = fs::path(rawStoragePath_) / ("._incoming_" + id);
+        {
+            ofstream f(staging, ios::binary);
+            if (!f) { outError = "cannot open staging file"; return false; }
+            f.write(bytes.data(), (streamsize)bytes.size());
+            if (!f.good()) { outError = "write failed"; return false; }
+        }
+
+        PhotoEntry photo;
+        photo.id = id;
+        photo.filename = fname;
+        photo.fileSize = bytes.size();
+        photo.isVideo = isVideoFile(fs::path(fname));
+        photo.isRaw = photo.isVideo ? false : RawLoader::isRawFile(fs::path(fname));
+        if (!photo.isVideo) {
+            extractExifMetadata(staging.string(), photo);
+            extractXmpMetadata(staging.string(), photo);
+        }
+
+        string subdir = dateToSubdir(photo.dateTimeOriginal, staging.string());
+        fs::path destDir = fs::path(rawStoragePath_) / subdir;
+        fs::create_directories(destDir);
+        fs::path destPath = resolveDestPath(destDir, fname);
+        try {
+            fs::rename(staging, destPath);
+        } catch (...) {
+            try {
+                fs::copy_file(staging, destPath, fs::copy_options::overwrite_existing);
+                fs::remove(staging);
+            } catch (const exception& e) {
+                try { fs::remove(staging); } catch (...) {}
+                outError = string("move failed: ") + e.what();
+                return false;
+            }
+        }
+
+        photo.localPath = destPath.string();
+        photo.isManaged = true;
+        photo.syncState = SyncState::LocalOnly;
+
+        {
+            lock_guard<mutex> lock(photosMutex_);
+            photos_[id] = photo;
+            db_.insertPhotos(vector<PhotoEntry>{photo});
+        }
+        if (outEntry) *outEntry = photo;
+        logNotice() << "[PhotoProvider] Ingested original: " << fname
+                    << " (" << bytes.size() << " bytes) id=" << id;
+        return true;
+    }
+
+    // Ensure an on-disk smart preview exists, generating it from the local original
+    // if missing. Returns the SP path (empty on failure). Used for on-demand GET.
+    string ensureSmartPreview(const string& id) {
+        // Snapshot under lock; the decode/encode below runs without it so a
+        // long RAW decode never blocks other threads on photosMutex_.
+        PhotoEntry snap;
+        {
+            lock_guard<mutex> lock(photosMutex_);
+            auto it = photos_.find(id);
+            if (it == photos_.end()) return "";
+            if (!it->second.localSmartPreviewPath.empty() &&
+                fs::exists(it->second.localSmartPreviewPath))
+                return it->second.localSmartPreviewPath;
+            snap = it->second;
+        }
+
+        string spPath = smartPreviewPath(snap);
+        if (spPath.empty()) return "";
+
+        if (!fs::exists(spPath)) {
+            if (snap.isVideo) return "";
+            if (snap.localPath.empty() || !fs::exists(snap.localPath)) return "";
+
+            Pixels rawF32;
+            if (snap.isRaw) {
+                if (!RawLoader::loadFloatPreview(snap.localPath, rawF32)) return "";
+            } else {
+                Pixels u8;
+                if (!u8.load(snap.localPath)) return "";
+                int w = u8.getWidth(), h = u8.getHeight(), ch = u8.getChannels();
+                rawF32.allocate(w, h, ch, PixelFormat::F32);
+                const unsigned char* s = u8.getData();
+                float* d = rawF32.getDataF32();
+                for (int i = 0; i < w * h * ch; i++) d[i] = s[i] / 255.0f;
+            }
+
+            fs::create_directories(fs::path(spPath).parent_path());
+            if (!SmartPreview::encode(rawF32, spPath)) return "";
+            logNotice() << "[PhotoProvider] Generated smart preview on demand: " << id;
+        }
+
+        {
+            lock_guard<mutex> lock(photosMutex_);
+            auto it = photos_.find(id);
+            if (it != photos_.end()) it->second.localSmartPreviewPath = spPath;
+            db_.updateSmartPreviewPath(id, spPath);
+        }
+        return spPath;
+    }
+
+    // Snapshot copies of entries lacking a cached thumbnail, paired with the
+    // cache path to write. Used by the server-mode derived-data loop so it
+    // never iterates photos_ while a Crow thread mutates it.
+    vector<pair<PhotoEntry, string>> copyEntriesNeedingThumbs() {
+        vector<pair<PhotoEntry, string>> out;
+        lock_guard<mutex> lock(photosMutex_);
+        for (auto& [id, entry] : photos_) {
+            if (entry.isVideo) continue;
+            if (entry.localPath.empty() || !fs::exists(entry.localPath)) continue;
+            string thumbPath = getThumbnailCachePath(id);
+            if (thumbPath.empty() || fs::exists(thumbPath)) continue;
+            out.push_back({entry, thumbPath});
+        }
+        return out;
+    }
+
+    // Store an uploaded smart preview (JXL bytes). Idempotent: returns false when
+    // one already exists (caller replies 204), true when newly written.
+    bool saveSmartPreviewBytes(const string& id, const string& bytes) {
+        lock_guard<mutex> lock(photosMutex_);
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        auto& photo = it->second;
+        if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath))
+            return false;
+        string spPath = smartPreviewPath(photo);
+        if (spPath.empty()) return false;
+        if (fs::exists(spPath)) {
+            photo.localSmartPreviewPath = spPath;
+            db_.updateSmartPreviewPath(id, spPath);
+            return false;
+        }
+        fs::create_directories(fs::path(spPath).parent_path());
+        ofstream f(spPath, ios::binary);
+        if (!f) return false;
+        f.write(bytes.data(), (streamsize)bytes.size());
+        f.close();
+        photo.localSmartPreviewPath = spPath;
+        db_.updateSmartPreviewPath(id, spPath);
+        return true;
+    }
+
+    // Store an uploaded thumbnail (JPEG bytes) into the thumbnail cache.
+    bool saveThumbnailBytes(const string& id, const string& bytes) {
+        lock_guard<mutex> lock(photosMutex_);
+        auto it = photos_.find(id);
+        if (it == photos_.end()) return false;
+        auto& photo = it->second;
+        if (thumbnailCacheDir_.empty()) return false;
+        string subdir = dateToSubdir(photo.dateTimeOriginal, photo.localPath);
+        string dir = thumbnailCacheDir_ + "/" + subdir;
+        fs::create_directories(dir);
+        string cachePath = dir + "/" + id + ".jpg";
+        ofstream f(cachePath, ios::binary);
+        if (!f) return false;
+        f.write(bytes.data(), (streamsize)bytes.size());
+        f.close();
+        photo.localThumbnailPath = cachePath;
+        db_.updateThumbnailPath(id, cachePath);
+        return true;
+    }
 
     // --- EXIF Backfill (v9 fields) ---
 
@@ -2701,6 +3003,11 @@ private:
 
     HttpClient client_;
     PhotoDatabase db_;
+    // Guards photos_ against Crow-thread mutation in server mode
+    // (ingestOriginalBytes / saveSmartPreviewBytes / saveThumbnailBytes run on
+    // HTTP worker threads while the main loop iterates for derived-data
+    // generation). GUI mode never contends on it.
+    mutable mutex photosMutex_;
     unordered_map<string, PhotoEntry> photos_;
     unordered_map<string, vector<string>> stackIndex_; // stackId -> member ids
     vector<Collection> collections_;
@@ -2905,7 +3212,7 @@ private:
                     bool loaded = false;
 
                     if (!thumbPath.empty() && fs::exists(thumbPath)) {
-                        loaded = thumbPixels.load(thumbPath);
+                        loaded = thumbPixels.load(thumbPath).ok();
                     }
                     if (!loaded) {
                         loaded = getThumbnail(id, thumbPixels);
