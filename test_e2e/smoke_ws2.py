@@ -11,6 +11,19 @@ VAULT = "/Users/toru/Nextcloud/Obsidian/QuickMemo"
 CAT = f"{ROOT}/CatWS2"
 MCP = 18852
 
+# The app records --catalog in the global app_config.json; snapshot it so test
+# catalogs never become the user's "last opened" catalog.
+APP_CONFIG = os.path.expanduser("~/Library/Application Support/TrussPhoto/app_config.json")
+try:
+    _app_config_backup = open(APP_CONFIG).read()
+except OSError:
+    _app_config_backup = None
+
+def restore_app_config():
+    if _app_config_backup is not None:
+        with open(APP_CONFIG, "w") as f:
+            f.write(_app_config_backup)
+
 shutil.rmtree(CAT, ignore_errors=True)
 os.makedirs(CAT)
 
@@ -92,3 +105,4 @@ finally:
     proc.terminate()
     try: proc.wait(timeout=3)
     except Exception: proc.kill()
+    restore_app_config()

@@ -27,6 +27,19 @@ CATCLI = fresh(f"{ROOT}/CatCli")
 CATCLI2 = fresh(f"{ROOT}/CatCli2")
 IMPORT_SRC = f"{ROOT}/import_src"
 
+# The app records --catalog in the global app_config.json; snapshot it so test
+# catalogs never become the user's "last opened" catalog.
+APP_CONFIG = os.path.expanduser("~/Library/Application Support/TrussPhoto/app_config.json")
+try:
+    _app_config_backup = open(APP_CONFIG).read()
+except OSError:
+    _app_config_backup = None
+
+def restore_app_config():
+    if _app_config_backup is not None:
+        with open(APP_CONFIG, "w") as f:
+            f.write(_app_config_backup)
+
 procs = []
 def spawn(args, env_extra, logname):
     logf = open(f"{ROOT}/{logname}", "w")
@@ -270,3 +283,4 @@ finally:
             try: p.kill()
             except Exception: pass
     kill_port_owners()
+    restore_app_config()
