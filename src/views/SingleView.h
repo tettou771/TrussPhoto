@@ -93,7 +93,7 @@ public:
     // Reload RAW only (without resetting SP/UI) for DCP toggle
     void reloadRawWithCurrentSettings() {
         if (selectedIndex_ < 0 || !ctx_) return;
-        const string& photoId = ctx_->grid->getPhotoId(selectedIndex_);
+        const string& photoId = currentId_;
         auto* entry = ctx_->provider->getPhoto(photoId);
         if (!entry || entry->localPath.empty()) {
             logWarning() << "[DCP] reloadRaw: no entry or no localPath";
@@ -114,6 +114,7 @@ public:
         rawLoadInProgress_ = true;
         rawLoadCompleted_ = false;
         rawLoadTargetIndex_ = index;
+        rawLoadTargetId_ = photoId;
 
         if (rawLoadThread_.joinable()) rawLoadThread_.join();
         rawLoadThread_ = thread([this, index, path, camMatrix, colorTemp, hasDcp, profOn]() {
@@ -167,6 +168,8 @@ public:
         const string& photoId = grid->getPhotoId(index);
         auto* entry = provider.getPhoto(photoId);
         if (!entry) return;
+        // Memo cards have no image; bail out before tearing down the current photo
+        if (entry->isText()) return;
 
         logNotice() << "Opening: " << entry->filename;
 
@@ -279,6 +282,7 @@ public:
                     rawLoadInProgress_ = true;
                     rawLoadCompleted_ = false;
                     rawLoadTargetIndex_ = index;
+                    rawLoadTargetId_ = photoId;
                     lensCorrector_.reset();
 
                     if (rawLoadThread_.joinable()) rawLoadThread_.join();
@@ -398,6 +402,7 @@ public:
 
         if (loaded) {
             selectedIndex_ = index;
+            currentId_ = photoId;
             zoomLevel_ = 1.0f;
             panOffset_ = {0, 0};
             loadProfileForEntry(*entry);
@@ -444,7 +449,8 @@ public:
     void processRawLoadCompletion() {
         if (!ctx_ || !rawLoadCompleted_ || !isRawImage_) return;
 
-        if (rawLoadTargetIndex_ == selectedIndex_) {
+        // Match by id: a grid repopulate may have moved the shown photo's index
+        if (!rawLoadTargetId_.empty() && rawLoadTargetId_ == currentId_) {
             lock_guard<mutex> lock(rawLoadMutex_);
             if (pendingRawPixels_.isAllocated()) {
                 rawPixels_ = std::move(pendingRawPixels_);
@@ -457,7 +463,7 @@ public:
                             << rawPixels_.getWidth() << "x" << rawPixels_.getHeight()
                             << " display=" << displayW_ << "x" << displayH_;
 
-                const string& spId = ctx_->grid->getPhotoId(selectedIndex_);
+                const string& spId = currentId_;
 
                 // Write intermediate dimensions + crop coords to DB
                 if (lensCorrector_.isReady()) {
@@ -556,7 +562,7 @@ public:
         int ucRot90 = 0;
         float ucPerspV = 0, ucPerspH = 0, ucShear = 0;
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
-            const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
+            const string& pid = currentId_;
             auto* entry = ctx_->provider->getPhoto(pid);
             if (entry && entry->hasCrop()) {
                 ucX = entry->userCropX;
@@ -592,7 +598,7 @@ public:
         tmpEntry.userPerspH = ucPerspH;
         tmpEntry.userShear = ucShear;
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
-            auto* e = ctx_->provider->getPhoto(ctx_->grid->getPhotoId(selectedIndex_));
+            auto* e = ctx_->provider->getPhoto(currentId_);
             if (e) tmpEntry.focalLength35mm = e->focalLength35mm;
         }
 
@@ -722,12 +728,17 @@ public:
             return false;
         }
 
-        if (key == SAPP_KEYCODE_LEFT && selectedIndex_ > 0) {
-            show(selectedIndex_ - 1);
-            return true;
-        }
-        if (key == SAPP_KEYCODE_RIGHT && selectedIndex_ < (int)grid->getPhotoIdCount() - 1) {
-            show(selectedIndex_ + 1);
+        if (key == SAPP_KEYCODE_LEFT || key == SAPP_KEYCODE_RIGHT) {
+            // Step to the neighbouring photo, skipping memo cards in the grid
+            int step = key == SAPP_KEYCODE_LEFT ? -1 : 1;
+            int n = (int)grid->getPhotoIdCount();
+            int i = selectedIndex_ + step;
+            while (i >= 0 && i < n) {
+                auto* e = ctx_->provider->getPhoto(grid->getPhotoId(i));
+                if (e && !e->isText()) break;
+                i += step;
+            }
+            if (i >= 0 && i < n) show(i);
             return true;
         }
         if (key == 'P' || key == 'p') {
@@ -736,7 +747,7 @@ public:
                 if (currentProfileType_ == ProfileType::DCP) {
                     // DCP color pipeline is baked into pixels — reload RAW only
                     // Only works if RAW file is accessible
-                    const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
+                    const string& pid = currentId_;
                     auto* ent = ctx_->provider->getPhoto(pid);
                     if (ent && !ent->localPath.empty() && fs::exists(ent->localPath)) {
                         reloadRawWithCurrentSettings();
@@ -774,7 +785,7 @@ public:
         }
         if (key >= '0' && key <= '5') {
             if (selectedIndex_ >= 0 && selectedIndex_ < (int)grid->getPhotoIdCount()) {
-                const string& photoId = grid->getPhotoId(selectedIndex_);
+                const string& photoId = currentId_;
                 int rating = key - '0';
                 provider.setRating(photoId, rating);
                 logNotice() << "[Rating] " << photoId << " -> " << rating;
@@ -789,7 +800,7 @@ public:
         if (key == 'S' || key == 's') {
             // Debug: force load smart preview
             if (selectedIndex_ >= 0 && selectedIndex_ < (int)grid->getPhotoIdCount()) {
-                const string& photoId = grid->getPhotoId(selectedIndex_);
+                const string& photoId = currentId_;
                 auto* spEntry = provider.getPhoto(photoId);
                 Pixels spPixels;
                 if (spEntry && provider.loadSmartPreview(photoId, spPixels)) {
@@ -873,7 +884,7 @@ public:
 
         // Save all develop settings to DB
         if (ctx_ && selectedIndex_ >= 0 && selectedIndex_ < (int)ctx_->grid->getPhotoIdCount()) {
-            const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
+            const string& pid = currentId_;
             ctx_->provider->setDevelop(pid, exposure_, temperature_, tint_,
                                        contrast_, highlights_, shadows_,
                                        whites_, blacks_,
@@ -991,7 +1002,7 @@ public:
     void updateMetadata() {
         if (!ctx_ || selectedIndex_ < 0) return;
         if (selectedIndex_ >= (int)ctx_->grid->getPhotoIdCount()) return;
-        const string& pid = ctx_->grid->getPhotoId(selectedIndex_);
+        const string& pid = currentId_;
         auto* e = ctx_->provider->getPhoto(pid);
         if (e && ctx_->metadataPanel) {
             ctx_->metadataPanel->setPhoto(e);
@@ -1003,8 +1014,18 @@ public:
 
     string currentPhotoId() const {
         if (!ctx_ || selectedIndex_ < 0) return "";
-        if (selectedIndex_ >= (int)ctx_->grid->getPhotoIdCount()) return "";
-        return ctx_->grid->getPhotoId(selectedIndex_);
+        return currentId_;
+    }
+
+    // The grid was repopulated while this view is open (memo cards toggled,
+    // sync, import): find the shown photo again. False if it is gone.
+    bool reresolveIndex() {
+        if (!ctx_ || selectedIndex_ < 0 || currentId_.empty()) return true;
+        auto& grid = ctx_->grid;
+        for (int i = 0; i < (int)grid->getPhotoIdCount(); i++) {
+            if (grid->getPhotoId(i) == currentId_) { selectedIndex_ = i; return true; }
+        }
+        return false;
     }
 
     // Generate developed thumbnail if FBO ready and params changed since show().
@@ -1100,6 +1121,7 @@ private:
 
     // Image state
     int selectedIndex_ = -1;
+    string currentId_;      // id of the shown photo (index can shift on repopulate)
     PhotoEntry::DevSnapshot openedSnapshot_; // params at show() time
     Image fullImage_;
     Pixels rawPixels_;
@@ -1124,6 +1146,7 @@ private:
     atomic<bool> rawLoadInProgress_{false};
     atomic<bool> rawLoadCompleted_{false};
     atomic<int> rawLoadTargetIndex_{-1};
+    string rawLoadTargetId_;   // photo the running full-size decode belongs to (main thread)
     Pixels pendingRawPixels_;
     mutex rawLoadMutex_;
 
@@ -1244,6 +1267,7 @@ private:
         isRawImage_ = false;
         isSmartPreview_ = false;
         selectedIndex_ = -1;
+        currentId_.clear();
         displayW_ = displayH_ = 0;
 
         hasProfileLut_ = false;
@@ -1432,7 +1456,7 @@ private:
         if (!ctx_ || selectedIndex_ < 0) return;
         if (selectedIndex_ >= (int)ctx_->grid->getPhotoIdCount()) return;
 
-        const string& photoId = ctx_->grid->getPhotoId(selectedIndex_);
+        const string& photoId = currentId_;
         auto* entry = ctx_->provider->getPhoto(photoId);
         if (!entry) return;
 

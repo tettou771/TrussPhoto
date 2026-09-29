@@ -537,6 +537,9 @@ private:
         bool any = false;
         while (loader_.tryGetResult(result)) {
             if (!result.success) continue;
+            // Index keys are reused when the strip is refilled: match the id too
+            if (result.id < 0 || result.id >= (int)photoIds_.size() ||
+                photoIds_[result.id] != result.photoId) continue;
             auto it = poolMap_.find(result.id);
             if (it == poolMap_.end()) continue;
 

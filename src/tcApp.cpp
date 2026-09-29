@@ -144,6 +144,7 @@ void tcApp::setup() {
         if (AppConfig::generateThumbnails) {
             int queued = 0;
             for (auto& [id, entry] : provider_.photos()) {
+                if (entry.isText() || entry.deletedAt > 0) continue;
                 string thumbPath = provider_.getThumbnailCachePath(id);
                 if (thumbPath.empty()) continue;
                 if (fs::exists(thumbPath)) continue;
@@ -375,17 +376,28 @@ void tcApp::setup() {
             metadataPanel_->setStyleProfileStatus(
                 viewManager_->singleView()->hasProfileFor(entry->camera, entry->creativeStyle));
             Pixels thumbPixels;
-            if (provider_.getThumbnail(photoId, thumbPixels)) {
+            if (!entry->isText() && provider_.getThumbnail(photoId, thumbPixels)) {
                 Texture tex;
                 tex.allocate(thumbPixels, TextureUsage::Immutable, false);
                 metadataPanel_->setThumbnail(std::move(tex));
+            } else {
+                metadataPanel_->clearThumbnail();
             }
         }
         redraw();
     };
     mapView->onPinDoubleClick = [this](int index, const string& photoId) {
-        viewManager_->showFullImage(index);
-        applyModeLayout();
+        (void)index;   // map list order is not guaranteed to match the grid's
+        auto* entry = provider_.getPhoto(photoId);
+        if (!entry || entry->isText()) return;
+        auto g = grid();
+        for (int i = 0; i < (int)g->getPhotoIdCount(); i++) {
+            if (g->getPhotoId(i) == photoId) {
+                viewManager_->showFullImage(i);
+                applyModeLayout();
+                break;
+            }
+        }
     };
     mapView->onRedraw = [this]() { redraw(); };
     mapView->cmdDownRef = &cmdDown_;
@@ -406,10 +418,12 @@ void tcApp::setup() {
             metadataPanel_->setStyleProfileStatus(
                 viewManager_->singleView()->hasProfileFor(entry->camera, entry->creativeStyle));
             Pixels thumbPixels;
-            if (provider_.getThumbnail(photoId, thumbPixels)) {
+            if (!entry->isText() && provider_.getThumbnail(photoId, thumbPixels)) {
                 Texture tex;
                 tex.allocate(thumbPixels, TextureUsage::Immutable, false);
                 metadataPanel_->setThumbnail(std::move(tex));
+            } else {
+                metadataPanel_->clearThumbnail();
             }
         }
         redraw();
@@ -438,10 +452,12 @@ void tcApp::setup() {
             metadataPanel_->setStyleProfileStatus(
                 viewManager_->singleView()->hasProfileFor(e->camera, e->creativeStyle));
             Pixels thumbPixels;
-            if (provider_.getThumbnail(photoId, thumbPixels)) {
+            if (!e->isText() && provider_.getThumbnail(photoId, thumbPixels)) {
                 Texture tex;
                 tex.allocate(thumbPixels, TextureUsage::Immutable, false);
                 metadataPanel_->setThumbnail(std::move(tex));
+            } else {
+                metadataPanel_->clearThumbnail();
             }
         }
         redraw();
@@ -542,6 +558,8 @@ void tcApp::setup() {
         lastClickIndex_ = index;
 
         auto g = grid();
+        auto* clicked = provider_.getPhoto(g->getPhotoId(index));
+        bool isMemo = clicked && clicked->isText();
         if (shiftDown_) {
             int anchor = g->getSelectionAnchor();
             if (anchor >= 0) {
@@ -555,7 +573,8 @@ void tcApp::setup() {
         } else if (cmdDown_) {
             g->toggleSelection(index);
             updateMetadataPanel();
-        } else if (isDoubleClick) {
+        } else if (isDoubleClick && !isMemo) {
+            // (Memo cards stay selected on double-click until a memo view exists)
             g->clearSelection();
             viewManager_->showFullImage(index);
             applyModeLayout();
@@ -590,15 +609,18 @@ void tcApp::setup() {
         logNotice() << "[Thumbnail] Queued background update: " << photoId;
     });
     gridDeleteListener_ = grid()->deleteRequested.listen([this](vector<string>& ids) {
-        int count = (int)ids.size();
-        string msg = format("Delete {} photo{}?\nThis will permanently remove the file{} from disk.",
-            count, count > 1 ? "s" : "", count > 1 ? "s" : "");
-        if (confirmDialog("Delete Photos", msg)) {
-            int deleted = provider_.deletePhotos(ids);
-            logNotice() << "[Delete] Removed " << deleted << " photos";
-            grid()->populate(provider_);
-            rebuildFolderTree();
-            redraw();
+        deleteWithConfirm(ids);
+    });
+    // A repopulate (memo toggle, sync, import) can shift grid indices under an
+    // open single view: re-find its photo, or fall back to the grid if it is gone.
+    gridPopulatedListener_ = grid()->populated.listen([this]() {
+        if (!viewManager_) return;
+        auto mode = viewMode();
+        if (mode != ViewMode::Single && mode != ViewMode::Crop) return;
+        if (!viewManager_->singleView()->reresolveIndex()) {
+            logNotice() << "[Grid] Shown photo left the grid; returning to grid view";
+            viewManager_->switchTo(ViewMode::Grid);
+            applyModeLayout();
         }
     });
     viewManager_->singleView()->onContextMenu = [this](ContextMenu::Ptr menu) {
@@ -734,6 +756,10 @@ void tcApp::setup() {
         .bind([this](const json& args) {
             string id = args.at("id").get<string>();
             string memo = args.at("memo").get<string>();
+            if (auto* e = provider_.getPhoto(id); e && e->isText()) {
+                // Re-import from the vault would silently overwrite the edit
+                return json{{"status", "error"}, {"message", "Memo text is owned by its Obsidian note"}};
+            }
             if (!provider_.setMemo(id, memo)) {
                 return json{{"status", "error"}, {"message", "Photo not found"}};
             }
@@ -746,6 +772,9 @@ void tcApp::setup() {
         .bind([this](const json& args) {
             string id = args.at("id").get<string>();
             string tags = args.at("tags").get<string>();
+            if (auto* e = provider_.getPhoto(id); e && e->isText()) {
+                return json{{"status", "error"}, {"message", "Memo tags are owned by its Obsidian note"}};
+            }
             if (!provider_.setTags(id, tags)) {
                 return json{{"status", "error"}, {"message", "Photo not found"}};
             }
@@ -817,6 +846,7 @@ void tcApp::setup() {
             provider_.rebuildTextLinks();
             provider_.embedMissingTextEntries();
             if (grid()) grid()->populate(provider_);
+            rebuildFolderTree();
             redraw();
             return json{
                 {"status", "ok"},
@@ -825,6 +855,74 @@ void tcApp::setup() {
                 {"updated", res.updated},
                 {"count", (int)provider_.getCount()}
             };
+        });
+
+    mcp::tool("set_show_text", "Show or hide memo cards in the grid")
+        .arg<bool>("show", "true to interleave memo cards with photos")
+        .bind([this](const json& args) {
+            bool show = args.at("show").get<bool>();
+            if (viewMode() != ViewMode::Grid) {
+                return json{{"status", "error"}, {"message", "Only available in the grid view"}};
+            }
+            if (auto g = grid()) {
+                g->setShowText(show);
+                g->populate(provider_);
+            }
+            redraw();
+            return json{{"status", "ok"}, {"show", show},
+                        {"gridCount", grid() ? (int)grid()->getPhotoIdCount() : 0}};
+        });
+
+    mcp::tool("search", "Run a grid search like the search bar (empty query clears it)")
+        .arg<string>("query", "Search text (no @place support here)")
+        .bind([this](const json& args) {
+            string query = args.at("query").get<string>();
+            auto g = grid();
+            if (!g) return json{{"status", "error"}, {"message", "no grid"}};
+            g->clearGeoBBox();
+            runTextSearch(g, query);
+            redraw();
+            return json{{"status", "ok"}, {"count", (int)g->getPhotoIdCount()}};
+        });
+
+    mcp::tool("get_grid", "List the grid's entries in display order (photos and memo cards)")
+        .bind([this]() {
+            json items = json::array();
+            if (auto g = grid()) {
+                for (int i = 0; i < (int)g->getPhotoIdCount(); i++) {
+                    const string& id = g->getPhotoId(i);
+                    auto* e = provider_.getPhoto(id);
+                    items.push_back({{"id", id}, {"type", e && e->isText() ? "memo" : "media"}});
+                }
+            }
+            return json{{"status", "ok"}, {"count", (int)items.size()}, {"items", items},
+                        {"showText", grid() ? grid()->isShowText() : false}};
+        });
+
+    mcp::tool("open_photo", "Open a grid entry in the single view (memos do not open)")
+        .arg<string>("id", "Entry id as listed by get_grid")
+        .bind([this](const json& args) {
+            string id = args.at("id").get<string>();
+            auto g = grid();
+            int index = -1;
+            for (int i = 0; g && i < (int)g->getPhotoIdCount(); i++) {
+                if (g->getPhotoId(i) == id) { index = i; break; }
+            }
+            if (index >= 0) {
+                viewManager_->showFullImage(index);
+                applyModeLayout();
+                redraw();
+            }
+            bool single = viewMode() == ViewMode::Single;
+            return json{{"status", index >= 0 ? "ok" : "not_found"}, {"single", single},
+                        {"current", single ? viewManager_->singleView()->currentPhotoId() : ""}};
+        });
+
+    mcp::tool("get_text_links", "List memo -> photo links (derived from capture time)")
+        .bind([this]() {
+            json links = json::object();
+            for (const auto& [tid, pids] : provider_.textLinks()) links[tid] = pids;
+            return json{{"status", "ok"}, {"count", (int)links.size()}, {"links", links}};
         });
 
     // 9. CLIP embedder (async: downloads model in background if needed)
@@ -947,7 +1045,8 @@ void tcApp::update() {
 
         auto g = grid();
         if (provider_.getCount() > 0 && g->getItemCount() != provider_.getCount()) {
-            g->populate(provider_);
+            provider_.rebuildTextLinks();   // pulled rows may be memos or their photos
+            g->populate(provider_, true);
             rebuildFolderTree();
             redraw();
         }
@@ -976,6 +1075,12 @@ void tcApp::update() {
 
     // Process EXIF backfill results
     provider_.processExifBackfillResults();
+    if (provider_.consumeExifTimesChanged()) {
+        // Capture times / offsets arrived late: memo links and card positions move
+        provider_.rebuildTextLinks();
+        if (auto g = grid()) g->populate(provider_, true);
+        redraw();
+    }
 
     // Process WB backfill results
     provider_.processWbBackfillResults();
@@ -1345,7 +1450,7 @@ void tcApp::keyPressed(int key) {
             vector<string> gpsIds;
             for (auto& id : allSelected) {
                 auto* e = provider_.getPhoto(id);
-                if (e && e->hasGps()) gpsIds.push_back(id);
+                if (e && e->hasGps() && !e->isText()) gpsIds.push_back(id);
             }
             if (!gpsIds.empty()) {
                 int n = (int)gpsIds.size();
@@ -1404,7 +1509,9 @@ void tcApp::keyPressed(int key) {
         } else if (key == 'V' || key == 'v') {
             if (g->getSelectionCount() == 1) {
                 auto ids = g->getSelectedIds();
-                if (!ids.empty() && provider_.getCachedEmbedding(ids[0])) {
+                auto* sel = ids.empty() ? nullptr : provider_.getPhoto(ids[0]);
+                // Related view centres on photos only (memos have text embeddings)
+                if (sel && !sel->isText() && provider_.getCachedEmbedding(ids[0])) {
                     viewManager_->relatedView()->setCenter(ids[0], provider_);
                     viewManager_->switchTo(ViewMode::Related);
                     if (metadataPanel_) {
@@ -1418,11 +1525,17 @@ void tcApp::keyPressed(int key) {
                     applyModeLayout();
                 }
             }
+        } else if (key == 'N' || key == 'n') {
+            // N: show / hide memo (note) cards in the grid
+            g->setShowText(!g->isShowText());
+            g->populate(provider_);
+            logNotice() << "[Grid] Memo cards " << (g->isShowText() ? "shown" : "hidden");
         } else if (key == 'D' || key == 'd') {
             // D key: open selected photo in single (develop) view
             if (g->getSelectionCount() == 1) {
                 auto ids = g->getSelectedIds();
-                if (!ids.empty()) {
+                auto* sel = ids.empty() ? nullptr : provider_.getPhoto(ids[0]);
+                if (sel && !sel->isText()) {
                     for (int i = 0; i < (int)g->getPhotoIdCount(); i++) {
                         if (g->getPhotoId(i) == ids[0]) {
                             g->clearSelection();
@@ -1501,16 +1614,20 @@ void tcApp::keyPressed(int key) {
             vector<PhotoEntry> photos;
             for (size_t i = 0; i < g->getPhotoIdCount(); i++) {
                 const string& id = g->getPhotoId((int)i);
-                ids.push_back(id);
                 auto* e = provider_.getPhoto(id);
+                if (e && e->isText() && !e->hasGps()) continue;   // nothing to place on a map
+                ids.push_back(id);
                 if (e) photos.push_back(*e);
                 else photos.push_back(PhotoEntry{});
             }
-            // Also drop pins for text (memo) entries that carry GPS
-            for (auto& [tid, te] : provider_.photos()) {
-                if (te.isText() && te.hasGps() && te.deletedAt == 0) {
-                    ids.push_back(tid);
-                    photos.push_back(te);
+            // GPS memos the grid does not already carry (hidden cards, filters)
+            {
+                unordered_set<string> inGrid(ids.begin(), ids.end());
+                for (auto& [tid, te] : provider_.photos()) {
+                    if (te.isText() && te.hasGps() && te.deletedAt == 0 && !inGrid.count(tid)) {
+                        ids.push_back(tid);
+                        photos.push_back(te);
+                    }
                 }
             }
             mapView->setPhotos(photos, ids, provider_);
@@ -1528,9 +1645,8 @@ void tcApp::keyPressed(int key) {
             viewManager_->switchTo(ViewMode::Map);
 
             // Center on focus photo at zoom 14, or fit all bounds
-            if (!focusPhotoId.empty()) {
-                mapView->centerOnPhoto(focusPhotoId);
-            } else {
+            // (e.g. the focus is a memo without GPS)
+            if (focusPhotoId.empty() || !mapView->centerOnPhoto(focusPhotoId)) {
                 mapView->fitBounds();
             }
 
@@ -1712,16 +1828,20 @@ void tcApp::filesDropped(const vector<string>& files) {
             vector<PhotoEntry> photos;
             for (size_t i = 0; i < g->getPhotoIdCount(); i++) {
                 const string& id = g->getPhotoId((int)i);
-                ids.push_back(id);
                 auto* e = provider_.getPhoto(id);
+                if (e && e->isText() && !e->hasGps()) continue;   // nothing to place on a map
+                ids.push_back(id);
                 if (e) photos.push_back(*e);
                 else photos.push_back(PhotoEntry{});
             }
-            // Also drop pins for text (memo) entries that carry GPS
-            for (auto& [tid, te] : provider_.photos()) {
-                if (te.isText() && te.hasGps() && te.deletedAt == 0) {
-                    ids.push_back(tid);
-                    photos.push_back(te);
+            // GPS memos the grid does not already carry (hidden cards, filters)
+            {
+                unordered_set<string> inGrid(ids.begin(), ids.end());
+                for (auto& [tid, te] : provider_.photos()) {
+                    if (te.isText() && te.hasGps() && te.deletedAt == 0 && !inGrid.count(tid)) {
+                        ids.push_back(tid);
+                        photos.push_back(te);
+                    }
                 }
             }
             mapView->setPhotos(photos, ids, provider_);
@@ -1753,6 +1873,7 @@ void tcApp::filesDropped(const vector<string>& files) {
     }
 
     if (added) {
+        provider_.rebuildTextLinks();   // new photos may sit next to existing memos
         grid()->populate(provider_);
         rebuildFolderTree();
         redraw();
@@ -1922,19 +2043,36 @@ void tcApp::deleteSelectedPhotos() {
     auto g = grid();
     if (!g || !g->hasSelection()) return;
 
-    auto selectedIds = g->getSelectedIds();
-    int count = (int)selectedIds.size();
+    deleteWithConfirm(g->getSelectedIds());
+}
 
-    string msg = format("Delete {} photo{}?\nThis will permanently remove the file{} from disk.",
-        count, count > 1 ? "s" : "", count > 1 ? "s" : "");
+// Photos are deleted from disk; memos are only removed from the catalog
+// (their Obsidian notes are never touched).
+void tcApp::deleteWithConfirm(const vector<string>& ids) {
+    if (ids.empty()) return;
+    int memos = 0;
+    for (const auto& id : ids) {
+        if (auto* e = provider_.getPhoto(id); e && e->isText()) memos++;
+    }
+    int media = (int)ids.size() - memos;
+    string msg;
+    if (media == 0) {
+        msg = format("Remove {} memo{} from the catalog?\nThe Obsidian note{} will be kept.",
+            memos, memos > 1 ? "s" : "", memos > 1 ? "s" : "");
+    } else {
+        msg = format("Delete {} photo{}?\nThis will permanently remove the file{} from disk.",
+            media, media > 1 ? "s" : "", media > 1 ? "s" : "");
+        if (memos > 0) {
+            msg += format("\n{} memo{} will be removed from the catalog (notes are kept).",
+                memos, memos > 1 ? "s" : "");
+        }
+    }
+    if (!confirmDialog(media == 0 ? "Remove Memos" : "Delete Photos", msg)) return;
 
-    bool ok = confirmDialog("Delete Photos", msg);
-    if (!ok) return;
-
-    int deleted = provider_.deletePhotos(selectedIds);
-    logNotice() << "[Delete] Removed " << deleted << " photos";
-
-    g->populate(provider_);
+    int deleted = provider_.deletePhotos(ids);
+    logNotice() << "[Delete] Removed " << deleted << " entries";
+    provider_.rebuildTextLinks();
+    if (auto g = grid()) g->populate(provider_);
     rebuildFolderTree();
     redraw();
 }
@@ -2109,15 +2247,29 @@ void tcApp::runTextSearch(PhotoGrid::Ptr g, const string& query) {
         auto textMatches = provider_.searchByTextFields(query);
         int textCount = 0;
         if (!textMatches.empty()) {
-            unordered_set<string> clipIds;
-            for (const auto& r : results) clipIds.insert(r.photoId);
             float boostScore = results.empty() ? 1.0f : results.front().score + 0.01f;
+            // Text hits lead the results in grid order (newest first), so a memo
+            // card lands next to the photo it describes — even when that photo
+            // is also a CLIP hit (it moves up out of the CLIP ranking).
+            vector<string> prefix;
+            unordered_set<string> inPrefix;
             for (const auto& id : textMatches) {
-                if (!clipIds.count(id)) {
-                    results.insert(results.begin(), {id, boostScore});
-                    textCount++;
-                }
+                if (inPrefix.insert(id).second) prefix.push_back(id);
             }
+            results.erase(remove_if(results.begin(), results.end(),
+                              [&](const PhotoProvider::SearchResult& r) { return inPrefix.count(r.photoId) > 0; }),
+                          results.end());
+            auto key = [this](const string& id) -> string {
+                auto* e = provider_.getPhoto(id);
+                if (!e) return "";
+                return e->isText() ? provider_.textSortKey(*e) : e->dateTimeOriginal;
+            };
+            stable_sort(prefix.begin(), prefix.end(),
+                        [&](const string& a, const string& b) { return key(a) > key(b); });
+            vector<PhotoProvider::SearchResult> head;
+            for (const auto& id : prefix) head.push_back({id, boostScore});
+            results.insert(results.begin(), head.begin(), head.end());
+            textCount = (int)prefix.size();
         }
 
         g->clearClipResults();

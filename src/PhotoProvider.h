@@ -159,6 +159,8 @@ public:
         for (auto& [id, photo] : photos_) {
             // ServerOnly has no local file by design
             if (photo.syncState == SyncState::ServerOnly) continue;
+            // Memo rows carry their own content; the vault .md is only the import source
+            if (photo.isText()) continue;
 
             if (photo.localPath.empty() || !fs::exists(photo.localPath)) {
                 if (photo.syncState == SyncState::Synced) {
@@ -246,6 +248,7 @@ public:
     int refreshCreativeStyles() {
         int updated = 0;
         for (auto& [id, photo] : photos_) {
+            if (photo.isText()) continue;   // no EXIF in a .md
             if (!photo.creativeStyle.empty()) continue;
             if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
 
@@ -532,6 +535,7 @@ public:
         if (haveServerIds) {
             for (auto& [id, photo] : photos_) {
                 if (photo.deletedAt > 0) continue; // never touch/resurrect tombstones
+                if (photo.isText()) continue;      // memos have no original to be present
                 if (serverIds.count(id)) {
                     if (photo.syncState == SyncState::LocalOnly) {
                         photo.syncState = SyncState::Synced;
@@ -647,6 +651,7 @@ public:
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
         auto& photo = it->second;
+        if (photo.isText()) return false;   // memos have no image (localPath is a .md)
 
         // Restore Missing → LocalOnly if file is now accessible
         if (photo.syncState == SyncState::Missing &&
@@ -1194,7 +1199,9 @@ public:
             // In server mode, refuse to delete originals for safety
             if (AppConfig::serverMode) {
                 logWarning() << "[Delete] Skipping original file in server mode: " << photo.localPath;
-            } else if (photo.isManaged && !photo.localPath.empty() && fs::exists(photo.localPath)) {
+            } else if (photo.isManaged && !photo.isText() &&
+                       !photo.localPath.empty() && fs::exists(photo.localPath)) {
+                // (Memos are never removed from the vault; the row is only tombstoned.)
                 // Delete XMP sidecar
                 string xmpPath = xmpWritePath(photo.localPath);
                 if (!xmpPath.empty() && fs::exists(xmpPath)) {
@@ -1254,6 +1261,7 @@ public:
         unordered_map<GroupKey, vector<string>, GroupKeyHash> groups;
 
         for (auto& [id, photo] : photos_) {
+            if (photo.isText()) continue;   // memos never stack with media
             if (photo.localPath.empty()) continue;
             fs::path p(photo.localPath);
             string dir = p.parent_path().string();
@@ -1358,21 +1366,26 @@ public:
 
     // Get sorted photo list (by dateTimeOriginal descending, newest first)
     // Stacked non-primary entries are excluded from the result
-    vector<string> getSortedIds() const {
+    // Grid order, newest first. Text (memo) entries are included on request and
+    // sorted by textSortKey() so each card sits among the photos shot at the
+    // same moment.
+    vector<string> getSortedIds(bool includeText = false) const {
         vector<string> ids;
         ids.reserve(photos_.size());
         for (const auto& [id, photo] : photos_) {
-            // Text entries are never shown as grid tiles (surfaced via linked photos)
-            if (photo.isText()) continue;
+            if (photo.isText() && !includeText) continue;
             // Filter out tombstoned (deleted) entries
             if (photo.deletedAt > 0) continue;
             // Filter out non-primary stacked entries
             if (!photo.stackId.empty() && !photo.stackPrimary) continue;
             ids.push_back(id);
         }
-        sort(ids.begin(), ids.end(), [this](const string& a, const string& b) {
-            const auto& da = photos_.at(a).dateTimeOriginal;
-            const auto& db = photos_.at(b).dateTimeOriginal;
+        auto key = [this](const PhotoEntry& e) -> const string& {
+            return e.isText() ? textSortKey(e) : e.dateTimeOriginal;
+        };
+        sort(ids.begin(), ids.end(), [this, &key](const string& a, const string& b) {
+            const auto& da = key(photos_.at(a));
+            const auto& db = key(photos_.at(b));
             // Empty dates sort to end
             if (da.empty() != db.empty()) return !da.empty();
             if (da != db) return da > db;  // newest first
@@ -1386,6 +1399,7 @@ public:
         vector<pair<string, string>> result;
         for (const auto& [id, photo] : photos_) {
             if (photo.deletedAt > 0) continue;
+            if (photo.isText()) continue;   // memo content syncs in the row, not as an upload
             if (photo.syncState == SyncState::LocalOnly && !photo.localPath.empty()) {
                 result.push_back({id, photo.localPath});
             }
@@ -1430,13 +1444,57 @@ public:
 
     // --- Text entries (Obsidian memos) ---
 
-    // Find an existing text entry by filename. Matching is by filename (not id)
-    // because Obsidian edits change the file size, and id embeds the size.
-    PhotoEntry* findTextEntryByFilename(const string& filename) {
+    // Existing memo row for a vault note, in order of confidence:
+    //  1. the same path (also through a symlink / different spelling)
+    //  2. the same filename on a row whose file is not on this machine (synced
+    //     from a peer, or the vault moved) — preferring the same created instant
+    //  3. a row whose file vanished and that has the same created instant
+    //     (the note was renamed in Obsidian)
+    // Notes that merely share a name with a live note elsewhere stay separate.
+    PhotoEntry* findTextEntry(const string& path, const string& filename, int64_t createdUtc) {
+        PhotoEntry* byName = nullptr;
+        PhotoEntry* byNameSameTime = nullptr;
+        PhotoEntry* renamed = nullptr;
         for (auto& [id, e] : photos_) {
-            if (e.isText() && e.filename == filename) return &e;
+            if (!e.isText()) continue;
+            if (e.localPath == path) return &e;
+            bool gone = e.localPath.empty() || !fs::exists(e.localPath);
+            if (e.filename == filename) {
+                error_code ec;
+                if (!gone && fs::equivalent(e.localPath, path, ec)) return &e;
+                if (gone) {
+                    if (e.captureEpochUtc() == createdUtc) byNameSameTime = &e;
+                    else if (!byName) byName = &e;
+                }
+            } else if (gone && !e.localPath.empty() && !renamed &&
+                       e.captureEpochUtc() == createdUtc) {
+                renamed = &e;
+            }
         }
-        return nullptr;
+        if (byNameSameTime) return byNameSameTime;
+        if (byName) return byName;
+        return renamed;
+    }
+
+    // After an import: memo rows whose note lived under one of `roots` but was
+    // not seen (deleted or moved out in Obsidian) are marked Missing, so their
+    // cards show it. Rows synced from peers (empty path) are left alone.
+    int markMissingTextEntries(const unordered_set<string>& seen, const vector<string>& roots) {
+        int n = 0;
+        for (auto& [id, e] : photos_) {
+            if (!e.isText() || e.deletedAt > 0 || e.localPath.empty()) continue;
+            if (e.syncState == SyncState::Missing || seen.count(e.localPath)) continue;
+            bool underRoot = false;
+            for (const auto& r : roots) {
+                string prefix = r.back() == '/' ? r : r + "/";
+                if (e.localPath.compare(0, prefix.size(), prefix) == 0) { underRoot = true; break; }
+            }
+            if (!underRoot || fs::exists(e.localPath)) continue;
+            e.syncState = SyncState::Missing;
+            db_.updateSyncState(id, e.syncState);
+            n++;
+        }
+        return n;
     }
 
     // Insert a brand-new text entry (no EXIF/XMP; localPath = vault .md path).
@@ -1452,56 +1510,145 @@ public:
     // and read-only for us). Returns true if any field changed.
     bool updateTextEntryContent(PhotoEntry& e, const string& memo, const string& tags,
                                 double lat, double lon, const string& dateTime,
-                                const string& localPath) {
+                                const string& offsetTime, const string& localPath) {
+        string filename = fs::path(localPath).filename().string();
         bool changed = (e.memo != memo) || (e.tags != tags) ||
                        (e.latitude != lat) || (e.longitude != lon) ||
-                       (e.dateTimeOriginal != dateTime) || (e.localPath != localPath);
+                       (e.dateTimeOriginal != dateTime) || (e.offsetTime != offsetTime) ||
+                       (e.localPath != localPath) || (e.filename != filename) ||
+                       (e.syncState == SyncState::Missing);
         auto ts = nowMs();
         if (e.memo != memo) { e.memo = memo; e.memoUpdatedAt = ts; }
         if (e.tags != tags) { e.tags = tags; e.tagsUpdatedAt = ts; }
         e.latitude = lat;
         e.longitude = lon;
         e.dateTimeOriginal = dateTime;
+        e.offsetTime = offsetTime;
         e.localPath = localPath;
+        e.filename = filename;   // a renamed note keeps its row
+        if (e.syncState == SyncState::Missing) e.syncState = SyncState::LocalOnly;   // note is back
         if (changed) db_.updatePhoto(e);
         return changed;
     }
 
     // --- Photo <-> Text links (derived, in-memory; not persisted) ---
 
-    // Rebuild links: each text entry is linked to media entries taken within
-    // ±30 min. If both carry GPS and are >2 km apart, the pair is excluded.
+    // Rebuild links: each text entry is linked to the single media entry taken
+    // closest in time within ±30 min. Candidates >2 km away are skipped when
+    // both sides carry GPS. A hidden stack companion resolves to its stack's
+    // primary so the link lands on a visible tile. Diary entries (tag "diary")
+    // are journal text, not photo captions, and are never linked.
+    //
+    // Time frames: a photo with an EXIF offset is compared in UTC. A photo
+    // without one only has a wall clock, compared against the memo's wall clock
+    // twice — assuming the camera was set to the memo's local time, and to this
+    // machine's zone (the old behaviour) — and the closer reading wins.
+    //
+    // Also derives each text's grid sort key, expressed on the wall clock the
+    // photos around it are sorted by: the linked photo's clock when linked,
+    // otherwise the nearest offset-bearing photo's (within 12 h), otherwise the
+    // memo's own local time.
     void rebuildTextLinks() {
         linkedTexts_.clear();
         linkedPhotos_.clear();
-        // Snapshot media entries with a parseable timestamp once.
-        struct M { const string* id; int64_t t; const PhotoEntry* e; };
-        vector<M> media;
-        media.reserve(photos_.size());
+        textSortKeys_.clear();
+
+        auto wallOf = [](const string& dt) -> int64_t {
+            tm t = {};
+            if (!PhotoEntry::parseDateTimeFields(dt, t)) return 0;
+            return (int64_t)timegm(&t);
+        };
+        auto formatWall = [](int64_t wall) {
+            time_t w = (time_t)wall;
+            tm g{};
+            gmtime_r(&w, &g);
+            char buf[20];
+            strftime(buf, sizeof(buf), "%Y:%m:%d %H:%M:%S", &g);
+            return string(buf);
+        };
+
+        // t: UTC instant (withOffset) or naive wall clock (noOffset)
+        struct M { int64_t t; int64_t wall; const string* id; const PhotoEntry* e; };
+        vector<M> withOffset, noOffset;
         for (auto& [pid, pent] : photos_) {
-            if (pent.isText()) continue;
-            int64_t pt = PhotoEntry::parseDateTimeOriginal(pent.dateTimeOriginal);
-            if (pt == 0) continue;
-            media.push_back({&pid, pt, &pent});
+            if (pent.isText() || pent.deletedAt > 0) continue;
+            int64_t wall = wallOf(pent.dateTimeOriginal);
+            if (wall == 0) continue;
+            int off = 0;
+            if (PhotoEntry::parseUtcOffset(pent.offsetTime, off)) withOffset.push_back({wall - off, wall, &pid, &pent});
+            else noOffset.push_back({wall, wall, &pid, &pent});
         }
+        auto byT = [](const M& a, const M& b) { return a.t < b.t; };
+        sort(withOffset.begin(), withOffset.end(), byT);
+        sort(noOffset.begin(), noOffset.end(), byT);
+
+        constexpr int64_t WINDOW_SEC = 1800;   // ±30 min
+        constexpr double MAX_DIST_KM = 2.0;    // farther apart -> not the same moment
+        constexpr int64_t FRAME_SEC = 12 * 3600;
+
         int linked = 0;
         for (auto& [tid, tent] : photos_) {
-            if (!tent.isText()) continue;
-            int64_t tt = PhotoEntry::parseDateTimeOriginal(tent.dateTimeOriginal);
-            if (tt == 0) continue;
-            bool any = false;
-            for (const auto& m : media) {
-                if (llabs(m.t - tt) > 1800) continue;  // ±30 min
-                if (tent.hasGps() && m.e->hasGps()) {
-                    double d = haversine(tent.latitude, tent.longitude,
-                                         m.e->latitude, m.e->longitude);
-                    if (d > 2.0) continue;             // >2 km apart -> not the same moment
+            if (!tent.isText() || tent.deletedAt > 0) continue;
+            int64_t tUtc = tent.captureEpochUtc();
+            int64_t tWall = wallOf(tent.dateTimeOriginal);   // memo's local wall clock
+            if (tUtc == 0 || tWall == 0) continue;
+            // The same instant on this machine's wall clock
+            time_t u = (time_t)tUtc;
+            tm lt{};
+            localtime_r(&u, &lt);
+            int64_t tMachineWall = (int64_t)tUtc + lt.tm_gmtoff;
+
+            const M* best = nullptr;
+            int64_t bestDt = 0, bestDelta = 0;   // delta: memo time - photo time, in its frame
+            auto consider = [&](const vector<M>& v, int64_t target) {
+                auto it = lower_bound(v.begin(), v.end(), target - WINDOW_SEC,
+                                      [](const M& m, int64_t t) { return m.t < t; });
+                for (; it != v.end() && it->t <= target + WINDOW_SEC; ++it) {
+                    if (tent.hasGps() && it->e->hasGps() &&
+                        haversine(tent.latitude, tent.longitude,
+                                  it->e->latitude, it->e->longitude) > MAX_DIST_KM) {
+                        continue;
+                    }
+                    int64_t dt = llabs(it->t - target);
+                    // Ties go to the earlier shot: memos are usually written after.
+                    if (!best || dt < bestDt) { best = &*it; bestDt = dt; bestDelta = target - it->t; }
                 }
-                linkedTexts_[*m.id].push_back(tid);
-                linkedPhotos_[tid].push_back(*m.id);
-                any = true;
+            };
+            if (!tent.hasTag("diary")) {
+                consider(withOffset, tUtc);
+                consider(noOffset, tWall);
+                if (tMachineWall != tWall) consider(noOffset, tMachineWall);
             }
-            if (any) linked++;
+
+            if (best) {
+                string target = *best->id;
+                if (!best->e->stackPrimary && !best->e->stackId.empty()) {
+                    auto sit = stackIndex_.find(best->e->stackId);
+                    if (sit != stackIndex_.end()) {
+                        for (const auto& mid : sit->second) {
+                            auto pit = photos_.find(mid);
+                            if (pit != photos_.end() && pit->second.stackPrimary) { target = mid; break; }
+                        }
+                    }
+                }
+                linkedTexts_[target].push_back(tid);
+                linkedPhotos_[tid].push_back(target);
+                linked++;
+                // Beside its photo: the photo's wall clock shifted by the memo's delay
+                textSortKeys_[tid] = formatWall(best->wall + bestDelta);
+                continue;
+            }
+
+            // Unlinked: nearest offset-bearing photo's clock, if one is close
+            auto oit = lower_bound(withOffset.begin(), withOffset.end(), tUtc,
+                                   [](const M& m, int64_t t) { return m.t < t; });
+            const M* frame = nullptr;
+            if (oit != withOffset.end()) frame = &*oit;
+            if (oit != withOffset.begin() &&
+                (!frame || tUtc - prev(oit)->t < frame->t - tUtc)) frame = &*prev(oit);
+            if (frame && llabs(frame->t - tUtc) <= FRAME_SEC) {
+                textSortKeys_[tid] = formatWall(frame->wall + (tUtc - frame->t));
+            }
         }
         logNotice() << "[TextLinks] " << linked << " texts linked to photos";
     }
@@ -1513,6 +1660,17 @@ public:
     }
 
     // Photos linked to a text (nullptr if none)
+    // Sort key for a text entry in the grid: its instant expressed on the wall
+    // clock of the photos around it (see rebuildTextLinks). Falls back to the
+    // memo's own local time.
+    const string& textSortKey(const PhotoEntry& e) const {
+        auto it = textSortKeys_.find(e.id);
+        return it != textSortKeys_.end() ? it->second : e.dateTimeOriginal;
+    }
+
+    // All text -> photo links (derived; for MCP/tests)
+    const unordered_map<string, vector<string>>& textLinks() const { return linkedPhotos_; }
+
     const vector<string>* getLinkedPhotos(const string& textId) const {
         auto it = linkedPhotos_.find(textId);
         return it != linkedPhotos_.end() ? &it->second : nullptr;
@@ -1643,19 +1801,18 @@ public:
 
         vector<string> result;
         unordered_set<string> seen;
-        // Emit a photo id once. Text-entry matches are promoted to their linked
-        // photos (an unlinked text hit surfaces only on the map, not the grid).
+        // Emit an id once. A memo hit emits the memo card and its linked photo.
         auto emit = [&](const PhotoEntry& photo, const string& id) {
+            if (seen.insert(id).second) result.push_back(id);
             if (photo.isText()) {
                 auto lp = linkedPhotos_.find(id);
                 if (lp == linkedPhotos_.end()) return;
                 for (const auto& pid : lp->second)
                     if (seen.insert(pid).second) result.push_back(pid);
-            } else {
-                if (seen.insert(id).second) result.push_back(id);
             }
         };
         for (const auto& [id, photo] : photos_) {
+            if (photo.deletedAt > 0) continue;
             if (contains(fs::path(photo.filename).stem().string()) ||
                 contains(photo.camera) || contains(photo.cameraMake) ||
                 contains(photo.lens) || contains(photo.lensMake) ||
@@ -2165,7 +2322,7 @@ public:
             auto it = photos_.find(id);
             if (it == photos_.end()) continue;
             auto& photo = it->second;
-            if (photo.isVideo) continue;
+            if (photo.isVideo || photo.isText()) continue;
             if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) continue;
             if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
             pendingSPGenerations_.push_back(id);
@@ -2179,7 +2336,7 @@ public:
         {
             lock_guard<mutex> lock(photosMutex_);
             for (const auto& [id, photo] : photos_) {
-                if (photo.isVideo) continue;
+                if (photo.isVideo || photo.isText()) continue;
                 if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) continue;
                 if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
                 ids.push_back(id);
@@ -2241,6 +2398,7 @@ public:
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
         const auto& photo = it->second;
+        if (photo.isText()) return false;
         if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath))
             return true;
         bool noLocalOriginal = photo.localPath.empty() || !fs::exists(photo.localPath);
@@ -2254,6 +2412,7 @@ public:
         auto it = photos_.find(id);
         if (it == photos_.end()) return false;
         auto& photo = it->second;
+        if (photo.isText()) return false;
 
         // 1. Local smart preview
         if (!photo.localSmartPreviewPath.empty() && fs::exists(photo.localSmartPreviewPath)) {
@@ -2328,6 +2487,10 @@ public:
         {
             lock_guard<mutex> lock(photosMutex_);
             auto existing = photos_.find(id);
+            if (existing != photos_.end() && existing->second.isText()) {
+                outError = "text entry has no original";
+                return false;
+            }
             if (existing != photos_.end() &&
                 !existing->second.localPath.empty() && fs::exists(existing->second.localPath)) {
                 if (outEntry) *outEntry = existing->second;
@@ -2448,7 +2611,7 @@ public:
         vector<pair<PhotoEntry, string>> out;
         lock_guard<mutex> lock(photosMutex_);
         for (auto& [id, entry] : photos_) {
-            if (entry.isVideo) continue;
+            if (entry.isVideo || entry.isText() || entry.deletedAt > 0) continue;
             if (entry.localPath.empty() || !fs::exists(entry.localPath)) continue;
             string thumbPath = getThumbnailCachePath(id);
             if (thumbPath.empty() || fs::exists(thumbPath)) continue;
@@ -2509,6 +2672,7 @@ public:
         if (exifBackfillRunning_) return 0;
         vector<string> ids;
         for (const auto& [id, photo] : photos_) {
+            if (photo.isText()) continue;  // memos have no EXIF (localPath is a .md)
             if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
             // Queue if v9 fields are all at defaults (never extracted)
             bool needsV9 = photo.lensCorrectionParams.empty() &&
@@ -2529,6 +2693,14 @@ public:
         return (int)ids.size();
     }
 
+    // True once per finished EXIF backfill that changed capture times or
+    // offsets: memo links and grid positions derive from them.
+    bool consumeExifTimesChanged() {
+        if (exifBackfillRunning_ || !exifTimesChanged_) return false;
+        exifTimesChanged_ = false;
+        return true;
+    }
+
     void processExifBackfillResults() {
         lock_guard<mutex> lock(exifBackfillMutex_);
         for (const auto& result : completedExifBackfills_) {
@@ -2546,8 +2718,12 @@ public:
             if (photo.focalLength == 0 && r.focalLength > 0) photo.focalLength = r.focalLength;
             if (photo.aperture == 0 && r.aperture > 0) photo.aperture = r.aperture;
             if (photo.iso == 0 && r.iso > 0) photo.iso = r.iso;
-            if (photo.dateTimeOriginal.empty() && !r.dateTimeOriginal.empty()) photo.dateTimeOriginal = r.dateTimeOriginal;
+            if (photo.dateTimeOriginal.empty() && !r.dateTimeOriginal.empty()) {
+                photo.dateTimeOriginal = r.dateTimeOriginal;
+                exifTimesChanged_ = true;
+            }
             if (photo.creativeStyle.empty() && !r.creativeStyle.empty()) photo.creativeStyle = r.creativeStyle;
+            if (photo.offsetTime != r.offsetTime) exifTimesChanged_ = true;
 
             // v9 fields: always overwrite (backfill is the authority)
             photo.lensCorrectionParams = r.lensCorrectionParams;
@@ -2703,7 +2879,7 @@ public:
         if (!textEncoder_.isReady()) return 0;
         int n = 0;
         for (auto& [id, photo] : photos_) {
-            if (!photo.isText() || photo.memo.empty()) continue;
+            if (!photo.isText() || photo.memo.empty() || photo.deletedAt > 0) continue;
             if (db_.hasEmbedding(id, clipEmbedder_.MODEL_NAME, "text")) continue;
             if (embedTextEntry(id)) n++;
         }
@@ -2730,6 +2906,9 @@ public:
         vector<SearchResult> results;
         for (const auto& [otherId, otherEmb] : embeddingCache_) {
             if (otherId == id) continue;
+            // Media only: memo text embeddings share the space but are not "related photos"
+            if (auto pit = photos_.find(otherId);
+                pit != photos_.end() && (pit->second.isText() || pit->second.deletedAt > 0)) continue;
             float score = cosineSimilarity(*ref, otherEmb);
             results.push_back({otherId, score});
         }
@@ -2763,7 +2942,7 @@ public:
 
         vector<pair<string, double>> nearby;
         for (const auto& [otherId, entry] : photos_) {
-            if (otherId == id || !entry.hasGps()) continue;
+            if (otherId == id || !entry.hasGps() || entry.isText() || entry.deletedAt > 0) continue;
             double dist = haversine(ref.latitude, ref.longitude,
                                     entry.latitude, entry.longitude);
             if (dist <= maxKm) {
@@ -2922,6 +3101,7 @@ public:
         fs::path libPath = fs::path(rawStoragePath_);
 
         for (auto& [id, photo] : photos_) {
+            if (photo.isText()) continue;   // never move Obsidian notes out of the vault
             if (photo.localPath.empty() || !fs::exists(photo.localPath)) continue;
 
             // Re-extract EXIF if dateTimeOriginal is missing
@@ -3218,6 +3398,7 @@ private:
     mutable mutex exifBackfillMutex_;
     vector<ExifBackfillResult> completedExifBackfills_;
     atomic<bool> exifBackfillRunning_{false};
+    bool exifTimesChanged_ = false;   // main thread only
     thread exifBackfillThread_;
     static constexpr int EXIF_BACKFILL_WORKERS = 2;
 
@@ -3236,6 +3417,7 @@ private:
     // Derived photo<->text links (rebuilt on load + after import; not persisted)
     unordered_map<string, vector<string>> linkedTexts_;   // photoId -> textIds
     unordered_map<string, vector<string>> linkedPhotos_;  // textId  -> photoIds
+    unordered_map<string, string> textSortKeys_;          // textId  -> grid sort key
 
     // Face name cache (photo_id -> person names)
     unordered_map<string, vector<string>> faceNameCache_;
@@ -3976,7 +4158,10 @@ private:
                 auto fl35It = exif.findKey(Exiv2::ExifKey("Exif.Photo.FocalLengthIn35mmFilm"));
                 if (fl35It != exif.end()) photo.focalLength35mm = (int)fl35It->toInt64();
 
-                photo.offsetTime = getString("Exif.Photo.OffsetTime");
+                // Offset of DateTimeOriginal (Digitized as fallback). Not OffsetTime:
+                // it pairs with the last-modified time and DNG converters stamp it.
+                photo.offsetTime = getString("Exif.Photo.OffsetTimeOriginal");
+                if (photo.offsetTime.empty()) photo.offsetTime = getString("Exif.Photo.OffsetTimeDigitized");
                 photo.bodySerial = getString("Exif.Photo.BodySerialNumber");
                 photo.lensSerial = getString("Exif.Photo.LensSerialNumber");
                 photo.subjectDistance = getFloat("Exif.Photo.SubjectDistance");
@@ -4763,7 +4948,10 @@ private:
                         temp.whiteBalance = getString("Exif.Photo.WhiteBalance");
                         auto fl35It = exif.findKey(Exiv2::ExifKey("Exif.Photo.FocalLengthIn35mmFilm"));
                         if (fl35It != exif.end()) temp.focalLength35mm = (int)fl35It->toInt64();
-                        temp.offsetTime = getString("Exif.Photo.OffsetTime");
+                        // Offset of DateTimeOriginal (Digitized as fallback). Not OffsetTime:
+                        // it pairs with the last-modified time and DNG converters stamp it.
+                        temp.offsetTime = getString("Exif.Photo.OffsetTimeOriginal");
+                        if (temp.offsetTime.empty()) temp.offsetTime = getString("Exif.Photo.OffsetTimeDigitized");
                         temp.bodySerial = getString("Exif.Photo.BodySerialNumber");
                         temp.lensSerial = getString("Exif.Photo.LensSerialNumber");
                         temp.subjectDistance = getFloat("Exif.Photo.SubjectDistance");

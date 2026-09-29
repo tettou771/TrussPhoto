@@ -26,6 +26,7 @@ public:
     Event<void> repairRequested;
     Event<void> consolidateRequested;
     Event<string> updateThumbnailRequested;
+    Event<void> populated;   // fired after populate(): indices may have shifted
 
     PhotoGrid() {
         itemWidth_ = 140;
@@ -35,6 +36,17 @@ public:
 
         // Font for labels
         loadJapaneseFont(labelFont_, 12);
+
+        // Font for memo-card bodies (wrapped, Japanese line-break rules)
+        loadJapaneseFont(cardFont_, 11);
+        cardFont_.enableWrap(true);
+        cardFont_.setKinsoku(KinsokuLevel::Standard);
+
+        // Hover bubble text, wrapped to the bubble's inner width
+        loadJapaneseFont(bubbleFont_, 12);
+        bubbleFont_.enableWrap(true);
+        bubbleFont_.setKinsoku(KinsokuLevel::Standard);
+        bubbleFont_.setMaxLineLength(PhotoItem::BUBBLE_W - PhotoItem::BUBBLE_PAD * 2);
 
         // Start async loader
         loader_.start();
@@ -72,6 +84,7 @@ public:
             auto& item = pool_[it->second];
             item->unloadImage();
             loader_.cancelRequest(i);
+            item->setLoadState(LoadState::Loading);
             requestLoad(i);
             break;
         }
@@ -93,6 +106,10 @@ public:
     void setTextMatchIds(const unordered_set<string>& ids) { textMatchIds_ = ids; }
     void clearTextMatchIds() { textMatchIds_.clear(); }
 
+    // Memo (text) cards interleaved with photos. Takes effect on next populate().
+    void setShowText(bool show) { showText_ = show; }
+    bool isShowText() const { return showText_; }
+
     void setFilterPhotoIds(const unordered_set<string>& ids) { filterPhotoIds_ = ids; }
     void clearFilterPhotoIds() { filterPhotoIds_.clear(); }
     bool hasFilterPhotoIds() const { return !filterPhotoIds_.empty(); }
@@ -109,8 +126,12 @@ public:
 
     // --- Populate ---
 
-    void populate(PhotoProvider& provider) {
+    // keepView: keep the scroll position and the selection (by id) — for
+    // refreshes the user did not ask for (sync, background EXIF completion).
+    void populate(PhotoProvider& provider, bool keepView = false) {
         provider_ = &provider;
+        float keptScrollY = keepView ? scrollContainer_->getScrollY() : 0;
+        vector<string> keptSelection = keepView ? getSelectedIds() : vector<string>{};
 
         loader_.setThumbnailLoader([&provider](const string& photoId, Pixels& outPixels) {
             return provider.getThumbnail(photoId, outPixels);
@@ -123,12 +144,14 @@ public:
         if (!clipResults_.empty()) {
             for (const auto& r : clipResults_) ids.push_back(r.photoId);
         } else {
-            ids = provider.getSortedIds();
+            ids = provider.getSortedIds(showText_);
         }
 
         for (size_t i = 0; i < ids.size(); i++) {
             auto* photo = provider.getPhoto(ids[i]);
             if (!photo) continue;
+            if (photo->deletedAt > 0) continue;
+            if (photo->isText() && !showText_) continue;
 
             // Filter by explicit photo ID set (e.g. from People view)
             if (!filterPhotoIds_.empty() && filterPhotoIds_.count(ids[i]) == 0) continue;
@@ -153,9 +176,27 @@ public:
             photoIds_.push_back(ids[i]);
         }
 
-        // Reset scroll
-        resetScroll();
-        rebuild();
+        memosInGrid_.clear();
+        for (const auto& id : photoIds_) {
+            if (auto* e = provider.getPhoto(id); e && e->isText()) memosInGrid_.insert(id);
+        }
+
+        if (keepView) {
+            // Restore selection before binding so the items draw it
+            if (!keptSelection.empty()) {
+                unordered_set<string> want(keptSelection.begin(), keptSelection.end());
+                for (int i = 0; i < (int)photoIds_.size(); i++) {
+                    if (want.count(photoIds_[i])) selectionSet_.insert(i);
+                }
+            }
+            rebuild();
+            scrollContainer_->setScrollY(keptScrollY);
+            lastScrollY_ = -99999;   // force the visible range to refresh
+        } else {
+            resetScroll();
+            rebuild();
+        }
+        populated.notify();
     }
 
     // --- Data access ---
@@ -270,6 +311,7 @@ protected:
         auto& L = poolListeners_[poolIdx];
 
         auto item = make_shared<PhotoItem>(-1, itemSize_);
+        item->setBubbleFont(&bubbleFont_);
 
         L.click = item->clicked.listen([this, poolIdx]() {
             int dataIdx = reverseMap_[poolIdx];
@@ -294,10 +336,12 @@ protected:
 
             auto menu = make_shared<ContextMenu>();
 
-            menu->addChild(make_shared<MenuItem>("Show in Finder",
-                [path = photo->localPath]() {
-                    revealInFinder(path);
-                }));
+            if (!photo->localPath.empty() && fs::exists(photo->localPath)) {
+                menu->addChild(make_shared<MenuItem>("Show in Finder",
+                    [path = photo->localPath]() {
+                        revealInFinder(path);
+                    }));
+            }
 
             // "Update Thumbnail" — only for photos with dev edits
             if (photo->hasDevEdits()) {
@@ -310,7 +354,8 @@ protected:
 
             menu->addChild(make_shared<MenuSeparator>());
 
-            menu->addChild(make_shared<MenuItem>("Delete",
+            menu->addChild(make_shared<MenuItem>(
+                photo->isText() ? "Remove from Catalog" : "Delete",
                 [this]() {
                     auto ids = getSelectedIds();
                     if (!ids.empty()) deleteRequested.notify(ids);
@@ -350,6 +395,10 @@ protected:
     void onBind(int dataIdx, ItemPtr& item) override {
         if (!provider_) return;
         auto* photo = provider_->getPhoto(photoIds_[dataIdx]);
+        if (photo && photo->isText()) {
+            bindTextCard(dataIdx, item, *photo);
+            return;
+        }
         string stem = photo ? fs::path(photo->filename).stem().string() : "???";
         SyncState sync = photo ? photo->syncState : SyncState::LocalOnly;
         bool selected = selectionSet_.count(dataIdx) > 0;
@@ -361,12 +410,17 @@ protected:
         int stackSize = provider_->getStackSize(photoIds_[dataIdx]);
         item->rebindAndLoad(dataIdx, stem, sync, selected, video, &labelFont_, stackSize);
 
-        // Linked-text bubble: first linked memo (200-char preview) + count
+        // Linked-text bubble: shown when a linked memo has no card in the current
+        // grid (cards hidden, or filtered out by folder / collection / search).
         if (auto* texts = provider_->getLinkedTexts(photoIds_[dataIdx])) {
-            if (!texts->empty()) {
-                const auto* memo = provider_->getPhoto((*texts)[0]);
-                item->setMemoBubble(memo ? memo->memo : string(), (int)texts->size());
+            const PhotoEntry* first = nullptr;
+            int missing = 0;
+            for (const auto& tid : *texts) {
+                if (memosInGrid_.count(tid)) continue;
+                if (!first) first = provider_->getPhoto(tid);
+                missing++;
             }
+            if (missing > 0) item->setMemoBubble(first ? first->memo : string(), missing);
         }
     }
 
@@ -426,6 +480,10 @@ private:
     // --- Loader ---
     AsyncImageLoader loader_;
     Font labelFont_;
+    Font cardFont_;
+    Font bubbleFont_;                     // hover bubble (wrapped to its width)
+    bool showText_ = true;
+    unordered_set<string> memosInGrid_;   // memo cards present after populate()
     ScrollBar::Ptr scrollBar_;
 
     // --- Pool item listeners ---
@@ -512,7 +570,61 @@ private:
 
     void requestLoad(int index) {
         if (!provider_ || index < 0 || index >= (int)photoIds_.size()) return;
+        auto* photo = provider_->getPhoto(photoIds_[index]);
+        if (!photo || photo->isText()) return;   // memo cards have no thumbnail
         loader_.requestLoad(index, photoIds_[index]);
+    }
+
+    // Memo card: time header, body without leading #tags, camera glyph when
+    // linked to a photo. The hover bubble carries longer memos in full.
+    void bindTextCard(int dataIdx, ItemPtr& item, const PhotoEntry& memo) {
+        const string& dt = memo.dateTimeOriginal;            // local wall clock
+        bool diary = memo.hasTag("diary");
+        string label = string(diary ? "Diary" : "Memo") +
+            (dt.size() >= 10 ? " " + dt.substr(5, 2) + "/" + dt.substr(8, 2) : "");
+        string header = dt.size() >= 16 ? dt.substr(11, 5) : "";
+        string body = stripLeadingTags(memo.memo);
+        replace(body.begin(), body.end(), '\n', ' ');   // one paragraph on the card
+        string hover = codepoints(body) > CARD_BODY_CP ? body : string();
+        const auto* linked = provider_->getLinkedPhotos(memo.id);
+
+        item->setClipMatch(!clipResults_.empty() && !textMatchIds_.count(memo.id));
+        item->rebindAsText(dataIdx, label, header, truncateCodepoints(body, CARD_BODY_CP), hover,
+                           memo.syncState, selectionSet_.count(dataIdx) > 0,
+                           &labelFont_, &cardFont_, linked && !linked->empty(), diary);
+    }
+
+    static constexpr int CARD_BODY_CP = 56;   // fits a 140 px card at 11 px (≈6 lines of CJK)
+
+    // "#photo-memo 川の音" -> "川の音" (tags leading the note only)
+    static string stripLeadingTags(const string& s) {
+        size_t i = 0;
+        while (true) {
+            while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++;
+            if (i + 1 < s.size() && s[i] == '#' && s[i + 1] != ' ' && s[i + 1] != '#') {
+                while (i < s.size() && s[i] != ' ' && s[i] != '\t' && s[i] != '\n') i++;
+            } else {
+                break;
+            }
+        }
+        return s.substr(i);
+    }
+
+    static int codepoints(const string& s) {
+        int n = 0;
+        for (unsigned char c : s) if ((c & 0xC0) != 0x80) n++;
+        return n;
+    }
+
+    static string truncateCodepoints(const string& s, int maxCp) {
+        int cp = 0;
+        size_t i = 0;
+        while (i < s.size() && cp < maxCp) {
+            unsigned char c = (unsigned char)s[i];
+            i += (c < 0x80) ? 1 : (c < 0xE0) ? 2 : (c < 0xF0) ? 3 : 4;
+            cp++;
+        }
+        return i < s.size() ? s.substr(0, i) + "…" : s;
     }
 
     void processLoadResults() {
@@ -523,13 +635,19 @@ private:
 
             // Companion preview load result (negative IDs)
             if (result.id < -999) {
-                if (companionLoading_ && companionPreview_ && companionPreview_->isShowing()) {
+                if (companionLoading_ && companionPreview_ && companionPreview_->isShowing() &&
+                    result.photoId == companionId_) {
                     companionPreview_->setPixels(std::move(result.pixels));
                     companionLoading_ = false;
                     anyLoaded = true;
                 }
                 continue;
             }
+
+            // A populate() may have rebound this index to another photo while the
+            // request was queued: only apply pixels that belong to the current id.
+            if (result.id < 0 || result.id >= (int)photoIds_.size() ||
+                photoIds_[result.id] != result.photoId) continue;
 
             auto it = poolMap_.find(result.id);
             if (it == poolMap_.end()) continue;

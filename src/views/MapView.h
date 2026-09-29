@@ -1165,6 +1165,8 @@ private:
                 c.wx = (c.wx * c.count + wx) / (c.count + 1);
                 c.wy = (c.wy * c.count + wy) / (c.count + 1);
                 c.count++;
+                // Prefer a photo as the cluster's representative over a memo
+                if (pins_[c.firstPinIdx].isText && !pins_[i].isText) c.firstPinIdx = (int)i;
             }
         }
 
@@ -1479,9 +1481,11 @@ public:
         photoIds_ = ids;
         canvas_->setPhotos(photos, ids);
 
+        // Memos report "has GPS" to the strip so they are never drag-geotag
+        // targets: a memo's location belongs to its Obsidian note.
         vector<bool> hasGps(ids.size());
         for (size_t i = 0; i < photos.size(); i++)
-            hasGps[i] = photos[i].hasGps();
+            hasGps[i] = photos[i].hasGps() || photos[i].isText();
         strip_->setPhotos(ids, hasGps, provider);
     }
 
@@ -1499,13 +1503,15 @@ public:
     }
 
     // Center on a specific photo at zoom 14
-    void centerOnPhoto(const string& photoId) {
+    // False if the photo has no GPS (caller falls back to fitBounds)
+    bool centerOnPhoto(const string& photoId) {
         for (size_t i = 0; i < photos_.size(); i++) {
             if (photoIds_[i] == photoId && photos_[i].hasGps()) {
                 canvas_->centerOn(photos_[i].latitude, photos_[i].longitude, 14.0);
-                return;
+                return true;
             }
         }
+        return false;
     }
 
     // --- Provisional pin API ---
@@ -1591,6 +1597,9 @@ public:
         };
         vector<TimeEntry> sorted;
         for (size_t i = 0; i < photos_.size(); i++) {
+            if (photos_[i].isText()) continue;   // memos: not photos, not geotag targets
+            // Photo-to-photo comparison: naive wall clock keeps every shot in one
+            // frame (mixing EXIF-offset UTC with local guesses would split them)
             int64_t t = PhotoEntry::parseDateTimeOriginal(photos_[i].dateTimeOriginal);
             if (t == 0) continue;
             bool target = !photos_[i].hasGps() && targetIds.count(photoIds_[i]);
@@ -1855,9 +1864,10 @@ private:
         constexpr double MAX_EDGE = 3600;  // 1h extrapolation at track edges
 
         for (size_t i = 0; i < photos_.size(); i++) {
-            if (photos_[i].hasGps()) continue;
+            if (photos_[i].hasGps() || photos_[i].isText()) continue;
 
-            time_t photoTime = PhotoEntry::parseDateTimeOriginal(photos_[i].dateTimeOriginal);
+            // UTC instant (GPX timestamps are UTC); honours the photo's EXIF offset
+            time_t photoTime = (time_t)photos_[i].captureEpochUtc();
             if (photoTime == 0) continue;
 
             // Binary search in GPX timeline

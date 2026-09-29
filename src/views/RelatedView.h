@@ -794,6 +794,7 @@ private:
         };
         vector<TimeEntry> sorted;
         for (const auto& [id, entry] : provider.photos()) {
+            if (entry.isText() || entry.deletedAt > 0) continue;   // photos only
             int64_t t = parseDateTimeOriginal(entry.dateTimeOriginal);
             sorted.push_back({id, t});
         }

@@ -95,6 +95,11 @@ public:
     // mode change to switchTo() so there is exactly one transition path.
     void showFullImage(int index) {
         if (!singleView_) return;
+        // Memo cards have no image to open (a memo view will hook in here)
+        if (ctx_.grid && index >= 0 && index < (int)ctx_.grid->getPhotoIdCount()) {
+            auto* e = ctx_.provider ? ctx_.provider->getPhoto(ctx_.grid->getPhotoId(index)) : nullptr;
+            if (e && e->isText()) return;
+        }
 
         if (active_ == ViewMode::Single) {
             // Already in Single: just switch photo

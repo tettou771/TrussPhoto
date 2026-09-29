@@ -43,6 +43,7 @@ public:
             json photosJson = json::array();
             for (const auto& [id, photo] : provider_->photos()) {
                 if (photo.deletedAt > 0) continue;
+                if (photo.isText()) continue;   // memos have no original payload
                 if (photo.localPath.empty()) continue;
                 photosJson.push_back({
                     {"id", photo.id},

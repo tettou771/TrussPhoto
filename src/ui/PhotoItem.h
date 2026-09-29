@@ -41,19 +41,42 @@ public:
         useImage_ = true;
     }
 
-    // Clear image to free memory
+    // Clear image (and text-card mode) to free memory / recycle
     void clearImage() {
         image_ = Image();
         pixels_.clear();
         texture_.clear();
         hasImage_ = false;
         useImage_ = false;
+        if (textMode_) {
+            textMode_ = false;
+            cardHeader_.clear();
+            cardBody_.clear();
+        }
     }
 
     bool hasImage() const { return hasImage_; }
 
+    // Text (memo) card: drawn in place of an image. bodyFont should have
+    // wrapping enabled; its line length is set to the card width on draw.
+    // The caller keeps `body` short enough to fit (no clipping here).
+    void setTextCard(const string& header, const string& body, Font* headerFont,
+                     Font* bodyFont, bool linked, bool diary) {
+        clearImage();
+        textMode_ = true;
+        cardHeader_ = header;
+        cardBody_ = body;
+        headerFont_ = headerFont;
+        bodyFont_ = bodyFont;
+        cardLinked_ = linked;
+        cardDiary_ = diary;
+    }
+    bool isTextCard() const { return textMode_; }
+
     void draw() override {
-        if (hasImage_) {
+        if (textMode_) {
+            drawTextCard();
+        } else if (hasImage_) {
             float imgW, imgH;
             if (useImage_) {
                 imgW = image_.getWidth();
@@ -92,11 +115,52 @@ public:
     }
 
 private:
+    void drawTextCard() {
+        const float w = getWidth(), h = getHeight(), pad = 10;
+        Color accent = cardDiary_ ? Color(0.72f, 0.62f, 0.95f)    // diary: lavender
+                                  : Color(0.98f, 0.85f, 0.30f);   // memo: warm yellow
+        setColor(cardDiary_ ? Color(0.13f, 0.12f, 0.17f) : Color(0.16f, 0.15f, 0.11f));
+        fill();
+        drawRect(0, 0, w, h);
+        setColor(accent);
+        drawRect(0, 0, 3, h);   // accent bar
+
+        float y = pad;
+        if (headerFont_ && !cardHeader_.empty()) {
+            headerFont_->drawString(cardHeader_, pad, y, Direction::Left, Direction::Top);
+            y += headerFont_->getLineHeight() + 4;
+        }
+        if (bodyFont_ && !cardBody_.empty()) {
+            bodyFont_->setMaxLineLength(w - pad * 2);
+            setColor(0.90f, 0.89f, 0.85f);
+            bodyFont_->drawString(cardBody_, pad, y, Direction::Left, Direction::Top);
+        }
+
+        // Camera glyph (bottom-right): this memo is linked to a photo
+        if (cardLinked_) {
+            float cx = w - 24, cy = h - 18;
+            setColor(accent);
+            fill();
+            drawRect(cx, cy + 2, 16, 11);
+            drawRect(cx + 4, cy, 6, 3);
+            setColor(0.16f, 0.15f, 0.11f);
+            drawCircle(cx + 8, cy + 7.5f, 3.2f);
+        }
+    }
+
     Image image_;
     Pixels pixels_;
     Texture texture_;
     bool hasImage_ = false;
     bool useImage_ = false;  // true = use Image, false = use Texture from Pixels
+
+    // Text-card mode
+    bool textMode_ = false;
+    string cardHeader_, cardBody_;
+    Font* headerFont_ = nullptr;
+    Font* bodyFont_ = nullptr;
+    bool cardLinked_ = false;
+    bool cardDiary_ = false;
 };
 
 // Label node - displays filename
@@ -340,12 +404,8 @@ public:
     LabelNode::Ptr getLabel() { return label_; }
 
     void setLabelText(const string& text) {
-        // Truncate if too long
-        if (text.length() > 15) {
-            label_->text = text.substr(0, 12) + "...";
-        } else {
-            label_->text = text;
-        }
+        // Truncate if too long (codepoint-aware: labels may be Japanese)
+        label_->text = cpLength(text) > 15 ? truncateCp(text, 12) : text;
     }
 
     // Load state management
@@ -364,6 +424,7 @@ public:
     // Unload image to free memory
     void unloadImage() {
         thumbnail_->clearImage();
+        isTextCard_ = false;
         setLoadState(LoadState::Unloaded);
     }
 
@@ -384,6 +445,39 @@ public:
         memoCount_ = count;
     }
     bool hasMemo() const { return memoCount_ > 0; }
+    bool isTextCard() const { return isTextCard_; }
+
+    static constexpr float BUBBLE_W = 200;
+    static constexpr float BUBBLE_PAD = 6;
+    // Wrapping font for the hover bubble (line length = BUBBLE_W - 2 * BUBBLE_PAD)
+    void setBubbleFont(Font* f) { bubbleFont_ = f; }
+
+    // Rebind as a text (memo) card: nothing to load. `hoverText` (may be empty)
+    // is shown in the hover bubble when the card itself cannot fit the memo.
+    void rebindAsText(int dataIndex, const string& label, const string& header,
+                      const string& body, const string& hoverText, SyncState syncState,
+                      bool selected, Font* labelFont, Font* bodyFont,
+                      bool linked, bool diary) {
+        if (loadState_ == LoadState::Loading)
+            unloadRequested.notify(entryIndex_);
+
+        entryIndex_ = dataIndex;
+        isTextCard_ = true;
+        setLabelText(label);
+        label_->font = labelFont;
+        setSyncState(syncState);
+        setSelected(selected);
+        setIsVideo(false);
+        setStackSize(0);
+        memoText_ = hoverText;
+        memoCount_ = 0;          // no bubble icon on the card itself
+        showBubble_ = false;
+        hoverStart_ = -1;
+        label_->bgColor = diary ? Color(0.13f, 0.11f, 0.18f) : Color(0.17f, 0.15f, 0.09f);
+        thumbnail_->setTextCard(header, body, labelFont, bodyFont, linked, diary);
+        loadState_ = LoadState::Loaded;
+        redraw();
+    }
 
     void rebindAndLoad(int dataIndex, const string& label, SyncState syncState,
                        bool selected, bool isVideo, Font* font, int stackSize = 0) {
@@ -392,6 +486,7 @@ public:
             unloadRequested.notify(entryIndex_);
 
         entryIndex_ = dataIndex;
+        isTextCard_ = false;
         setLabelText(label);
         label_->font = font;
         setSyncState(syncState);
@@ -424,7 +519,7 @@ public:
             redraw();
         }
         // Reveal memo bubble after 0.5s of hover
-        if (over && hasMemo() && !showBubble_ && hoverStart_ >= 0 &&
+        if (over && !memoText_.empty() && !showBubble_ && hoverStart_ >= 0 &&
             getElapsedTimef() - hoverStart_ >= 0.5f) {
             showBubble_ = true;
             redraw();
@@ -454,32 +549,31 @@ public:
         noFill();
         drawRect(0, 0, getWidth(), getHeight());
 
-        // Sync state badge (bottom-right corner of thumbnail)
+        // Sync state badge (bottom-right corner of thumbnail). Text cards only
+        // show it when their note has gone missing.
         float badgeSize = 8;
         float badgeX = getWidth() - badgeSize - 4;
         float badgeY = getWidth() - badgeSize - 4;  // thumbnail is square, width = thumbnail height
         fill();
-        switch (syncState_) {
-            case SyncState::LocalOnly:
-                setColor(0.9f, 0.65f, 0.2f);  // orange
-                drawCircle(badgeX, badgeY, badgeSize);
-                break;
-            case SyncState::Syncing:
-                setColor(0.3f, 0.6f, 0.95f);  // blue
-                drawCircle(badgeX, badgeY, badgeSize);
-                break;
-            case SyncState::Synced:
-                setColor(0.3f, 0.8f, 0.4f);   // green
-                drawCircle(badgeX, badgeY, badgeSize);
-                break;
-            case SyncState::ServerOnly:
-                setColor(0.7f, 0.5f, 0.9f);   // purple
-                drawCircle(badgeX, badgeY, badgeSize);
-                break;
-            case SyncState::Missing:
-                setColor(0.9f, 0.3f, 0.3f);   // red
-                drawCircle(badgeX, badgeY, badgeSize);
-                break;
+        if (!isTextCard_ || syncState_ == SyncState::Missing) {
+            switch (syncState_) {
+                case SyncState::LocalOnly:
+                    setColor(0.9f, 0.65f, 0.2f);  // orange
+                    break;
+                case SyncState::Syncing:
+                    setColor(0.3f, 0.6f, 0.95f);  // blue
+                    break;
+                case SyncState::Synced:
+                    setColor(0.3f, 0.8f, 0.4f);   // green
+                    break;
+                case SyncState::ServerOnly:
+                    setColor(0.7f, 0.5f, 0.9f);   // purple
+                    break;
+                case SyncState::Missing:
+                    setColor(0.9f, 0.3f, 0.3f);   // red
+                    break;
+            }
+            drawCircle(badgeX, badgeY, badgeSize);
         }
 
         // CLIP similarity match border
@@ -504,23 +598,34 @@ public:
             }
         }
 
-        // Hover bubble: rounded-ish cushion with the (truncated) memo text
-        if (showBubble_ && !memoText_.empty() && label_->font) {
-            auto lines = wrapText(truncateCp(memoText_, 200), 22);
-            const float pad = 6, lineH = 14, bw = 200;
-            float bh = pad * 2 + lineH * (float)lines.size();
+        // Hover bubble: cushion with the (truncated) memo text, wrapped by width
+        if (showBubble_ && !memoText_.empty() && (bubbleFont_ || label_->font)) {
+            const float pad = BUBBLE_PAD, bw = BUBBLE_W;
             float bx = getWidth() * 0.5f - bw * 0.5f;
             float by = 22;
             if (bx < 2) bx = 2;
-            setColor(0.08f, 0.08f, 0.10f, 0.94f);
-            fill();
-            drawRect(bx, by, bw, bh);
-            setColor(0.9f, 0.9f, 0.92f);
-            float ty = by + pad + lineH * 0.5f;
-            for (const auto& ln : lines) {
-                label_->font->drawString(ln, bx + pad, ty,
-                    Direction::Left, Direction::Center);
-                ty += lineH;
+            string text = truncateCp(memoText_, 200);
+            if (bubbleFont_) {
+                float bh = pad * 2 + bubbleFont_->getBBox(text).height;
+                setColor(0.08f, 0.08f, 0.10f, 0.94f);
+                fill();
+                drawRect(bx, by, bw, bh);
+                setColor(0.9f, 0.9f, 0.92f);
+                bubbleFont_->drawString(text, bx + pad, by + pad, Direction::Left, Direction::Top);
+            } else {
+                auto lines = wrapText(text, 22);
+                const float lineH = 14;
+                float bh = pad * 2 + lineH * (float)lines.size();
+                setColor(0.08f, 0.08f, 0.10f, 0.94f);
+                fill();
+                drawRect(bx, by, bw, bh);
+                setColor(0.9f, 0.9f, 0.92f);
+                float ty = by + pad + lineH * 0.5f;
+                for (const auto& ln : lines) {
+                    label_->font->drawString(ln, bx + pad, ty,
+                        Direction::Left, Direction::Center);
+                    ty += lineH;
+                }
             }
         }
     }
@@ -545,6 +650,7 @@ protected:
     }
 
     void onActiveChanged(bool active) override {
+        if (isTextCard_) return;   // text cards carry no image to (un)load
         if (active) {
             // Becoming visible - request load if needed
             if (loadState_ == LoadState::Unloaded) {
@@ -565,6 +671,12 @@ protected:
     }
 
 private:
+    static int cpLength(const string& s) {
+        int n = 0;
+        for (unsigned char c : s) if ((c & 0xC0) != 0x80) n++;
+        return n;
+    }
+
     // Truncate to maxCp Unicode codepoints (UTF-8 aware), append … if cut.
     static string truncateCp(const string& s, int maxCp) {
         int cp = 0; size_t i = 0;
@@ -601,6 +713,8 @@ private:
     StackBadge::Ptr stackBadge_;
     EventListener stackBadgeListener_;
     bool isSelected_ = false;
+    bool isTextCard_ = false;
+    Font* bubbleFont_ = nullptr;
     bool isVideo_ = false;
     bool clipMatch_ = false;
     bool pastMouseOver = false;

@@ -73,6 +73,27 @@ struct PhotoEntry {
     bool hasGps() const { return latitude != 0 || longitude != 0; }
     bool isText() const { return entryType == 1; }
 
+    // True if `tags` (JSON array string) contains `tag`, matched the way Obsidian
+    // does: case-insensitive, leading '#' ignored, nested tags ("diary/2026")
+    // count as their parent. Malformed JSON -> false.
+    bool hasTag(const string& tag) const {
+        if (tags.empty()) return false;
+        auto j = nlohmann::json::parse(tags, nullptr, false);
+        if (!j.is_array()) return false;
+        auto norm = [](string s) {
+            if (!s.empty() && s[0] == '#') s.erase(0, 1);
+            for (auto& c : s) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+            return s;
+        };
+        string want = norm(tag);
+        for (const auto& t : j) {
+            if (!t.is_string()) continue;
+            string v = norm(t.get<string>());
+            if (v == want || v.rfind(want + "/", 0) == 0) return true;
+        }
+        return false;
+    }
+
     // Develop settings (per-photo)
     float chromaDenoise = 0.5f;  // 0-1, chroma noise reduction strength
     float lumaDenoise = 0.0f;    // 0-1, luma noise reduction strength
@@ -387,19 +408,53 @@ struct PhotoEntry {
 
     // Parse "YYYY:MM:DD HH:MM:SS" → epoch seconds (0 on failure)
     static int64_t parseDateTimeOriginal(const string& dt) {
-        if (dt.size() < 19) return 0;
+        tm t = {};
+        if (!parseDateTimeFields(dt, t)) return 0;
+        t.tm_isdst = -1;   // let mktime decide DST for the local zone
+        return (int64_t)mktime(&t);
+    }
+
+    // "YYYY:MM:DD HH:MM:SS" -> tm fields (no zone applied). False if malformed.
+    static bool parseDateTimeFields(const string& dt, tm& t) {
+        if (dt.size() < 19) return false;
         try {
-            tm t = {};
+            t = {};
             t.tm_year = stoi(dt.substr(0, 4)) - 1900;
             t.tm_mon = stoi(dt.substr(5, 2)) - 1;
             t.tm_mday = stoi(dt.substr(8, 2));
             t.tm_hour = stoi(dt.substr(11, 2));
             t.tm_min = stoi(dt.substr(14, 2));
             t.tm_sec = stoi(dt.substr(17, 2));
-            return (int64_t)mktime(&t);
+            return true;
         } catch (...) {
-            return 0;
+            return false;
         }
+    }
+
+    // EXIF UTC offset ("+09:00" / "-05:30") -> seconds east of UTC.
+    // False for empty or malformed values (e.g. blank "   :  " placeholders).
+    static bool parseUtcOffset(const string& s, int& outSeconds) {
+        if (s.size() != 6 || (s[0] != '+' && s[0] != '-') || s[3] != ':') return false;
+        for (int i : {1, 2, 4, 5}) {
+            if (s[i] < '0' || s[i] > '9') return false;
+        }
+        int h = (s[1] - '0') * 10 + (s[2] - '0');
+        int m = (s[4] - '0') * 10 + (s[5] - '0');
+        if (h > 14 || m > 59) return false;
+        outSeconds = (h * 3600 + m * 60) * (s[0] == '-' ? -1 : 1);
+        return true;
+    }
+
+    // Capture instant as UTC epoch seconds. dateTimeOriginal is a naive wall-clock
+    // reading; offsetTime pins it to UTC, so photos shot abroad compare correctly
+    // against UTC sources (memos, GPX). Without an offset, the timestamp is read
+    // in the machine's local zone (same as parseDateTimeOriginal).
+    int64_t captureEpochUtc() const {
+        int off = 0;
+        if (!parseUtcOffset(offsetTime, off)) return parseDateTimeOriginal(dateTimeOriginal);
+        tm t = {};
+        if (!parseDateTimeFields(dateTimeOriginal, t)) return 0;
+        return (int64_t)timegm(&t) - off;
     }
 };
 

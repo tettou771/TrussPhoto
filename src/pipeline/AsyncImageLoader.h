@@ -24,6 +24,7 @@ struct LoadRequest {
 // Load result (Pixels, not Image - texture must be created on main thread)
 struct AsyncLoadResult {
     int id;
+    string photoId;     // identity check: a slot can be rebound before the result lands
     Pixels pixels;
     bool success = false;
 };
@@ -124,6 +125,7 @@ protected:
             // Load image
             AsyncLoadResult result;
             result.id = req.id;
+            result.photoId = req.photoId;
 
             bool loaded = false;
 

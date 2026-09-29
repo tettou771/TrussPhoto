@@ -115,6 +115,7 @@ private:
     EventListener gridRepairListener_;
     EventListener gridConsolidateListener_;
     EventListener gridDeleteListener_;
+    EventListener gridPopulatedListener_;
     EventListener gridUpdateThumbnailListener_;
     EventListener searchListener_;
     EventListener developListener_;
@@ -160,6 +161,7 @@ private:
     ViewMode viewMode() const { return viewManager_ ? viewManager_->activeView() : ViewMode::Grid; }
 
     void deleteSelectedPhotos();
+    void deleteWithConfirm(const vector<string>& ids);
     void enqueueLocalOnlyPhotos();
     void configureServer(const string& url, const string& key = "");
     void repairLibrary();

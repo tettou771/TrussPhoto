@@ -51,6 +51,10 @@ public:
         scrollContainer_->addChild(scrollBar_);
 
         loadJapaneseFont(font_, 12);
+        // Memo bodies wrap to the panel width (memo cards are read here)
+        loadJapaneseFont(memoFont_, 12);
+        memoFont_.enableWrap(true);
+        memoFont_.setKinsoku(KinsokuLevel::Standard);
     }
 
     void setup() override {
@@ -168,6 +172,7 @@ private:
     RectNode::Ptr content_;
     ScrollBar::Ptr scrollBar_;
     Font font_;
+    mutable Font memoFont_;   // line length follows the panel width
 
     PhotoEntry entry_;
     bool hasPhoto_ = false;
@@ -305,8 +310,10 @@ private:
         // File section
         y += lineH_; // header
         y += lineH_; // filename
-        y += lineH_; // dimensions
-        y += lineH_; // file size
+        if (!e.isText()) {
+            y += lineH_; // dimensions
+            y += lineH_; // file size
+        }
         if (!e.dateTimeOriginal.empty()) y += lineH_;
         y += sectionGap_;
 
@@ -343,7 +350,7 @@ private:
         // Memo section
         if (!e.memo.empty()) {
             y += lineH_; // header
-            y += lineH_; // memo text (simplified: single line)
+            y += memoTextHeight(e.memo);
             y += sectionGap_;
         }
 
@@ -388,6 +395,12 @@ private:
         float labelW = font_.getWidth(label);
         font_.drawString(value, padding_ + labelW + 6, y + lineH_ * 0.5f, Direction::Left, Direction::Center);
         y += lineH_;
+    }
+
+    // Wrapped height of a memo body at the current panel width
+    float memoTextHeight(const string& memo) const {
+        memoFont_.setMaxLineLength(max(40.0f, getWidth() - 12 - padding_ * 2));  // scrollbar + padding
+        return max(lineH_, memoFont_.getBBox(memo).height + 4);
     }
 
     void drawValue(const string& value, float& y, const Color& color = Color(0.75f, 0.75f, 0.8f)) {
@@ -445,11 +458,13 @@ private:
         string typeStr = e.isRaw ? "  [RAW]" : "";
         drawValue(e.filename + typeStr, y);
 
-        drawValue(format("{} x {}", e.width, e.height), y, Color(0.6f, 0.6f, 0.65f));
+        if (!e.isText()) {   // a memo has no pixels, and its note size means little
+            drawValue(format("{} x {}", e.width, e.height), y, Color(0.6f, 0.6f, 0.65f));
 
-        // File size
-        float sizeMB = e.fileSize / (1024.0f * 1024.0f);
-        drawValue(format("{:.1f} MB", sizeMB), y, Color(0.6f, 0.6f, 0.65f));
+            // File size
+            float sizeMB = e.fileSize / (1024.0f * 1024.0f);
+            drawValue(format("{:.1f} MB", sizeMB), y, Color(0.6f, 0.6f, 0.65f));
+        }
 
         if (!e.dateTimeOriginal.empty()) {
             drawValue(e.dateTimeOriginal, y, Color(0.6f, 0.6f, 0.65f));
@@ -563,7 +578,10 @@ private:
         // === Memo ===
         if (!e.memo.empty()) {
             drawSectionHeader("Memo", y, w);
-            drawValue(e.memo, y, Color(0.65f, 0.65f, 0.7f));
+            float h = memoTextHeight(e.memo);
+            setColor(0.75f, 0.75f, 0.8f);
+            memoFont_.drawString(e.memo, padding_, y + 2, Direction::Left, Direction::Top);
+            y += h;
             y += sectionGap_;
         }
 
